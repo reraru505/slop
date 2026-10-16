@@ -36,6 +36,7 @@ dired_destroy :: proc(d: ^Dired) {
     delete(d.entries)
     if d.path != "" {
         delete(d.path)
+        d.path = ""
     }
 }
 
@@ -57,7 +58,7 @@ dired_load_path :: proc(d: ^Dired, dir_path: string) -> bool {
     if ferr != nil do return false
     defer os.file_info_slice_delete(files, context.allocator)
 
-    // Always add parent directory entry ".."
+    // Parent directory entry ".."
     append(&d.entries, DiredEntry{
         name   = strings.clone(".."),
         is_dir = true,
@@ -115,12 +116,19 @@ dired_format_size :: proc(size: i64) -> string {
     }
 }
 
-dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App) -> bool {
+dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane) -> bool {
     #partial switch event.type {
     case .KEY_DOWN:
         d.last_action = time.now()
         key := event.key.key
         mod := event.key.mod
+        is_shift := (mod & sdl.KMOD_SHIFT) != {}
+
+        // Command mode trigger ':' from Dired!
+        if key == sdl.K_COLON || (key == sdl.K_SEMICOLON && is_shift) {
+            app_open_command_prompt(app)
+            return true
+        }
 
         switch key {
         case sdl.K_J, sdl.K_DOWN:
@@ -155,14 +163,17 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App) -> bool {
                 } else {
                     target_file, _ := filepath.join([]string{d.path, entry.name}, context.allocator)
                     defer delete(target_file)
-                    app_open_file(app, target_file)
+                    // Directly replace current split with the selected file!
+                    app_pane_open_file(app, pane, target_file)
                 }
             }
             return true
 
         case sdl.K_ESCAPE, sdl.K_Q:
-            if app.editor.file_path != "" {
-                app.view = .Editor
+            if pane != nil && pane.editor.file_path != "" {
+                pane.kind = .Editor
+            } else if len(app.panes) > 1 {
+                app_close_pane(app, pane)
             }
             return true
         }
@@ -179,13 +190,15 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App) -> bool {
     return false
 }
 
-dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, window_w, window_h: i32) {
+dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool) {
+    if rect.w < 50 || rect.h < 50 do return
+
     scale := get_font_scale_multiplier(.HALF)
     line_h := get_line_height(.HALF)
 
     header_h := line_h * 2.0
     status_bar_h := line_h + 8.0
-    body_h := f32(window_h) - header_h - status_bar_h
+    body_h := rect.h - header_h - status_bar_h
 
     visible_lines := int(body_h / line_h)
     if visible_lines <= 0 do visible_lines = 1
@@ -196,29 +209,35 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, window_w, 
         d.scroll = d.cursor - visible_lines + 1
     }
 
+    // Set hardware clip rect so Dired content cannot bleed outside its split
+    clip := sdl.Rect{i32(rect.x), i32(rect.y), i32(rect.w), i32(rect.h)}
+    sdl.SetRenderClipRect(renderer, &clip)
+    defer sdl.SetRenderClipRect(renderer, nil)
+
     // 1. Background
     bg_color := sdl.FColor{0.08, 0.08, 0.1, 1.0}
     sdl.SetRenderDrawColorFloat(renderer, bg_color.r, bg_color.g, bg_color.b, bg_color.a)
-    sdl.RenderClear(renderer)
+    bg_rect := rect
+    sdl.RenderFillRect(renderer, &bg_rect)
 
     // 2. Header
     header_rect := sdl.FRect{
-        x = 0,
-        y = 0,
-        w = f32(window_w),
+        x = rect.x,
+        y = rect.y,
+        w = rect.w,
         h = header_h,
     }
     sdl.SetRenderDrawColor(renderer, 28, 30, 38, 255)
     sdl.RenderFillRect(renderer, &header_rect)
 
     header_line := fmt.tprintf("DIR: %s", d.path)
-    push_line(font, header_line, Vec2{16.0, 4.0}, sdl.FColor{0.95, 0.85, 0.45, 1.0}, .HALF)
-    push_line(font, "Press <Enter>/<l> to open, <h>/<-> for parent, <j>/<k> to move", Vec2{16.0, 4.0 + line_h}, sdl.FColor{0.5, 0.55, 0.65, 1.0}, .HALF)
+    push_line(font, header_line, Vec2{rect.x + 16.0, rect.y + 4.0}, sdl.FColor{0.95, 0.85, 0.45, 1.0}, .HALF)
+    push_line(font, "Press <Enter>/<l> to open, <h>/<-> for parent, <:> for commands", Vec2{rect.x + 16.0, rect.y + 4.0 + line_h}, sdl.FColor{0.5, 0.55, 0.65, 1.0}, .HALF)
 
     div_rect := sdl.FRect{
-        x = 0,
-        y = header_h - 1.0,
-        w = f32(window_w),
+        x = rect.x,
+        y = rect.y + header_h - 1.0,
+        w = rect.w,
         h = 1.0,
     }
     sdl.SetRenderDrawColor(renderer, 48, 52, 64, 255)
@@ -230,20 +249,20 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, window_w, 
         if idx >= len(d.entries) do break
 
         entry := d.entries[idx]
-        y_pos := header_h + f32(i) * line_h
+        y_pos := rect.y + header_h + f32(i) * line_h
 
-        if idx == d.cursor {
+        if idx == d.cursor && is_focused {
             sel_rect := sdl.FRect{
-                x = 0,
+                x = rect.x,
                 y = y_pos,
-                w = f32(window_w),
+                w = rect.w,
                 h = line_h,
             }
             sdl.SetRenderDrawColor(renderer, 36, 40, 52, 255)
             sdl.RenderFillRect(renderer, &sel_rect)
 
             mark_rect := sdl.FRect{
-                x = 0,
+                x = rect.x,
                 y = y_pos,
                 w = 3.0,
                 h = line_h,
@@ -254,28 +273,31 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, window_w, 
 
         if entry.is_dir {
             name_str := fmt.tprintf("%s/", entry.name)
-            push_line(font, name_str, Vec2{24.0, y_pos}, sdl.FColor{0.45, 0.75, 0.98, 1.0}, .HALF)
+            push_line(font, name_str, Vec2{rect.x + 24.0, y_pos}, sdl.FColor{0.45, 0.75, 0.98, 1.0}, .HALF)
         } else {
-            push_line(font, entry.name, Vec2{24.0, y_pos}, sdl.FColor{0.9, 0.9, 0.9, 1.0}, .HALF)
+            push_line(font, entry.name, Vec2{rect.x + 24.0, y_pos}, sdl.FColor{0.9, 0.9, 0.9, 1.0}, .HALF)
 
             size_str := dired_format_size(entry.size)
-            size_x := max(f32(window_w) - 160.0, 450.0)
+            size_x := max(rect.x + rect.w - 140.0, rect.x + 250.0)
             push_line(font, size_str, Vec2{size_x, y_pos}, sdl.FColor{0.5, 0.5, 0.55, 1.0}, .HALF)
         }
     }
 
     // 4. Status Bar
     status_bar_rect := sdl.FRect{
-        x = 0,
-        y = f32(window_h) - status_bar_h,
-        w = f32(window_w),
+        x = rect.x,
+        y = rect.y + rect.h - status_bar_h,
+        w = rect.w,
         h = status_bar_h,
     }
-    sdl.SetRenderDrawColor(renderer, 35, 38, 48, 255)
+    status_bar_bg := is_focused ? sdl.FColor{0.14, 0.16, 0.22, 1.0} : sdl.FColor{0.1, 0.11, 0.14, 1.0}
+    sdl.SetRenderDrawColorFloat(renderer, status_bar_bg.r, status_bar_bg.g, status_bar_bg.b, status_bar_bg.a)
     sdl.RenderFillRect(renderer, &status_bar_rect)
 
-    status_str := fmt.tprintf("-- DIRED --   %d / %d items", d.cursor + 1, len(d.entries))
-    push_line(font, status_str, Vec2{10.0, f32(window_h) - status_bar_h + 4.0}, sdl.FColor{0.95, 0.75, 0.3, 1.0}, .HALF)
+    focus_badge := is_focused ? "[ACTIVE] " : ""
+    status_str := fmt.tprintf("%s-- DIRED --   %d / %d items", focus_badge, d.cursor + 1, len(d.entries))
+    status_color := is_focused ? sdl.FColor{0.95, 0.75, 0.3, 1.0} : sdl.FColor{0.6, 0.6, 0.6, 1.0}
+    push_line(font, status_str, Vec2{rect.x + 10.0, rect.y + rect.h - status_bar_h + 4.0}, status_color, .HALF)
 
     flush_text(font, renderer)
 }

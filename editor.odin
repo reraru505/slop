@@ -122,7 +122,7 @@ editor_set_mode :: proc(e: ^Editor, new_mode: EditorMode, window: ^sdl.Window) {
     e.last_action = time.now()
     e.pending_cmd = 0
 
-    if new_mode == .Insert {
+    if new_mode == .Insert || new_mode == .Command {
         e.cursor.shape = .Bar
         if window != nil do _ = sdl.StartTextInput(window)
     } else {
@@ -403,10 +403,10 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     return false
 }
 
-editor_handle_command_key :: proc(e: ^Editor, key: sdl.Keycode, app: ^App) -> bool {
+editor_handle_command_key :: proc(e: ^Editor, key: sdl.Keycode, window: ^sdl.Window, app: ^App) -> bool {
     switch key {
     case sdl.K_ESCAPE:
-        e.mode = .Normal
+        editor_set_mode(e, .Normal, window)
         clear(&e.command_buffer)
         return true
 
@@ -414,13 +414,13 @@ editor_handle_command_key :: proc(e: ^Editor, key: sdl.Keycode, app: ^App) -> bo
         if len(e.command_buffer) > 0 {
             pop(&e.command_buffer)
         } else {
-            e.mode = .Normal
+            editor_set_mode(e, .Normal, window)
         }
         return true
 
     case sdl.K_RETURN, sdl.K_KP_ENTER:
         cmd := strings.trim_space(string(e.command_buffer[:]))
-        e.mode = .Normal
+        editor_set_mode(e, .Normal, window)
         clear(&e.command_buffer)
 
         if cmd == "w" {
@@ -445,6 +445,12 @@ editor_handle_command_key :: proc(e: ^Editor, key: sdl.Keycode, app: ^App) -> bo
             e.status_message = fmt.tprintf("Unknown command: :%s", cmd)
         }
         return true
+
+    case:
+        if !sdl.TextInputActive(window) && key >= 32 && key <= 126 {
+            append(&e.command_buffer, u8(key))
+            return true
+        }
     }
     return false
 }
@@ -497,10 +503,9 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
 
-    // Colon ':' for command mode (Shift + ;)
-    if key == sdl.K_SEMICOLON && is_shift {
-        e.mode = .Command
-        clear(&e.command_buffer)
+    // Colon ':' opens global command prompt
+    if key == sdl.K_COLON || (key == sdl.K_SEMICOLON && is_shift) {
+        app_open_command_prompt(app)
         return true
     }
 
@@ -730,7 +735,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
         if e.mode == .Insert {
             return editor_handle_insert_key(e, key, mod, window)
         } else if e.mode == .Command {
-            return editor_handle_command_key(e, key, app)
+            return editor_handle_command_key(e, key, window, app)
         } else {
             return editor_handle_normal_key(e, key, mod, window, app)
         }
@@ -748,7 +753,9 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
     return false
 }
 
-editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w, window_h: i32) {
+editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool) {
+    if rect.w < 50 || rect.h < 50 do return
+
     scale := get_font_scale_multiplier(e.font_scale)
     line_h := get_line_height(e.font_scale)
     char_w := e.char_advance * scale
@@ -756,7 +763,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
     total_lines := pt_get_line_count(&e.table) + 1
 
     status_bar_h := line_h + 8.0
-    editor_h := f32(window_h) - status_bar_h
+    editor_h := rect.h - status_bar_h
 
     digits := 1
     tmp := total_lines
@@ -768,19 +775,27 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
     gutter_w := f32(digits + 2) * char_w
 
     visible_lines := int(editor_h / line_h)
-    visible_cols := int((f32(window_w) - gutter_w) / char_w)
+    visible_cols := int((rect.w - gutter_w) / char_w)
+    if visible_lines <= 0 do visible_lines = 1
+    if visible_cols <= 0 do visible_cols = 1
 
     editor_scroll_to_cursor(e, visible_lines, visible_cols)
+
+    // Clip rendering to this pane's rectangle
+    clip := sdl.Rect{i32(rect.x), i32(rect.y), i32(rect.w), i32(rect.h)}
+    sdl.SetRenderClipRect(renderer, &clip)
+    defer sdl.SetRenderClipRect(renderer, nil)
 
     // 1. Background
     bg_color := sdl.FColor{0.08, 0.08, 0.1, 1.0}
     sdl.SetRenderDrawColorFloat(renderer, bg_color.r, bg_color.g, bg_color.b, bg_color.a)
-    sdl.RenderClear(renderer)
+    bg_rect := rect
+    sdl.RenderFillRect(renderer, &bg_rect)
 
     // 2. Gutter background
     gutter_rect := sdl.FRect{
-        x = 0,
-        y = 0,
+        x = rect.x,
+        y = rect.y,
         w = gutter_w,
         h = editor_h,
     }
@@ -789,8 +804,8 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
 
     // 3. Gutter separator line
     sep_rect := sdl.FRect{
-        x = gutter_w - 1.0,
-        y = 0,
+        x = rect.x + gutter_w - 1.0,
+        y = rect.y,
         w = 1.0,
         h = editor_h,
     }
@@ -798,12 +813,12 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
     sdl.RenderFillRect(renderer, &sep_rect)
 
     // 4. Current line highlight
-    if e.cursor.row >= e.scroll_row && e.cursor.row < e.scroll_row + visible_lines {
-        hl_y := f32(e.cursor.row - e.scroll_row) * line_h
+    if is_focused && e.cursor.row >= e.scroll_row && e.cursor.row < e.scroll_row + visible_lines {
+        hl_y := rect.y + f32(e.cursor.row - e.scroll_row) * line_h
         hl_rect := sdl.FRect{
-            x = gutter_w,
+            x = rect.x + gutter_w,
             y = hl_y,
-            w = f32(window_w) - gutter_w,
+            w = rect.w - gutter_w,
             h = line_h,
         }
         sdl.SetRenderDrawColor(renderer, 32, 34, 40, 255)
@@ -818,7 +833,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
             if line_idx >= total_lines do break
             if line_idx < start_sel.row || line_idx > end_sel.row do continue
 
-            y_pos := f32(i) * line_h
+            y_pos := rect.y + f32(i) * line_h
             line_len := editor_get_line_len(e, line_idx)
 
             c0 := 0
@@ -839,7 +854,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
             }
 
             if c1 > c0 {
-                sel_x := gutter_w + 4.0 + f32(c0 - e.scroll_col) * char_w
+                sel_x := rect.x + gutter_w + 4.0 + f32(c0 - e.scroll_col) * char_w
                 sel_w := f32(c1 - c0) * char_w
                 sel_rect := sdl.FRect{
                     x = sel_x,
@@ -854,11 +869,11 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
     }
 
     // 6. Block Cursor (rendered behind text)
-    cx := gutter_w + 4.0 + f32(e.cursor.col - e.scroll_col) * char_w
-    cy := f32(e.cursor.row - e.scroll_row) * line_h
-    cursor_visible := cursor_is_visible(&e.cursor, e.last_action)
+    cx := rect.x + gutter_w + 4.0 + f32(e.cursor.col - e.scroll_col) * char_w
+    cy := rect.y + f32(e.cursor.row - e.scroll_row) * line_h
+    cursor_visible := is_focused && cursor_is_visible(&e.cursor, e.last_action)
 
-    if e.cursor.shape == .Block {
+    if is_focused && e.cursor.shape == .Block {
         render_cursor(&e.cursor, renderer, cx, cy, char_w, line_h, e.last_action)
     }
 
@@ -872,15 +887,15 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
         line_idx := e.scroll_row + i
         if line_idx >= total_lines do break
 
-        y_pos := f32(i) * line_h
+        y_pos := rect.y + f32(i) * line_h
 
         // Line number in gutter
         line_num_str := fmt.tprintf("%*d ", digits, line_idx + 1)
         ln_color := normal_line_num_color
-        if line_idx == e.cursor.row {
+        if is_focused && line_idx == e.cursor.row {
             ln_color = active_line_num_color
         }
-        push_line(font, line_num_str, Vec2{char_w * 0.5, y_pos}, ln_color, e.font_scale)
+        push_line(font, line_num_str, Vec2{rect.x + char_w * 0.5, y_pos}, ln_color, e.font_scale)
 
         // Line text
         line_str, ok := pt_line_text(&e.table, line_idx)
@@ -890,14 +905,14 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
                 visible_str := line_str[e.scroll_col:]
 
                 hl_col := -1
-                if (e.mode == .Normal || e.mode == .Visual) && cursor_visible && line_idx == e.cursor.row {
+                if is_focused && (e.mode == .Normal || e.mode == .Visual) && cursor_visible && line_idx == e.cursor.row {
                     hl_col = e.cursor.col - e.scroll_col
                 }
 
                 push_editor_line(
                     font,
                     visible_str,
-                    Vec2{gutter_w + 4.0, y_pos},
+                    Vec2{rect.x + gutter_w + 4.0, y_pos},
                     code_text_color,
                     e.font_scale,
                     hl_col,
@@ -907,55 +922,56 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, window_w
         }
     }
 
-    // 8. Status Bar & Command Prompt
+    // 8. Status Bar
     status_bar_rect := sdl.FRect{
-        x = 0,
-        y = editor_h,
-        w = f32(window_w),
+        x = rect.x,
+        y = rect.y + editor_h,
+        w = rect.w,
         h = status_bar_h,
     }
-    sdl.SetRenderDrawColor(renderer, 35, 38, 48, 255)
+    if is_focused {
+        sdl.SetRenderDrawColor(renderer, 35, 38, 48, 255)
+    } else {
+        sdl.SetRenderDrawColor(renderer, 22, 24, 30, 255)
+    }
     sdl.RenderFillRect(renderer, &status_bar_rect)
 
-    if e.mode == .Command {
-        cmd_str := fmt.tprintf(":%s", string(e.command_buffer[:]))
-        push_line(font, cmd_str, Vec2{10.0, editor_h + 4.0}, sdl.FColor{1.0, 0.9, 0.4, 1.0}, e.font_scale)
-        // Command line cursor
-        cmd_cur_x := 10.0 + f32(len(cmd_str)) * char_w
-        cmd_cur_rect := sdl.FRect{x = cmd_cur_x, y = editor_h + 4.0, w = 2.0, h = line_h}
-        sdl.SetRenderDrawColor(renderer, 255, 255, 255, 255)
-        sdl.RenderFillRect(renderer, &cmd_cur_rect)
-    } else {
-        mode_text := "-- NORMAL --"
-        status_color := sdl.FColor{0.4, 0.8, 0.5, 1.0}
-        switch e.mode {
-        case .Normal:
-            mode_text = "-- NORMAL --"
-            status_color = sdl.FColor{0.4, 0.8, 0.5, 1.0}
-        case .Insert:
-            mode_text = "-- INSERT --"
-            status_color = sdl.FColor{0.9, 0.6, 0.2, 1.0}
-        case .Visual:
-            mode_text = "-- VISUAL --"
-            status_color = sdl.FColor{0.4, 0.6, 0.95, 1.0}
-        case .Command:
-        }
-
-        dirty_indicator := e.dirty ? " [+]" : ""
-        file_display := e.file_path != "" ? e.file_path : "Untitled"
-        status_info := fmt.tprintf("%s   %s%s   Line %d/%d, Col %d", mode_text, file_display, dirty_indicator, e.cursor.row + 1, total_lines, e.cursor.col + 1)
-        if e.status_message != "" {
-            status_info = fmt.tprintf("%s   | %s", status_info, e.status_message)
-        }
-
-        push_line(font, status_info, Vec2{10.0, editor_h + 4.0}, status_color, e.font_scale)
+    mode_text := "-- NORMAL --"
+    status_color := sdl.FColor{0.4, 0.8, 0.5, 1.0}
+    switch e.mode {
+    case .Normal:
+        mode_text = "-- NORMAL --"
+        status_color = sdl.FColor{0.4, 0.8, 0.5, 1.0}
+    case .Insert:
+        mode_text = "-- INSERT --"
+        status_color = sdl.FColor{0.9, 0.6, 0.2, 1.0}
+    case .Visual:
+        mode_text = "-- VISUAL --"
+        status_color = sdl.FColor{0.4, 0.6, 0.95, 1.0}
+    case .Command:
+        mode_text = "-- COMMAND --"
+        status_color = sdl.FColor{1.0, 0.9, 0.4, 1.0}
     }
+
+    if !is_focused {
+        status_color = sdl.FColor{0.5, 0.5, 0.55, 1.0}
+    }
+
+    dirty_indicator := " [+]" if e.dirty else ""
+    file_display := e.file_path if e.file_path != "" else "[No Name]"
+    focus_badge := "[ACTIVE] " if is_focused else ""
+    status_info := fmt.tprintf("%s%s   %s%s   Line %d/%d, Col %d", focus_badge, mode_text, file_display, dirty_indicator, e.cursor.row + 1, total_lines, e.cursor.col + 1)
+    if e.status_message != "" {
+        status_info = fmt.tprintf("%s   | %s", status_info, e.status_message)
+    }
+
+    push_line(font, status_info, Vec2{rect.x + 10.0, rect.y + editor_h + 4.0}, status_color, e.font_scale)
 
     // Flush text
     flush_text(font, renderer)
 
     // 9. Bar Cursor (in Insert Mode)
-    if e.cursor.shape == .Bar {
+    if is_focused && e.cursor.shape == .Bar {
         render_cursor(&e.cursor, renderer, cx, cy, char_w, line_h, e.last_action)
     }
 }
