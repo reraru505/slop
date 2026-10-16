@@ -899,5 +899,6 @@ pt_offset_to_line  :: offset_to_line
 pt_line_text       :: line_text
 pt_full_text       :: full_text
 pt_byte_at         :: byte_at
+pt_text            :: text
 pt_undo            :: undo
 pt_redo            :: redo
