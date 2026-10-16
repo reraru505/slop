@@ -15,14 +15,16 @@ SplitDir :: enum {
 PaneKind :: enum {
     Editor,
     Dired,
+    Compilation,
 }
 
 Pane :: struct {
-    id     : int,
-    kind   : PaneKind,
-    editor : Editor,
-    dired  : Dired,
-    rect   : sdl.FRect,
+    id          : int,
+    kind        : PaneKind,
+    editor      : Editor,
+    dired       : Dired,
+    compilation : Compilation,
+    rect        : sdl.FRect,
 }
 
 SplitNode :: struct {
@@ -41,6 +43,7 @@ pane_create :: proc(app: ^App, kind: PaneKind) -> ^Pane {
     p.kind = kind
     dired_init(&p.dired)
     editor_init(&p.editor, &app.font, "", "")
+    compilation_init(&p.compilation)
     append(&app.panes, p)
     return p
 }
@@ -48,6 +51,7 @@ pane_create :: proc(app: ^App, kind: PaneKind) -> ^Pane {
 pane_destroy :: proc(app: ^App, p: ^Pane) {
     editor_destroy(&p.editor)
     dired_destroy(&p.dired)
+    compilation_destroy(&p.compilation)
     for i := 0; i < len(app.panes); i += 1 {
         if app.panes[i] == p {
             ordered_remove(&app.panes, i)
@@ -141,10 +145,15 @@ app_split_pane :: proc(app: ^App, target: ^Pane, dir: SplitDir) {
         new_pane.editor.cursor = target.editor.cursor
         new_pane.editor.scroll_row = target.editor.scroll_row
         new_pane.editor.scroll_col = target.editor.scroll_col
-    } else {
+        new_pane.editor.desired_col = target.editor.desired_col
+    } else if target.kind == .Dired {
         dired_load_path(&new_pane.dired, target.dired.path)
         new_pane.dired.cursor = target.dired.cursor
         new_pane.dired.scroll = target.dired.scroll
+    } else if target.kind == .Compilation {
+        if target.compilation.command != "" {
+            compilation_run_command(&new_pane.compilation, target.compilation.command)
+        }
     }
 
     // Convert node to branch

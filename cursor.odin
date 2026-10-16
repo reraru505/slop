@@ -16,8 +16,7 @@ Cursor :: struct {
 }
 
 cursor_is_visible :: proc(cursor: ^Cursor, start_time: time.Time) -> bool {
-    elapsed_ms := time.duration_milliseconds(time.since(start_time))
-    return (int(elapsed_ms) / 500) % 2 == 0
+    return true
 }
 
 render_cursor :: proc(

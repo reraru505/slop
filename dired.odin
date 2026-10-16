@@ -3,30 +3,49 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
-import "core:slice"
 import "core:strings"
 import "core:time"
 import sdl "vendor:sdl3"
 
+DiredSortBy :: enum {
+    Name,
+    Size,
+    Time,
+}
+
+DiredSortOrder :: enum {
+    Asc,
+    Desc,
+}
+
 DiredEntry :: struct {
-    name   : string,
-    is_dir : bool,
-    size   : i64,
+    name     : string,
+    is_dir   : bool,
+    size     : i64,
+    mod_time : time.Time,
 }
 
 Dired :: struct {
-    path        : string,
-    entries     : [dynamic]DiredEntry,
-    cursor      : int,
-    scroll      : int,
-    last_action : time.Time,
+    path         : string,
+    entries      : [dynamic]DiredEntry,
+    cursor       : int,
+    scroll       : int,
+    last_action  : time.Time,
+    sort_by      : DiredSortBy,
+    sort_order   : DiredSortOrder,
+    is_editing   : bool,
+    orig_entries : [dynamic]DiredEntry,
 }
 
 dired_init :: proc(d: ^Dired) {
     d.entries = make([dynamic]DiredEntry, context.allocator)
+    d.orig_entries = make([dynamic]DiredEntry, context.allocator)
     d.cursor = 0
     d.scroll = 0
     d.last_action = time.now()
+    d.sort_by = .Name
+    d.sort_order = .Asc
+    d.is_editing = false
 }
 
 dired_destroy :: proc(d: ^Dired) {
@@ -34,9 +53,105 @@ dired_destroy :: proc(d: ^Dired) {
         delete(e.name)
     }
     delete(d.entries)
+
+    for e in d.orig_entries {
+        delete(e.name)
+    }
+    delete(d.orig_entries)
+
     if d.path != "" {
         delete(d.path)
         d.path = ""
+    }
+}
+
+dired_sort_name :: proc(sort_by: DiredSortBy) -> string {
+    switch sort_by {
+    case .Name: return "Name"
+    case .Size: return "Size"
+    case .Time: return "Time"
+    }
+    return "Name"
+}
+
+dired_cycle_sort :: proc(d: ^Dired) {
+    switch d.sort_by {
+    case .Name: d.sort_by = .Size
+    case .Size: d.sort_by = .Time
+    case .Time: d.sort_by = .Name
+    }
+}
+
+dired_compare_entries :: proc(a, b: DiredEntry, sort_by: DiredSortBy, order: DiredSortOrder) -> bool {
+    result := false
+    switch sort_by {
+    case .Name:
+        result = strings.compare(a.name, b.name) < 0
+    case .Size:
+        if a.size == b.size {
+            result = strings.compare(a.name, b.name) < 0
+        } else {
+            result = a.size < b.size
+        }
+    case .Time:
+        diff := time.diff(a.mod_time, b.mod_time)
+        if diff == 0 {
+            result = strings.compare(a.name, b.name) < 0
+        } else {
+            // By default for Time, newer files first
+            result = diff > 0
+        }
+    }
+
+    if order == .Desc {
+        result = !result
+    }
+    return result
+}
+
+dired_sort_entries :: proc(d: ^Dired) {
+    if len(d.entries) <= 2 do return // entry 0 is always ".."
+
+    dirs := make([dynamic]DiredEntry, context.allocator)
+    defer delete(dirs)
+    files := make([dynamic]DiredEntry, context.allocator)
+    defer delete(files)
+
+    for i := 1; i < len(d.entries); i += 1 {
+        entry := d.entries[i]
+        if entry.is_dir {
+            append(&dirs, entry)
+        } else {
+            append(&files, entry)
+        }
+    }
+
+    // Sort directories
+    for i := 0; i < len(dirs); i += 1 {
+        for j := i + 1; j < len(dirs); j += 1 {
+            if !dired_compare_entries(dirs[i], dirs[j], d.sort_by, d.sort_order) {
+                dirs[i], dirs[j] = dirs[j], dirs[i]
+            }
+        }
+    }
+
+    // Sort files
+    for i := 0; i < len(files); i += 1 {
+        for j := i + 1; j < len(files); j += 1 {
+            if !dired_compare_entries(files[i], files[j], d.sort_by, d.sort_order) {
+                files[i], files[j] = files[j], files[i]
+            }
+        }
+    }
+
+    parent := d.entries[0]
+    clear(&d.entries)
+    append(&d.entries, parent)
+    for de in dirs {
+        append(&d.entries, de)
+    }
+    for fe in files {
+        append(&d.entries, fe)
     }
 }
 
@@ -60,45 +175,26 @@ dired_load_path :: proc(d: ^Dired, dir_path: string) -> bool {
 
     // Parent directory entry ".."
     append(&d.entries, DiredEntry{
-        name   = strings.clone(".."),
-        is_dir = true,
-        size   = 0,
+        name     = strings.clone(".."),
+        is_dir   = true,
+        size     = 0,
+        mod_time = time.now(),
     })
-
-    temp_dirs := make([dynamic]DiredEntry, context.allocator)
-    defer delete(temp_dirs)
-    temp_files := make([dynamic]DiredEntry, context.allocator)
-    defer delete(temp_files)
 
     for f in files {
         if f.name == "." || f.name == ".." do continue
         is_directory := f.type == .Directory
 
         entry := DiredEntry{
-            name   = strings.clone(f.name),
-            is_dir = is_directory,
-            size   = f.size,
+            name     = strings.clone(f.name),
+            is_dir   = is_directory,
+            size     = f.size,
+            mod_time = f.modification_time,
         }
-        if is_directory {
-            append(&temp_dirs, entry)
-        } else {
-            append(&temp_files, entry)
-        }
+        append(&d.entries, entry)
     }
 
-    slice.sort_by(temp_dirs[:], proc(a, b: DiredEntry) -> bool {
-        return strings.compare(a.name, b.name) < 0
-    })
-    slice.sort_by(temp_files[:], proc(a, b: DiredEntry) -> bool {
-        return strings.compare(a.name, b.name) < 0
-    })
-
-    for d_entry in temp_dirs {
-        append(&d.entries, d_entry)
-    }
-    for f_entry in temp_files {
-        append(&d.entries, f_entry)
-    }
+    dired_sort_entries(d)
 
     d.cursor = 0
     d.scroll = 0
@@ -116,6 +212,165 @@ dired_format_size :: proc(size: i64) -> string {
     }
 }
 
+dired_enter_edit_mode :: proc(d: ^Dired, e: ^Editor, font: ^Font, window: ^sdl.Window) {
+    d.is_editing = true
+
+    for orig in d.orig_entries {
+        delete(orig.name)
+    }
+    clear(&d.orig_entries)
+
+    b: strings.Builder
+    strings.builder_init(&b, context.allocator)
+    defer strings.builder_destroy(&b)
+
+    for i := 1; i < len(d.entries); i += 1 {
+        entry := d.entries[i]
+        append(&d.orig_entries, DiredEntry{
+            name     = strings.clone(entry.name),
+            is_dir   = entry.is_dir,
+            size     = entry.size,
+            mod_time = entry.mod_time,
+        })
+
+        if entry.is_dir {
+            strings.write_string(&b, entry.name)
+            strings.write_string(&b, "/\n")
+        } else {
+            strings.write_string(&b, entry.name)
+            strings.write_string(&b, "\n")
+        }
+    }
+
+    full_text := strings.to_string(b)
+    editor_destroy(e)
+    display_title := fmt.tprintf("DIRED [%s] (edit mode: :w to save, :q to cancel)", d.path)
+    editor_init(e, font, full_text, display_title)
+
+    target_row := max(0, d.cursor - 1)
+    e.cursor.row = target_row
+    e.cursor.col = 0
+    e.desired_col = 0
+    editor_set_mode(e, .Insert, window)
+}
+
+dired_apply_edits :: proc(d: ^Dired, e: ^Editor) -> string {
+    full_text := pt_full_text(&e.table)
+    defer delete(full_text)
+
+    raw_lines := strings.split(full_text, "\n", context.allocator)
+    defer delete(raw_lines)
+
+    EditItem :: struct {
+        name   : string,
+        is_dir : bool,
+    }
+
+    new_items := make([dynamic]EditItem, context.allocator)
+    defer {
+        for item in new_items {
+            delete(item.name)
+        }
+        delete(new_items)
+    }
+
+    for line in raw_lines {
+        trimmed := strings.trim_space(line)
+        trimmed = strings.trim_right(trimmed, "\r")
+        if len(trimmed) == 0 do continue
+
+        is_directory := strings.has_suffix(trimmed, "/")
+        clean_name := strings.trim_right(trimmed, "/")
+        if clean_name == "." || clean_name == ".." || clean_name == "" do continue
+
+        append(&new_items, EditItem{
+            name   = strings.clone(clean_name),
+            is_dir = is_directory,
+        })
+    }
+
+    orig_matched := make([]bool, len(d.orig_entries), context.allocator)
+    defer delete(orig_matched)
+    new_matched := make([]bool, len(new_items), context.allocator)
+    defer delete(new_matched)
+
+    // Phase 1: Match identical names (unchanged items)
+    for ni := 0; ni < len(new_items); ni += 1 {
+        for oi := 0; oi < len(d.orig_entries); oi += 1 {
+            if !orig_matched[oi] && !new_matched[ni] {
+                if d.orig_entries[oi].name == new_items[ni].name && d.orig_entries[oi].is_dir == new_items[ni].is_dir {
+                    orig_matched[oi] = true
+                    new_matched[ni] = true
+                    break
+                }
+            }
+        }
+    }
+
+    renamed_count := 0
+    created_count := 0
+    deleted_count := 0
+
+    // Phase 2: Pair unmatched original with unmatched new (Renames)
+    for oi := 0; oi < len(d.orig_entries); oi += 1 {
+        if orig_matched[oi] do continue
+        for ni := 0; ni < len(new_items); ni += 1 {
+            if new_matched[ni] do continue
+
+            old_path, _ := filepath.join([]string{d.path, d.orig_entries[oi].name}, context.allocator)
+            defer delete(old_path)
+            new_path, _ := filepath.join([]string{d.path, new_items[ni].name}, context.allocator)
+            defer delete(new_path)
+
+            if os.rename(old_path, new_path) == nil {
+                renamed_count += 1
+                orig_matched[oi] = true
+                new_matched[ni] = true
+                break
+            }
+        }
+    }
+
+    // Phase 3: Create remaining unmatched new items
+    for ni := 0; ni < len(new_items); ni += 1 {
+        if new_matched[ni] do continue
+
+        new_path, _ := filepath.join([]string{d.path, new_items[ni].name}, context.allocator)
+        defer delete(new_path)
+
+        if new_items[ni].is_dir {
+            if os.make_directory(new_path) == nil {
+                created_count += 1
+                new_matched[ni] = true
+            }
+        } else {
+            if os.write_entire_file(new_path, "") == nil {
+                created_count += 1
+                new_matched[ni] = true
+            }
+        }
+    }
+
+    // Phase 4: Delete remaining unmatched original items
+    for oi := 0; oi < len(d.orig_entries); oi += 1 {
+        if orig_matched[oi] do continue
+
+        old_path, _ := filepath.join([]string{d.path, d.orig_entries[oi].name}, context.allocator)
+        defer delete(old_path)
+
+        if os.remove(old_path) == nil {
+            deleted_count += 1
+            orig_matched[oi] = true
+        }
+    }
+
+    // Refresh directory & sort
+    dired_load_path(d, d.path)
+    d.is_editing = false
+
+    return fmt.tprintf("Dired: applied changes (%d created, %d renamed, %d deleted)", created_count, renamed_count, deleted_count)
+}
+
 dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane) -> bool {
     #partial switch event.type {
     case .KEY_DOWN:
@@ -123,10 +378,45 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
         key := event.key.key
         mod := event.key.mod
         is_shift := (mod & sdl.KMOD_SHIFT) != {}
+        is_ctrl := (mod & sdl.KMOD_CTRL) != {}
 
-        // Command mode trigger ':' from Dired!
+        // Command mode trigger ':' from Dired
         if key == sdl.K_COLON || (key == sdl.K_SEMICOLON && is_shift) {
             app_open_command_prompt(app)
+            return true
+        }
+
+        // Toggle edit mode via 'i' or 'Esc'
+        if key == sdl.K_I || key == sdl.K_ESCAPE {
+            dired_enter_edit_mode(d, &pane.editor, &app.font, app.window)
+            app.cmd_prompt.message = "-- DIRED EDIT -- Add/edit lines (dir/ for folders), :w to save, :q to cancel"
+            return true
+        }
+
+        // Cycle sort with 's' or reverse with 'S'
+        if key == sdl.K_S {
+            if is_shift {
+                d.sort_order = .Desc if d.sort_order == .Asc else .Asc
+            } else {
+                dired_cycle_sort(d)
+            }
+            dired_sort_entries(d)
+            app.cmd_prompt.message = fmt.tprintf("Dired: sorted by %s (%s)", dired_sort_name(d.sort_by), "desc" if d.sort_order == .Desc else "asc")
+            return true
+        }
+
+        // Block navigation with Ctrl+j and Ctrl+k
+        if is_ctrl && (key == sdl.K_J || key == sdl.K_DOWN) {
+            if len(d.entries) > 0 {
+                d.cursor = min(len(d.entries) - 1, d.cursor + 5)
+            }
+            return true
+        }
+
+        if is_ctrl && (key == sdl.K_K || key == sdl.K_UP) {
+            if len(d.entries) > 0 {
+                d.cursor = max(0, d.cursor - 5)
+            }
             return true
         }
 
@@ -163,14 +453,13 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
                 } else {
                     target_file, _ := filepath.join([]string{d.path, entry.name}, context.allocator)
                     defer delete(target_file)
-                    // Directly replace current split with the selected file!
                     app_pane_open_file(app, pane, target_file)
                 }
             }
             return true
 
-        case sdl.K_ESCAPE, sdl.K_Q:
-            if pane != nil && pane.editor.file_path != "" {
+        case sdl.K_Q:
+            if pane != nil && pane.editor.file_path != "" && !strings.has_prefix(pane.editor.file_path, "DIRED") {
                 pane.kind = .Editor
             } else if len(app.panes) > 1 {
                 app_close_pane(app, pane)
@@ -230,9 +519,10 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
     sdl.SetRenderDrawColor(renderer, 28, 30, 38, 255)
     sdl.RenderFillRect(renderer, &header_rect)
 
-    header_line := fmt.tprintf("DIR: %s", d.path)
+    sort_info := fmt.tprintf("[Sort: %s (%s)]", dired_sort_name(d.sort_by), "desc" if d.sort_order == .Desc else "asc")
+    header_line := fmt.tprintf("DIR: %s   %s", d.path, sort_info)
     push_line(font, header_line, Vec2{rect.x + 16.0, rect.y + 4.0}, sdl.FColor{0.95, 0.85, 0.45, 1.0}, .HALF)
-    push_line(font, "Press <Enter>/<l> to open, <h>/<-> for parent, <:> for commands", Vec2{rect.x + 16.0, rect.y + 4.0 + line_h}, sdl.FColor{0.5, 0.55, 0.65, 1.0}, .HALF)
+    push_line(font, "<i>/<Esc> edit, <Enter>/<l> open, <h>/<-> parent, <s> sort, <:> command", Vec2{rect.x + 16.0, rect.y + 4.0 + line_h}, sdl.FColor{0.5, 0.55, 0.65, 1.0}, .HALF)
 
     div_rect := sdl.FRect{
         x = rect.x,
@@ -290,13 +580,13 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
         w = rect.w,
         h = status_bar_h,
     }
-    status_bar_bg := is_focused ? sdl.FColor{0.14, 0.16, 0.22, 1.0} : sdl.FColor{0.1, 0.11, 0.14, 1.0}
+    status_bar_bg := sdl.FColor{0.14, 0.16, 0.22, 1.0} if is_focused else sdl.FColor{0.1, 0.11, 0.14, 1.0}
     sdl.SetRenderDrawColorFloat(renderer, status_bar_bg.r, status_bar_bg.g, status_bar_bg.b, status_bar_bg.a)
     sdl.RenderFillRect(renderer, &status_bar_rect)
 
-    focus_badge := is_focused ? "[ACTIVE] " : ""
-    status_str := fmt.tprintf("%s-- DIRED --   %d / %d items", focus_badge, d.cursor + 1, len(d.entries))
-    status_color := is_focused ? sdl.FColor{0.95, 0.75, 0.3, 1.0} : sdl.FColor{0.6, 0.6, 0.6, 1.0}
+    focus_badge := "[ACTIVE] " if is_focused else ""
+    status_str := fmt.tprintf("%s-- DIRED --   %d / %d items   (<s> to sort, <i>/<Esc> to edit)", focus_badge, d.cursor + 1, len(d.entries))
+    status_color := sdl.FColor{0.95, 0.75, 0.3, 1.0} if is_focused else sdl.FColor{0.6, 0.6, 0.6, 1.0}
     push_line(font, status_str, Vec2{rect.x + 10.0, rect.y + rect.h - status_bar_h + 4.0}, status_color, .HALF)
 
     flush_text(font, renderer)

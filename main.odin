@@ -23,9 +23,10 @@ App :: struct {
     active_pane   : ^Pane,
     root_split    : ^SplitNode,
     next_pane_id  : int,
-    cmd_prompt    : CommandPrompt,
-    pending_w_cmd : bool,
-    running       : bool,
+    cmd_prompt       : CommandPrompt,
+    pending_w_cmd    : bool,
+    last_compile_cmd : string,
+    running          : bool,
 }
 
 app_open_command_prompt :: proc(app: ^App) {
@@ -86,27 +87,98 @@ app_open_dired :: proc(app: ^App, dir_path: string) {
     app_pane_open_dired(app, app.active_pane, dir_path)
 }
 
+app_run_compile :: proc(app: ^App, cmd_str: string) {
+    target_cmd := strings.trim_space(cmd_str)
+    if target_cmd == "" {
+        if app.last_compile_cmd != "" {
+            target_cmd = app.last_compile_cmd
+        } else {
+            if os.exists("Makefile") {
+                target_cmd = "make"
+            } else {
+                target_cmd = "odin check ."
+            }
+        }
+    }
+    if app.last_compile_cmd != "" do delete(app.last_compile_cmd)
+    app.last_compile_cmd = strings.clone(target_cmd)
+
+    comp_pane: ^Pane = nil
+    for p in app.panes {
+        if p.kind == .Compilation {
+            comp_pane = p
+            break
+        }
+    }
+
+    if comp_pane == nil {
+        app_split_pane(app, app.active_pane, .Horizontal)
+        comp_pane = app.active_pane
+        comp_pane.kind = .Compilation
+    }
+
+    compilation_run_command(&comp_pane.compilation, target_cmd)
+    app.cmd_prompt.message = fmt.tprintf("Compilation: %s", comp_pane.compilation.status)
+}
+
 app_execute_command :: proc(app: ^App, raw_cmd: string) {
     cmd := strings.trim_space(raw_cmd)
     if cmd == "" do return
 
     if cmd == "w" {
-        if app.active_pane != nil && app.active_pane.kind == .Editor {
-            if editor_save_file(&app.active_pane.editor) {
-                app.cmd_prompt.message = fmt.tprintf("\"%s\" written", app.active_pane.editor.file_path)
+        if app.active_pane != nil {
+            if app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
+                msg := dired_apply_edits(&app.active_pane.dired, &app.active_pane.editor)
+                app.cmd_prompt.message = msg
+                _ = sdl.StopTextInput(app.window)
+            } else if app.active_pane.kind == .Editor {
+                if editor_save_file(&app.active_pane.editor) {
+                    app.cmd_prompt.message = fmt.tprintf("\"%s\" written", app.active_pane.editor.file_path)
+                } else {
+                    app.cmd_prompt.message = "E32: No file name"
+                }
             } else {
-                app.cmd_prompt.message = "E32: No file name"
+                app.cmd_prompt.message = "Cannot write non-file buffer"
             }
-        } else {
-            app.cmd_prompt.message = "Cannot write non-file buffer"
         }
     } else if cmd == "q" {
-        app_close_pane(app, app.active_pane)
-    } else if cmd == "wq" || cmd == "x" {
-        if app.active_pane != nil && app.active_pane.kind == .Editor {
-            editor_save_file(&app.active_pane.editor)
+        if app.active_pane != nil && app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
+            app.active_pane.dired.is_editing = false
+            _ = sdl.StopTextInput(app.window)
+            app.cmd_prompt.message = "Dired: edit cancelled"
+            return
         }
         app_close_pane(app, app.active_pane)
+    } else if cmd == "wq" || cmd == "x" {
+        if app.active_pane != nil {
+            if app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
+                msg := dired_apply_edits(&app.active_pane.dired, &app.active_pane.editor)
+                app.cmd_prompt.message = msg
+                _ = sdl.StopTextInput(app.window)
+            } else if app.active_pane.kind == .Editor {
+                editor_save_file(&app.active_pane.editor)
+                app_close_pane(app, app.active_pane)
+            }
+        }
+    } else if strings.has_prefix(cmd, "sort ") || cmd == "sort" {
+        sub := strings.trim_space(cmd[4:] if strings.has_prefix(cmd, "sort ") else "")
+        if app.active_pane != nil && app.active_pane.kind == .Dired {
+            if sub == "size" {
+                app.active_pane.dired.sort_by = .Size
+            } else if sub == "time" {
+                app.active_pane.dired.sort_by = .Time
+            } else if sub == "name" {
+                app.active_pane.dired.sort_by = .Name
+            } else if sub == "rev" || sub == "reverse" {
+                app.active_pane.dired.sort_order = .Desc if app.active_pane.dired.sort_order == .Asc else .Asc
+            } else {
+                dired_cycle_sort(&app.active_pane.dired)
+            }
+            dired_sort_entries(&app.active_pane.dired)
+            app.cmd_prompt.message = fmt.tprintf("Dired: sorted by %s (%s)", dired_sort_name(app.active_pane.dired.sort_by), "desc" if app.active_pane.dired.sort_order == .Desc else "asc")
+        } else {
+            app.cmd_prompt.message = "Not in a Dired buffer"
+        }
     } else if cmd == "qa" || cmd == "q!" {
         app.running = false
     } else if cmd == "sp" || cmd == "split" {
@@ -124,6 +196,55 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
             dir = app.active_pane.dired.path
         }
         app_pane_open_dired(app, app.active_pane, dir)
+    } else if strings.has_prefix(cmd, "compile ") || cmd == "compile" || strings.has_prefix(cmd, "make ") || cmd == "make" {
+        cmd_arg := ""
+        if strings.has_prefix(cmd, "compile ") {
+            cmd_arg = strings.trim_space(cmd[8:])
+        } else if strings.has_prefix(cmd, "make ") {
+            cmd_arg = strings.trim_space(cmd[5:])
+        }
+        app_run_compile(app, cmd_arg)
+    } else if cmd == "recompile" {
+        app_run_compile(app, app.last_compile_cmd)
+    } else if cmd == "cfirst" || cmd == "crewind" {
+        comp_pane: ^Pane = nil
+        for p in app.panes {
+            if p.kind == .Compilation {
+                comp_pane = p
+                break
+            }
+        }
+        if comp_pane != nil {
+            compilation_first_error(&comp_pane.compilation, app, comp_pane)
+        } else {
+            app.cmd_prompt.message = "No compilation buffer"
+        }
+    } else if cmd == "cn" || cmd == "cnext" || cmd == "next-error" {
+        comp_pane: ^Pane = nil
+        for p in app.panes {
+            if p.kind == .Compilation {
+                comp_pane = p
+                break
+            }
+        }
+        if comp_pane != nil {
+            compilation_next_error(&comp_pane.compilation, app, comp_pane)
+        } else {
+            app.cmd_prompt.message = "No compilation buffer"
+        }
+    } else if cmd == "cp" || cmd == "cprev" || cmd == "prev-error" {
+        comp_pane: ^Pane = nil
+        for p in app.panes {
+            if p.kind == .Compilation {
+                comp_pane = p
+                break
+            }
+        }
+        if comp_pane != nil {
+            compilation_prev_error(&comp_pane.compilation, app, comp_pane)
+        } else {
+            app.cmd_prompt.message = "No compilation buffer"
+        }
     } else if strings.has_prefix(cmd, "e ") {
         target := strings.trim_space(cmd[2:])
         app_pane_open(app, app.active_pane, target)
@@ -269,7 +390,14 @@ update :: proc(app: ^App) {
             }
 
             // Check for Ctrl+w initiation (when not in Insert mode)
-            is_insert := app.active_pane != nil && app.active_pane.kind == .Editor && app.active_pane.editor.mode == .Insert
+            is_insert := false
+            if app.active_pane != nil {
+                if app.active_pane.kind == .Editor {
+                    is_insert = app.active_pane.editor.mode == .Insert
+                } else if app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
+                    is_insert = app.active_pane.editor.mode == .Insert
+                }
+            }
             if !is_insert && is_ctrl && key == sdl.K_W {
                 app.pending_w_cmd = true
                 continue
@@ -282,7 +410,13 @@ update :: proc(app: ^App) {
             case .Editor:
                 editor_handle_event(&app.active_pane.editor, &event, app.window, app)
             case .Dired:
-                dired_handle_event(&app.active_pane.dired, &event, app, app.active_pane)
+                if app.active_pane.dired.is_editing {
+                    editor_handle_event(&app.active_pane.editor, &event, app.window, app)
+                } else {
+                    dired_handle_event(&app.active_pane.dired, &event, app, app.active_pane)
+                }
+            case .Compilation:
+                compilation_handle_event(&app.active_pane.compilation, &event, app, app.active_pane)
             }
         }
     }
@@ -310,7 +444,13 @@ draw :: proc(app: ^App) {
         case .Editor:
             editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused)
         case .Dired:
-            dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused)
+            if p.dired.is_editing {
+                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused)
+            } else {
+                dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused)
+            }
+        case .Compilation:
+            compilation_render(&p.compilation, app.renderer, &app.font, p.rect, is_focused)
         }
     }
 
@@ -383,10 +523,15 @@ cleanup :: proc(app: ^App) {
     for p in app.panes {
         editor_destroy(&p.editor)
         dired_destroy(&p.dired)
+        compilation_destroy(&p.compilation)
         free(p)
     }
     delete(app.panes)
     delete(app.cmd_prompt.buffer)
+    if app.last_compile_cmd != "" {
+        delete(app.last_compile_cmd)
+        app.last_compile_cmd = ""
+    }
 
     sdl.DestroyRenderer(app.renderer)
     sdl.DestroyWindow(app.window)

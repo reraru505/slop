@@ -29,6 +29,7 @@ Editor :: struct {
     dirty            : bool,
     command_buffer   : [dynamic]u8,
     status_message   : string,
+    desired_col      : int,
 }
 
 editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := "") {
@@ -43,6 +44,7 @@ editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := ""
         color = sdl.FColor{0.92, 0.92, 0.92, 1.0},
     }
     e.selection_anchor = e.cursor
+    e.desired_col = 0
     e.scroll_row = 0
     e.scroll_col = 0
     e.last_action = time.now()
@@ -242,6 +244,211 @@ editor_motion_word_backward :: proc(e: ^Editor) {
     editor_clamp_cursor(e)
 }
 
+// Scope and paragraph motions
+editor_line_brace_delta :: proc(line: string) -> int {
+    delta := 0
+    in_string := false
+    escaped := false
+
+    for i := 0; i < len(line); i += 1 {
+        c := line[i]
+        if escaped {
+            escaped = false
+            continue
+        }
+        if c == '\\' && in_string {
+            escaped = true
+            continue
+        }
+        if c == '"' || c == '`' {
+            in_string = !in_string
+            continue
+        }
+        if in_string do continue
+
+        // Check for line comment //
+        if i + 1 < len(line) && c == '/' && line[i + 1] == '/' {
+            break
+        }
+
+        if c == '{' {
+            delta += 1
+        } else if c == '}' {
+            delta -= 1
+        }
+    }
+    return delta
+}
+
+editor_get_line_indent :: proc(e: ^Editor, row: int) -> (indent: int, first_char_col: int, is_blank: bool) {
+    line_str, ok := pt_line_text(&e.table, row)
+    if !ok do return 0, 0, true
+    defer delete(line_str)
+
+    indent = 0
+    first_char_col = 0
+    is_blank = true
+
+    for i := 0; i < len(line_str); i += 1 {
+        c := line_str[i]
+        if c == ' ' {
+            indent += 1
+        } else if c == '\t' {
+            indent += 4
+        } else if c == '\r' || c == '\n' {
+            continue
+        } else {
+            is_blank = false
+            first_char_col = i
+            break
+        }
+    }
+
+    if is_blank {
+        first_char_col = 0
+    }
+    return indent, first_char_col, is_blank
+}
+
+editor_is_line_blank :: proc(e: ^Editor, row: int) -> bool {
+    line_str, ok := pt_line_text(&e.table, row)
+    if !ok do return true
+    defer delete(line_str)
+
+    for i := 0; i < len(line_str); i += 1 {
+        c := line_str[i]
+        if c != ' ' && c != '\t' && c != '\r' && c != '\n' {
+            return false
+        }
+    }
+    return true
+}
+
+editor_motion_scope_up :: proc(e: ^Editor) {
+    total_lines := pt_get_line_count(&e.table) + 1
+    if total_lines <= 1 || e.cursor.row <= 0 {
+        e.cursor.row = 0
+        new_len := editor_get_line_len(e, 0)
+        max_c := max(0, new_len - 1)
+        if e.mode == .Visual do max_c = new_len
+        e.cursor.col = min(max_c, e.desired_col)
+        editor_clamp_cursor(e)
+        return
+    }
+
+    cur_row := e.cursor.row
+    target_row := 0
+
+    if editor_is_line_blank(e, cur_row) {
+        // When on a blank line: skip preceding blank lines, then find the blank line above that paragraph
+        r := cur_row - 1
+        for r >= 0 && editor_is_line_blank(e, r) {
+            r -= 1
+        }
+        for r >= 0 {
+            if editor_is_line_blank(e, r) {
+                target_row = r
+                break
+            }
+            r -= 1
+        }
+    } else {
+        // When on text: find preceding blank line or enclosing scope header
+        cur_indent, _, _ := editor_get_line_indent(e, cur_row)
+        brace_depth := 0
+        r := cur_row - 1
+        for r >= 0 {
+            if editor_is_line_blank(e, r) {
+                target_row = r
+                break
+            }
+
+            line_str, ok := pt_line_text(&e.table, r)
+            if ok {
+                b_delta := editor_line_brace_delta(line_str)
+                delete(line_str)
+                brace_depth += b_delta
+                indent, _, _ := editor_get_line_indent(e, r)
+                if brace_depth > 0 || indent < cur_indent {
+                    target_row = r
+                    break
+                }
+            }
+            r -= 1
+        }
+    }
+
+    e.cursor.row = target_row
+    new_len := editor_get_line_len(e, e.cursor.row)
+    max_c := max(0, new_len - 1)
+    if e.mode == .Visual do max_c = new_len
+    e.cursor.col = min(max_c, e.desired_col)
+    editor_clamp_cursor(e)
+}
+
+editor_motion_scope_down :: proc(e: ^Editor) {
+    total_lines := pt_get_line_count(&e.table) + 1
+    if total_lines <= 1 || e.cursor.row >= total_lines - 1 {
+        e.cursor.row = max(0, total_lines - 1)
+        new_len := editor_get_line_len(e, e.cursor.row)
+        max_c := max(0, new_len - 1)
+        if e.mode == .Visual do max_c = new_len
+        e.cursor.col = min(max_c, e.desired_col)
+        editor_clamp_cursor(e)
+        return
+    }
+
+    cur_row := e.cursor.row
+    target_row := total_lines - 1
+
+    if editor_is_line_blank(e, cur_row) {
+        // When on a blank line: skip following blank lines, then find the blank line below that paragraph
+        r := cur_row + 1
+        for r < total_lines && editor_is_line_blank(e, r) {
+            r += 1
+        }
+        for r < total_lines {
+            if editor_is_line_blank(e, r) {
+                target_row = r
+                break
+            }
+            r += 1
+        }
+    } else {
+        // When on text: find following blank line or closing scope boundary
+        cur_indent, _, _ := editor_get_line_indent(e, cur_row)
+        brace_depth := 0
+        r := cur_row + 1
+        for r < total_lines {
+            if editor_is_line_blank(e, r) {
+                target_row = r
+                break
+            }
+
+            line_str, ok := pt_line_text(&e.table, r)
+            if ok {
+                b_delta := editor_line_brace_delta(line_str)
+                delete(line_str)
+                brace_depth += b_delta
+                indent, _, _ := editor_get_line_indent(e, r)
+                if brace_depth < 0 || indent < cur_indent {
+                    target_row = r
+                    break
+                }
+            }
+            r += 1
+        }
+    }
+
+    e.cursor.row = target_row
+    new_len := editor_get_line_len(e, e.cursor.row)
+    max_c := max(0, new_len - 1)
+    if e.mode == .Visual do max_c = new_len
+    e.cursor.col = min(max_c, e.desired_col)
+    editor_clamp_cursor(e)
+}
+
+
 // Selection helpers
 editor_get_selection_range :: proc(e: ^Editor) -> (start: Cursor, end: Cursor) {
     if e.cursor.row < e.selection_anchor.row ||
@@ -328,6 +535,7 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         pt_insert(&e.table, offset, "\n")
         e.cursor.row += 1
         e.cursor.col = 0
+        e.desired_col = 0
         e.dirty = true
         return true
 
@@ -482,12 +690,26 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     // Ctrl+l: word forward
     if is_ctrl && key == sdl.K_L {
         editor_motion_word_forward(e)
+        e.desired_col = e.cursor.col
         return true
     }
 
     // Ctrl+h: word backward
     if is_ctrl && key == sdl.K_H {
         editor_motion_word_backward(e)
+        e.desired_col = e.cursor.col
+        return true
+    }
+
+    // Ctrl+j: scope / paragraph jump down
+    if is_ctrl && key == sdl.K_J {
+        editor_motion_scope_down(e)
+        return true
+    }
+
+    // Ctrl+k: scope / paragraph jump up
+    if is_ctrl && key == sdl.K_K {
+        editor_motion_scope_up(e)
         return true
     }
 
@@ -523,20 +745,24 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     case sdl.K_H:
         if is_shift {
             e.cursor.col = 0
+            e.desired_col = 0
             return true
         }
         e.cursor.col = max(0, e.cursor.col - 1)
+        e.desired_col = e.cursor.col
         return true
 
     // L: Jump to end of line
     case sdl.K_L:
         if is_shift {
             e.cursor.col = line_len
+            e.desired_col = 999999
             return true
         }
         max_col := max(0, line_len - 1)
         if e.mode == .Visual do max_col = line_len
         e.cursor.col = min(max_col, e.cursor.col + 1)
+        e.desired_col = e.cursor.col
         return true
 
     // Navigation: j, k
@@ -546,7 +772,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             new_len := editor_get_line_len(e, e.cursor.row)
             max_c := max(0, new_len - 1)
             if e.mode == .Visual do max_c = new_len
-            e.cursor.col = min(max_c, e.cursor.col)
+            e.cursor.col = min(max_c, e.desired_col)
         }
         return true
 
@@ -556,28 +782,32 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             new_len := editor_get_line_len(e, e.cursor.row)
             max_c := max(0, new_len - 1)
             if e.mode == .Visual do max_c = new_len
-            e.cursor.col = min(max_c, e.cursor.col)
+            e.cursor.col = min(max_c, e.desired_col)
         }
         return true
 
     case sdl.K_LEFT:
         e.cursor.col = max(0, e.cursor.col - 1)
+        e.desired_col = e.cursor.col
         return true
 
     case sdl.K_RIGHT:
         max_col := max(0, line_len - 1)
         if e.mode == .Visual do max_col = line_len
         e.cursor.col = min(max_col, e.cursor.col + 1)
+        e.desired_col = e.cursor.col
         return true
 
     // Line start / end
     case sdl.K_0:
         e.cursor.col = 0
+        e.desired_col = 0
         return true
 
     case sdl.K_4:
         if is_shift {
             e.cursor.col = line_len
+            e.desired_col = 999999
             return true
         }
 
@@ -590,6 +820,14 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             e.pending_cmd = 'g'
         }
         return true
+
+    case sdl.K_Q:
+        if app.active_pane != nil && app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
+            app.active_pane.dired.is_editing = false
+            _ = sdl.StopTextInput(window)
+            app.cmd_prompt.message = "Dired: edit cancelled"
+            return true
+        }
 
     // Dash '-' opens parent directory in Dired
     case sdl.K_MINUS:
@@ -619,19 +857,21 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             return true
         }
 
-    // New lines
-    case sdl.K_O:
+    // New lines (o, O, Enter)
+    case sdl.K_O, sdl.K_RETURN, sdl.K_KP_ENTER:
         if e.mode != .Visual {
-            if is_shift {
+            if key == sdl.K_O && is_shift {
                 start_off := pt_line_to_offset(&e.table, e.cursor.row)
                 pt_insert(&e.table, start_off, "\n")
                 e.cursor.col = 0
+                e.desired_col = 0
             } else {
                 start_off := pt_line_to_offset(&e.table, e.cursor.row)
                 insert_pos := start_off + line_len
                 pt_insert(&e.table, insert_pos, "\n")
                 e.cursor.row += 1
                 e.cursor.col = 0
+                e.desired_col = 0
             }
             e.dirty = true
             editor_set_mode(e, .Insert, window)
