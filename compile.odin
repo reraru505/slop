@@ -398,7 +398,7 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
     return false
 }
 
-compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool) {
+compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme) {
     if rect.w < 50 || rect.h < 50 do return
 
     scale := get_font_scale_multiplier(.HALF)
@@ -422,21 +422,21 @@ compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font
     defer sdl.SetRenderClipRect(renderer, nil)
 
     // Background
-    bg_color := sdl.FColor{0.07, 0.08, 0.1, 1.0}
+    bg_color := theme.bg
     sdl.SetRenderDrawColorFloat(renderer, bg_color.r, bg_color.g, bg_color.b, bg_color.a)
     bg_rect := rect
     sdl.RenderFillRect(renderer, &bg_rect)
 
     // Header
     header_rect := sdl.FRect{rect.x, rect.y, rect.w, header_h}
-    sdl.SetRenderDrawColor(renderer, 24, 27, 34, 255)
+    sdl.SetRenderDrawColorFloat(renderer, theme.cursor_line_bg.r, theme.cursor_line_bg.g, theme.cursor_line_bg.b, theme.cursor_line_bg.a)
     sdl.RenderFillRect(renderer, &header_rect)
 
     header_text := fmt.tprintf("*compilation* : %s", c.command if c.command != "" else "[No command]")
-    push_line(font, header_text, Vec2{rect.x + 12.0, rect.y + 4.0}, sdl.FColor{0.8, 0.85, 0.95, 1.0}, .HALF)
+    push_line(font, header_text, Vec2{rect.x + 12.0, rect.y + 4.0}, theme.fg, .HALF)
 
     div_rect := sdl.FRect{rect.x, rect.y + header_h - 1.0, rect.w, 1.0}
-    sdl.SetRenderDrawColor(renderer, 44, 48, 58, 255)
+    sdl.SetRenderDrawColorFloat(renderer, theme.border.r, theme.border.g, theme.border.b, theme.border.a)
     sdl.RenderFillRect(renderer, &div_rect)
 
     // Lines
@@ -479,7 +479,7 @@ compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font
         w = rect.w,
         h = status_bar_h,
     }
-    status_bar_bg := sdl.FColor{0.14, 0.16, 0.22, 1.0} if is_focused else sdl.FColor{0.1, 0.11, 0.14, 1.0}
+    status_bar_bg := theme.status_bg if is_focused else theme.status_inactive_bg
     sdl.SetRenderDrawColorFloat(renderer, status_bar_bg.r, status_bar_bg.g, status_bar_bg.b, status_bar_bg.a)
     sdl.RenderFillRect(renderer, &status_bar_rect)
 

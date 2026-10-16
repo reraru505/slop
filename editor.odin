@@ -89,15 +89,24 @@ editor_get_cursor_offset :: proc(e: ^Editor) -> int {
     return start_off + col
 }
 
+editor_realize_virtual_spaces :: proc(e: ^Editor) {
+    line_len := editor_get_line_len(e, e.cursor.row)
+    if e.cursor.col > line_len {
+        spaces_needed := e.cursor.col - line_len
+        spaces := make([]u8, spaces_needed, context.temp_allocator)
+        for i in 0 ..< spaces_needed {
+            spaces[i] = ' '
+        }
+        start_off := pt_line_to_offset(&e.table, e.cursor.row)
+        pt_insert(&e.table, start_off + line_len, string(spaces))
+        e.dirty = true
+    }
+}
+
 editor_clamp_cursor :: proc(e: ^Editor) {
     total_lines := pt_get_line_count(&e.table) + 1
     e.cursor.row = clamp(e.cursor.row, 0, max(0, total_lines - 1))
-    line_len := editor_get_line_len(e, e.cursor.row)
-    if e.mode == .Normal {
-        e.cursor.col = clamp(e.cursor.col, 0, max(0, line_len - 1))
-    } else {
-        e.cursor.col = clamp(e.cursor.col, 0, line_len)
-    }
+    e.cursor.col = max(0, e.cursor.col)
 }
 
 editor_scroll_to_cursor :: proc(e: ^Editor, visible_lines: int, visible_cols: int) {
@@ -460,11 +469,24 @@ editor_get_selection_range :: proc(e: ^Editor) -> (start: Cursor, end: Cursor) {
 
 editor_delete_selection :: proc(e: ^Editor) {
     start_sel, end_sel := editor_get_selection_range(e)
+    total_len := pt_get_length(&e.table)
     start_off := pt_line_to_offset(&e.table, start_sel.row) + start_sel.col
 
     end_line_len := editor_get_line_len(e, end_sel.row)
+    is_full_line := (start_sel.col == 0 && end_sel.col >= end_line_len)
+
     end_col := min(end_sel.col + 1, end_line_len)
     end_off := pt_line_to_offset(&e.table, end_sel.row) + end_col
+
+    if is_full_line {
+        if end_off < total_len && pt_byte_at(&e.table, end_off) == '\n' {
+            end_off += 1
+        } else if end_off + 1 < total_len && pt_byte_at(&e.table, end_off) == '\r' && pt_byte_at(&e.table, end_off + 1) == '\n' {
+            end_off += 2
+        } else if start_off > 0 && pt_byte_at(&e.table, start_off - 1) == '\n' {
+            start_off -= 1
+        }
+    }
 
     if end_off > start_off {
         pt_delete_range(&e.table, start_off, end_off - start_off)
@@ -472,16 +494,29 @@ editor_delete_selection :: proc(e: ^Editor) {
     }
 
     e.cursor = start_sel
+    e.cursor.col = min(e.cursor.col, editor_get_line_len(e, e.cursor.row))
+    e.desired_col = e.cursor.col
     editor_set_mode(e, .Normal, nil)
 }
 
 editor_yank_selection :: proc(e: ^Editor) {
     start_sel, end_sel := editor_get_selection_range(e)
+    total_len := pt_get_length(&e.table)
     start_off := pt_line_to_offset(&e.table, start_sel.row) + start_sel.col
 
     end_line_len := editor_get_line_len(e, end_sel.row)
+    is_full_line := (start_sel.col == 0 && end_sel.col >= end_line_len)
+
     end_col := min(end_sel.col + 1, end_line_len)
     end_off := pt_line_to_offset(&e.table, end_sel.row) + end_col
+
+    if is_full_line {
+        if end_off < total_len && pt_byte_at(&e.table, end_off) == '\n' {
+            end_off += 1
+        } else if end_off + 1 < total_len && pt_byte_at(&e.table, end_off) == '\r' && pt_byte_at(&e.table, end_off + 1) == '\n' {
+            end_off += 2
+        }
+    }
 
     if end_off > start_off {
         sel_text, ok := pt_text(&e.table, start_off, end_off - start_off)
@@ -496,6 +531,98 @@ editor_yank_selection :: proc(e: ^Editor) {
 
     e.cursor = start_sel
     editor_set_mode(e, .Normal, nil)
+}
+
+editor_paste :: proc(e: ^Editor) {
+    if !sdl.HasClipboardText() do return
+    clip_raw := sdl.GetClipboardText()
+    if clip_raw == nil do return
+    clip := string(cstring(clip_raw))
+    if len(clip) == 0 do return
+
+    if e.mode == .Visual {
+        editor_delete_selection(e)
+    }
+    editor_realize_virtual_spaces(e)
+    offset := editor_get_cursor_offset(e)
+    pt_insert(&e.table, offset, clip)
+    e.cursor.col += len(clip)
+    e.desired_col = e.cursor.col
+    e.dirty = true
+}
+
+editor_move_lines :: proc(e: ^Editor, dir: int) {
+    total_lines := pt_get_line_count(&e.table) + 1
+    if total_lines <= 1 do return
+
+    r_start := e.cursor.row
+    r_end := e.cursor.row
+    if e.mode == .Visual {
+        r_start = min(e.selection_anchor.row, e.cursor.row)
+        r_end = max(e.selection_anchor.row, e.cursor.row)
+    }
+
+    if dir > 0 { // Move Down
+        if r_end >= total_lines - 1 do return
+
+        // Ensure file ends with newline before moving into bottom-most position
+        total_len := pt_get_length(&e.table)
+        if total_len > 0 && pt_byte_at(&e.table, total_len - 1) != '\n' {
+            pt_insert(&e.table, total_len, "\n")
+            total_lines = pt_get_line_count(&e.table) + 1
+        }
+
+        block_start := pt_line_to_offset(&e.table, r_start)
+        block_end := pt_line_to_offset(&e.table, r_end + 1)
+
+        target_row := r_end + 1
+        target_start := block_end
+        target_end := pt_line_to_offset(&e.table, target_row + 1) if target_row + 1 < total_lines else pt_get_length(&e.table)
+        target_len := target_end - target_start
+        if target_len <= 0 do return
+
+        target_text, ok := pt_text(&e.table, target_start, target_len)
+        if !ok do return
+        defer delete(target_text)
+
+        pt_delete_range(&e.table, target_start, target_len)
+        pt_insert(&e.table, block_start, target_text)
+
+        e.cursor.row += 1
+        e.selection_anchor.row += 1
+        e.desired_col = e.cursor.col
+        e.dirty = true
+
+    } else if dir < 0 { // Move Up
+        if r_start <= 0 do return
+
+        // Ensure file ends with newline
+        total_len := pt_get_length(&e.table)
+        if total_len > 0 && pt_byte_at(&e.table, total_len - 1) != '\n' {
+            pt_insert(&e.table, total_len, "\n")
+            total_lines = pt_get_line_count(&e.table) + 1
+        }
+
+        target_row := r_start - 1
+        target_start := pt_line_to_offset(&e.table, target_row)
+        target_end := pt_line_to_offset(&e.table, r_start)
+        target_len := target_end - target_start
+        if target_len <= 0 do return
+
+        target_text, ok := pt_text(&e.table, target_start, target_len)
+        if !ok do return
+        defer delete(target_text)
+
+        pt_delete_range(&e.table, target_start, target_len)
+
+        new_insert_offset := pt_line_to_offset(&e.table, r_end) if r_end < total_lines - 1 else pt_get_length(&e.table)
+        pt_insert(&e.table, new_insert_offset, target_text)
+
+        e.cursor.row -= 1
+        e.selection_anchor.row -= 1
+        e.desired_col = e.cursor.col
+        e.dirty = true
+    }
 }
 
 editor_delete_current_line :: proc(e: ^Editor) {
@@ -531,6 +658,7 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
 
     case sdl.K_RETURN, sdl.K_KP_ENTER:
+        editor_realize_virtual_spaces(e)
         offset := editor_get_cursor_offset(e)
         pt_insert(&e.table, offset, "\n")
         e.cursor.row += 1
@@ -540,17 +668,24 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
 
     case sdl.K_TAB:
+        editor_realize_virtual_spaces(e)
         offset := editor_get_cursor_offset(e)
         pt_insert(&e.table, offset, "    ")
         e.cursor.col += 4
+        e.desired_col = e.cursor.col
         e.dirty = true
         return true
 
     case sdl.K_BACKSPACE:
-        if e.cursor.col > 0 {
+        line_len := editor_get_line_len(e, e.cursor.row)
+        if e.cursor.col > line_len {
+            e.cursor.col -= 1
+            e.desired_col = e.cursor.col
+        } else if e.cursor.col > 0 {
             offset := editor_get_cursor_offset(e)
             pt_delete_range(&e.table, offset - 1, 1)
             e.cursor.col -= 1
+            e.desired_col = e.cursor.col
             e.dirty = true
         } else if e.cursor.row > 0 {
             prev_len := editor_get_line_len(e, e.cursor.row - 1)
@@ -564,6 +699,7 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             pt_delete_range(&e.table, del_pos, del_len)
             e.cursor.row -= 1
             e.cursor.col = prev_len
+            e.desired_col = e.cursor.col
             e.dirty = true
         }
         return true
@@ -584,18 +720,18 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
 
     case sdl.K_LEFT:
         e.cursor.col = max(0, e.cursor.col - 1)
+        e.desired_col = e.cursor.col
         return true
 
     case sdl.K_RIGHT:
-        line_len := editor_get_line_len(e, e.cursor.row)
-        e.cursor.col = min(line_len, e.cursor.col + 1)
+        e.cursor.col += 1
+        e.desired_col = e.cursor.col
         return true
 
     case sdl.K_UP:
         if e.cursor.row > 0 {
             e.cursor.row -= 1
-            line_len := editor_get_line_len(e, e.cursor.row)
-            e.cursor.col = min(line_len, e.cursor.col)
+            e.cursor.col = e.desired_col
         }
         return true
 
@@ -603,8 +739,7 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         total_lines := pt_get_line_count(&e.table) + 1
         if e.cursor.row + 1 < total_lines {
             e.cursor.row += 1
-            line_len := editor_get_line_len(e, e.cursor.row)
-            e.cursor.col = min(line_len, e.cursor.col)
+            e.cursor.col = e.desired_col
         }
         return true
     }
@@ -670,14 +805,6 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     is_ctrl  := (mod & sdl.KMOD_CTRL) != {}
 
     // Multi-key commands
-    if e.pending_cmd == 'd' {
-        e.pending_cmd = 0
-        if key == sdl.K_D {
-            editor_delete_current_line(e)
-            return true
-        }
-    }
-
     if e.pending_cmd == 'g' {
         e.pending_cmd = 0
         if key == sdl.K_G {
@@ -752,16 +879,14 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         e.desired_col = e.cursor.col
         return true
 
-    // L: Jump to end of line
+    // L: Jump to end of line or right (virtual edit)
     case sdl.K_L:
         if is_shift {
             e.cursor.col = line_len
-            e.desired_col = 999999
+            e.desired_col = line_len
             return true
         }
-        max_col := max(0, line_len - 1)
-        if e.mode == .Visual do max_col = line_len
-        e.cursor.col = min(max_col, e.cursor.col + 1)
+        e.cursor.col += 1
         e.desired_col = e.cursor.col
         return true
 
@@ -769,20 +894,14 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     case sdl.K_J, sdl.K_DOWN:
         if e.cursor.row + 1 < total_lines {
             e.cursor.row += 1
-            new_len := editor_get_line_len(e, e.cursor.row)
-            max_c := max(0, new_len - 1)
-            if e.mode == .Visual do max_c = new_len
-            e.cursor.col = min(max_c, e.desired_col)
+            e.cursor.col = e.desired_col
         }
         return true
 
     case sdl.K_K, sdl.K_UP:
         if e.cursor.row > 0 {
             e.cursor.row -= 1
-            new_len := editor_get_line_len(e, e.cursor.row)
-            max_c := max(0, new_len - 1)
-            if e.mode == .Visual do max_c = new_len
-            e.cursor.col = min(max_c, e.desired_col)
+            e.cursor.col = e.desired_col
         }
         return true
 
@@ -792,9 +911,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
 
     case sdl.K_RIGHT:
-        max_col := max(0, line_len - 1)
-        if e.mode == .Visual do max_col = line_len
-        e.cursor.col = min(max_col, e.cursor.col + 1)
+        e.cursor.col += 1
         e.desired_col = e.cursor.col
         return true
 
@@ -842,6 +959,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             if is_shift {
                 e.cursor.col = 0
             }
+            e.desired_col = e.cursor.col
             editor_set_mode(e, .Insert, window)
             return true
         }
@@ -851,8 +969,9 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             if is_shift {
                 e.cursor.col = line_len
             } else {
-                e.cursor.col = min(line_len, e.cursor.col + 1)
+                e.cursor.col += 1
             }
+            e.desired_col = e.cursor.col
             editor_set_mode(e, .Insert, window)
             return true
         }
@@ -878,27 +997,42 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             return true
         }
 
-    // Deletions / Operations
+    // Line selection with X (Kakoune / Helix style)
     case sdl.K_X:
-        if e.mode == .Visual {
-            editor_delete_selection(e)
-            return true
-        }
-        if line_len > 0 {
-            offset := editor_get_cursor_offset(e)
-            pt_delete_range(&e.table, offset, 1)
-            new_len := editor_get_line_len(e, e.cursor.row)
-            e.cursor.col = min(max(0, new_len - 1), e.cursor.col)
-            e.dirty = true
+        if e.mode != .Visual {
+            e.mode = .Visual
+            e.cursor.shape = .Block
+            e.selection_anchor = Cursor{row = e.cursor.row, col = 0}
+            e.cursor.col = max(0, line_len)
+            e.desired_col = e.cursor.col
+        } else {
+            if e.cursor.row + 1 < total_lines {
+                e.cursor.row += 1
+                e.cursor.col = max(0, editor_get_line_len(e, e.cursor.row))
+                e.desired_col = e.cursor.col
+            }
         }
         return true
 
+    // Deletion with D (single char in Normal, selection in Visual)
     case sdl.K_D:
         if e.mode == .Visual {
             editor_delete_selection(e)
             return true
         }
-        e.pending_cmd = 'd'
+        if line_len > 0 && e.cursor.col < line_len {
+            offset := pt_line_to_offset(&e.table, e.cursor.row) + e.cursor.col
+            pt_delete_range(&e.table, offset, 1)
+            e.dirty = true
+        } else if e.cursor.row + 1 < total_lines {
+            offset := pt_line_to_offset(&e.table, e.cursor.row) + line_len
+            pt_delete_range(&e.table, offset, 1)
+            e.dirty = true
+        }
+        return true
+
+    case sdl.K_P:
+        editor_paste(e)
         return true
 
     case sdl.K_Y:
@@ -931,9 +1065,11 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
         if e.mode == .Insert {
             text_str := string(event.text.text)
             if len(text_str) > 0 {
+                editor_realize_virtual_spaces(e)
                 offset := editor_get_cursor_offset(e)
                 pt_insert(&e.table, offset, text_str)
                 e.cursor.col += len(text_str)
+                e.desired_col = e.cursor.col
                 e.dirty = true
                 e.last_action = time.now()
             }
@@ -952,6 +1088,33 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
         key := event.key.key
         mod := event.key.mod
         is_ctrl := (mod & sdl.KMOD_CTRL) != {}
+        is_alt  := (mod & sdl.KMOD_ALT) != {}
+
+        // A-j: Move line or selection down
+        if is_alt && key == sdl.K_J {
+            editor_move_lines(e, 1)
+            return true
+        }
+
+        // A-k: Move line or selection up
+        if is_alt && key == sdl.K_K {
+            editor_move_lines(e, -1)
+            return true
+        }
+
+        // A-w: Copy selection (yank)
+        if is_alt && key == sdl.K_W {
+            if e.mode == .Visual {
+                editor_yank_selection(e)
+                return true
+            }
+        }
+
+        // C-y: Paste clipboard
+        if is_ctrl && key == sdl.K_Y {
+            editor_paste(e)
+            return true
+        }
 
         if is_ctrl && key == sdl.K_S {
             editor_save_file(e)
@@ -993,7 +1156,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
     return false
 }
 
-editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool) {
+editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme) {
     if rect.w < 50 || rect.h < 50 do return
 
     scale := get_font_scale_multiplier(e.font_scale)
@@ -1027,7 +1190,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
     defer sdl.SetRenderClipRect(renderer, nil)
 
     // 1. Background
-    bg_color := sdl.FColor{0.08, 0.08, 0.1, 1.0}
+    bg_color := theme.bg
     sdl.SetRenderDrawColorFloat(renderer, bg_color.r, bg_color.g, bg_color.b, bg_color.a)
     bg_rect := rect
     sdl.RenderFillRect(renderer, &bg_rect)
@@ -1039,7 +1202,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
         w = gutter_w,
         h = editor_h,
     }
-    sdl.SetRenderDrawColor(renderer, 30, 30, 34, 255)
+    sdl.SetRenderDrawColorFloat(renderer, theme.gutter_bg.r, theme.gutter_bg.g, theme.gutter_bg.b, theme.gutter_bg.a)
     sdl.RenderFillRect(renderer, &gutter_rect)
 
     // 3. Gutter separator line
@@ -1049,7 +1212,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
         w = 1.0,
         h = editor_h,
     }
-    sdl.SetRenderDrawColor(renderer, 48, 48, 56, 255)
+    sdl.SetRenderDrawColorFloat(renderer, theme.border.r, theme.border.g, theme.border.b, theme.border.a)
     sdl.RenderFillRect(renderer, &sep_rect)
 
     // 4. Current line highlight
@@ -1061,7 +1224,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
             w = rect.w - gutter_w,
             h = line_h,
         }
-        sdl.SetRenderDrawColor(renderer, 32, 34, 40, 255)
+        sdl.SetRenderDrawColorFloat(renderer, theme.cursor_line_bg.r, theme.cursor_line_bg.g, theme.cursor_line_bg.b, theme.cursor_line_bg.a)
         sdl.RenderFillRect(renderer, &hl_rect)
     }
 
@@ -1084,7 +1247,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
                 c1 = end_sel.col + 1
             } else if line_idx == start_sel.row {
                 c0 = start_sel.col
-                c1 = line_len + 1
+                c1 = max(line_len + 1, start_sel.col + 1)
             } else if line_idx == end_sel.row {
                 c0 = 0
                 c1 = end_sel.col + 1
@@ -1102,7 +1265,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
                     w = sel_w,
                     h = line_h,
                 }
-                sdl.SetRenderDrawColor(renderer, 45, 75, 120, 255)
+                sdl.SetRenderDrawColorFloat(renderer, theme.selection_bg.r, theme.selection_bg.g, theme.selection_bg.b, theme.selection_bg.a)
                 sdl.RenderFillRect(renderer, &sel_rect)
             }
         }
@@ -1112,16 +1275,16 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
     cx := rect.x + gutter_w + 4.0 + f32(e.cursor.col - e.scroll_col) * char_w
     cy := rect.y + f32(e.cursor.row - e.scroll_row) * line_h
     cursor_visible := is_focused && cursor_is_visible(&e.cursor, e.last_action)
+    e.cursor.color = theme.cursor
 
     if is_focused && e.cursor.shape == .Block {
         render_cursor(&e.cursor, renderer, cx, cy, char_w, line_h, e.last_action)
     }
 
     // 7. Push visible lines into font batcher
-    code_text_color := sdl.FColor{0.9, 0.9, 0.9, 1.0}
-    inverted_cursor_char_color := bg_color
-    active_line_num_color := sdl.FColor{0.95, 0.85, 0.45, 1.0}
-    normal_line_num_color := sdl.FColor{0.4, 0.45, 0.5, 1.0}
+    inverted_cursor_char_color := theme.bg
+    active_line_num_color := theme.gutter_active_fg
+    normal_line_num_color := theme.gutter_fg
 
     for i in 0 ..< visible_lines {
         line_idx := e.scroll_row + i
@@ -1149,14 +1312,19 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
                     hl_col = e.cursor.col - e.scroll_col
                 }
 
+                line_colors := make([]sdl.FColor, len(line_str), context.temp_allocator)
+                syntax_highlight_line(e.file_path, line_str, theme, line_colors)
+                visible_colors := line_colors[e.scroll_col:]
+
                 push_editor_line(
                     font,
                     visible_str,
                     Vec2{rect.x + gutter_w + 4.0, y_pos},
-                    code_text_color,
+                    theme.fg,
                     e.font_scale,
                     hl_col,
                     inverted_cursor_char_color,
+                    visible_colors,
                 )
             }
         }
@@ -1169,32 +1337,29 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
         w = rect.w,
         h = status_bar_h,
     }
-    if is_focused {
-        sdl.SetRenderDrawColor(renderer, 35, 38, 48, 255)
-    } else {
-        sdl.SetRenderDrawColor(renderer, 22, 24, 30, 255)
-    }
+    sb_bg := theme.status_bg if is_focused else theme.status_inactive_bg
+    sdl.SetRenderDrawColorFloat(renderer, sb_bg.r, sb_bg.g, sb_bg.b, sb_bg.a)
     sdl.RenderFillRect(renderer, &status_bar_rect)
 
     mode_text := "-- NORMAL --"
-    status_color := sdl.FColor{0.4, 0.8, 0.5, 1.0}
+    status_color := theme.keyword
     switch e.mode {
     case .Normal:
         mode_text = "-- NORMAL --"
-        status_color = sdl.FColor{0.4, 0.8, 0.5, 1.0}
+        status_color = theme.keyword
     case .Insert:
         mode_text = "-- INSERT --"
-        status_color = sdl.FColor{0.9, 0.6, 0.2, 1.0}
+        status_color = theme.string_lit
     case .Visual:
         mode_text = "-- VISUAL --"
-        status_color = sdl.FColor{0.4, 0.6, 0.95, 1.0}
+        status_color = theme.fn_name
     case .Command:
         mode_text = "-- COMMAND --"
-        status_color = sdl.FColor{1.0, 0.9, 0.4, 1.0}
+        status_color = theme.number_lit
     }
 
     if !is_focused {
-        status_color = sdl.FColor{0.5, 0.5, 0.55, 1.0}
+        status_color = theme.status_inactive_fg
     }
 
     dirty_indicator := " [+]" if e.dirty else ""

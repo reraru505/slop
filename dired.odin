@@ -161,7 +161,10 @@ dired_load_path :: proc(d: ^Dired, dir_path: string) -> bool {
     }
     clear(&d.entries)
 
-    abs_path, _ := filepath.clean(dir_path, context.allocator)
+    abs_path, abs_err := filepath.abs(dir_path, context.allocator)
+    if abs_err != nil {
+        abs_path, _ = filepath.clean(dir_path, context.allocator)
+    }
     if d.path != "" do delete(d.path)
     d.path = abs_path
 
@@ -435,8 +438,9 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
 
         case sdl.K_H, sdl.K_MINUS:
             parent := filepath.dir(d.path)
-            if parent == "" do parent = ".."
-            dired_load_path(d, parent)
+            if parent != "" {
+                dired_load_path(d, parent)
+            }
             return true
 
         case sdl.K_RETURN, sdl.K_KP_ENTER, sdl.K_L:
@@ -444,8 +448,9 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
                 entry := d.entries[d.cursor]
                 if entry.name == ".." {
                     parent := filepath.dir(d.path)
-                    if parent == "" do parent = ".."
-                    dired_load_path(d, parent)
+                    if parent != "" {
+                        dired_load_path(d, parent)
+                    }
                 } else if entry.is_dir {
                     new_path, _ := filepath.join([]string{d.path, entry.name}, context.allocator)
                     defer delete(new_path)
@@ -479,7 +484,7 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
     return false
 }
 
-dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool) {
+dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme) {
     if rect.w < 50 || rect.h < 50 do return
 
     scale := get_font_scale_multiplier(.HALF)
@@ -504,7 +509,7 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
     defer sdl.SetRenderClipRect(renderer, nil)
 
     // 1. Background
-    bg_color := sdl.FColor{0.08, 0.08, 0.1, 1.0}
+    bg_color := theme.bg
     sdl.SetRenderDrawColorFloat(renderer, bg_color.r, bg_color.g, bg_color.b, bg_color.a)
     bg_rect := rect
     sdl.RenderFillRect(renderer, &bg_rect)
@@ -516,13 +521,13 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
         w = rect.w,
         h = header_h,
     }
-    sdl.SetRenderDrawColor(renderer, 28, 30, 38, 255)
+    sdl.SetRenderDrawColorFloat(renderer, theme.cursor_line_bg.r, theme.cursor_line_bg.g, theme.cursor_line_bg.b, theme.cursor_line_bg.a)
     sdl.RenderFillRect(renderer, &header_rect)
 
     sort_info := fmt.tprintf("[Sort: %s (%s)]", dired_sort_name(d.sort_by), "desc" if d.sort_order == .Desc else "asc")
     header_line := fmt.tprintf("DIR: %s   %s", d.path, sort_info)
-    push_line(font, header_line, Vec2{rect.x + 16.0, rect.y + 4.0}, sdl.FColor{0.95, 0.85, 0.45, 1.0}, .HALF)
-    push_line(font, "<i>/<Esc> edit, <Enter>/<l> open, <h>/<-> parent, <s> sort, <:> command", Vec2{rect.x + 16.0, rect.y + 4.0 + line_h}, sdl.FColor{0.5, 0.55, 0.65, 1.0}, .HALF)
+    push_line(font, header_line, Vec2{rect.x + 16.0, rect.y + 4.0}, theme.keyword, .HALF)
+    push_line(font, "<i>/<Esc> edit, <Enter>/<l> open, <h>/<-> parent, <s> sort, <:> command", Vec2{rect.x + 16.0, rect.y + 4.0 + line_h}, theme.comment, .HALF)
 
     div_rect := sdl.FRect{
         x = rect.x,
@@ -530,7 +535,7 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
         w = rect.w,
         h = 1.0,
     }
-    sdl.SetRenderDrawColor(renderer, 48, 52, 64, 255)
+    sdl.SetRenderDrawColorFloat(renderer, theme.border.r, theme.border.g, theme.border.b, theme.border.a)
     sdl.RenderFillRect(renderer, &div_rect)
 
     // 3. Entries
@@ -548,7 +553,7 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
                 w = rect.w,
                 h = line_h,
             }
-            sdl.SetRenderDrawColor(renderer, 36, 40, 52, 255)
+            sdl.SetRenderDrawColorFloat(renderer, theme.cursor_line_bg.r, theme.cursor_line_bg.g, theme.cursor_line_bg.b, theme.cursor_line_bg.a)
             sdl.RenderFillRect(renderer, &sel_rect)
 
             mark_rect := sdl.FRect{
@@ -557,19 +562,19 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
                 w = 3.0,
                 h = line_h,
             }
-            sdl.SetRenderDrawColor(renderer, 97, 175, 239, 255)
+            sdl.SetRenderDrawColorFloat(renderer, theme.cursor.r, theme.cursor.g, theme.cursor.b, theme.cursor.a)
             sdl.RenderFillRect(renderer, &mark_rect)
         }
 
         if entry.is_dir {
             name_str := fmt.tprintf("%s/", entry.name)
-            push_line(font, name_str, Vec2{rect.x + 24.0, y_pos}, sdl.FColor{0.45, 0.75, 0.98, 1.0}, .HALF)
+            push_line(font, name_str, Vec2{rect.x + 24.0, y_pos}, theme.fn_name, .HALF)
         } else {
-            push_line(font, entry.name, Vec2{rect.x + 24.0, y_pos}, sdl.FColor{0.9, 0.9, 0.9, 1.0}, .HALF)
+            push_line(font, entry.name, Vec2{rect.x + 24.0, y_pos}, theme.fg, .HALF)
 
             size_str := dired_format_size(entry.size)
             size_x := max(rect.x + rect.w - 140.0, rect.x + 250.0)
-            push_line(font, size_str, Vec2{size_x, y_pos}, sdl.FColor{0.5, 0.5, 0.55, 1.0}, .HALF)
+            push_line(font, size_str, Vec2{size_x, y_pos}, theme.comment, .HALF)
         }
     }
 
@@ -580,13 +585,13 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
         w = rect.w,
         h = status_bar_h,
     }
-    status_bar_bg := sdl.FColor{0.14, 0.16, 0.22, 1.0} if is_focused else sdl.FColor{0.1, 0.11, 0.14, 1.0}
+    status_bar_bg := theme.status_bg if is_focused else theme.status_inactive_bg
     sdl.SetRenderDrawColorFloat(renderer, status_bar_bg.r, status_bar_bg.g, status_bar_bg.b, status_bar_bg.a)
     sdl.RenderFillRect(renderer, &status_bar_rect)
 
     focus_badge := "[ACTIVE] " if is_focused else ""
     status_str := fmt.tprintf("%s-- DIRED --   %d / %d items   (<s> to sort, <i>/<Esc> to edit)", focus_badge, d.cursor + 1, len(d.entries))
-    status_color := sdl.FColor{0.95, 0.75, 0.3, 1.0} if is_focused else sdl.FColor{0.6, 0.6, 0.6, 1.0}
+    status_color := theme.keyword if is_focused else theme.status_inactive_fg
     push_line(font, status_str, Vec2{rect.x + 10.0, rect.y + rect.h - status_bar_h + 4.0}, status_color, .HALF)
 
     flush_text(font, renderer)

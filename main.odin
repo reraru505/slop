@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 import "core:time"
 import sdl "vendor:sdl3"
@@ -16,16 +17,21 @@ CommandPrompt :: struct {
 }
 
 App :: struct {
-    window        : ^sdl.Window,
-    renderer      : ^sdl.Renderer,
-    font          : Font,
-    panes         : [dynamic]^Pane,
-    active_pane   : ^Pane,
-    root_split    : ^SplitNode,
-    next_pane_id  : int,
+    window           : ^sdl.Window,
+    renderer         : ^sdl.Renderer,
+    font             : Font,
+    panes            : [dynamic]^Pane,
+    active_pane      : ^Pane,
+    root_split       : ^SplitNode,
+    next_pane_id     : int,
     cmd_prompt       : CommandPrompt,
     pending_w_cmd    : bool,
+    pending_leader   : bool,
+    working_dir      : string,
+    file_picker      : FilePicker,
     last_compile_cmd : string,
+    current_theme_id : ThemeId,
+    theme            : Theme,
     running          : bool,
 }
 
@@ -262,6 +268,56 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         }
     } else if cmd == "bn" || cmd == "bnext" {
         app_cycle_pane(app)
+    } else if strings.has_prefix(cmd, "theme ") || cmd == "theme" || strings.has_prefix(cmd, "colorscheme ") || cmd == "colorscheme" {
+        arg := ""
+        if strings.has_prefix(cmd, "theme ") {
+            arg = strings.trim_space(cmd[6:])
+        } else if strings.has_prefix(cmd, "colorscheme ") {
+            arg = strings.trim_space(cmd[12:])
+        }
+        if arg == "" {
+            next_id := ThemeId((int(app.current_theme_id) + 1) % 4)
+            app.current_theme_id = next_id
+            app.theme = theme_get(next_id)
+            app.cmd_prompt.message = fmt.tprintf("Theme: %s", app.theme.name)
+        } else {
+            id, ok := theme_from_name(arg)
+            if ok {
+                app.current_theme_id = id
+                app.theme = theme_get(id)
+                app.cmd_prompt.message = fmt.tprintf("Theme: %s", app.theme.name)
+            } else {
+                app.cmd_prompt.message = fmt.tprintf("Unknown theme: %s (options: gruber-darker, naysayer, kanagawa, hemisu)", arg)
+            }
+        }
+    } else if strings.has_prefix(cmd, "cd ") || cmd == "cd" {
+        arg := strings.trim_space(cmd[3:]) if strings.has_prefix(cmd, "cd ") else ""
+        if arg == "" {
+            arg = os.get_env("HOME", context.temp_allocator)
+            if arg == "" do arg = "."
+        }
+        abs_target, abs_err := filepath.abs(arg, context.temp_allocator)
+        if abs_err == nil && os.is_dir(abs_target) {
+            if app.working_dir != "" do delete(app.working_dir)
+            app.working_dir = strings.clone(abs_target, context.allocator)
+            _ = os.set_working_directory(app.working_dir)
+            app.cmd_prompt.message = fmt.tprintf("Working dir: %s", app.working_dir)
+        } else {
+            app.cmd_prompt.message = fmt.tprintf("Invalid directory: %s", arg)
+        }
+    } else if cmd == "pwd" {
+        app.cmd_prompt.message = fmt.tprintf("Working dir: %s", app.working_dir)
+    } else if cmd == "files" || cmd == "find" || cmd == "picker" {
+        file_picker_open(&app.file_picker, app.working_dir, app.window)
+    } else if strings.has_prefix(cmd, "zoom ") || strings.has_prefix(cmd, "scale ") {
+        val_str := strings.trim_space(cmd[5:] if strings.has_prefix(cmd, "zoom ") else cmd[6:])
+        scale_val, ok := strconv.parse_f32(val_str)
+        if ok && scale_val >= 0.25 && scale_val <= 3.0 {
+            global_ui_scale = scale_val
+            app.cmd_prompt.message = fmt.tprintf("UI Scale: %.2f", global_ui_scale)
+        } else {
+            app.cmd_prompt.message = "Usage: :zoom <0.5 .. 2.5>"
+        }
     } else {
         app.cmd_prompt.message = fmt.tprintf("Unknown command: :%s", cmd)
     }
@@ -274,12 +330,24 @@ load :: proc(app: ^App) {
         panic("Failed to create SDL window and renderer")
     }
 
+    app.current_theme_id = DEFAULT_THEME
+    app.theme = theme_get(app.current_theme_id)
     app.font = load_font(app.renderer)
     app.panes = make([dynamic]^Pane, context.allocator)
     app.cmd_prompt.buffer = make([dynamic]u8, context.allocator)
     app.next_pane_id = 1
 
-    target_path := "."
+    // Initialize working directory
+    cwd, cwd_err := os.get_working_directory(context.allocator)
+    if cwd_err == nil {
+        app.working_dir = cwd
+    } else {
+        app.working_dir = strings.clone(".", context.allocator)
+    }
+
+    file_picker_init(&app.file_picker)
+
+    target_path := app.working_dir
     if len(os.args) > 1 {
         target_path = os.args[1]
     }
@@ -315,6 +383,13 @@ update :: proc(app: ^App) {
             break
         }
 
+        // If file picker is active, route event to it first
+        if app.file_picker.active {
+            if file_picker_handle_event(&app.file_picker, &event, app) {
+                continue
+            }
+        }
+
         #partial switch event.type {
         case .MOUSE_BUTTON_DOWN:
             if event.button.button == sdl.BUTTON_LEFT {
@@ -342,6 +417,16 @@ update :: proc(app: ^App) {
             key := event.key.key
             mod := event.key.mod
             is_ctrl := (mod & sdl.KMOD_CTRL) != {}
+            is_alt := (mod & sdl.KMOD_ALT) != {}
+
+            is_insert := false
+            if app.active_pane != nil {
+                if app.active_pane.kind == .Editor {
+                    is_insert = app.active_pane.editor.mode == .Insert
+                } else if app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
+                    is_insert = app.active_pane.editor.mode == .Insert
+                }
+            }
 
             // If command prompt is active, intercept all keys
             if app.cmd_prompt.active {
@@ -360,6 +445,33 @@ update :: proc(app: ^App) {
                     app_execute_command(app, cmd)
                 }
                 continue
+            }
+
+            // Zoom controls
+            if is_ctrl && (key == sdl.K_EQUALS || key == sdl.K_KP_PLUS) {
+                global_ui_scale = min(2.5, global_ui_scale + 0.1)
+                app.cmd_prompt.message = fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0)
+                continue
+            }
+            if is_ctrl && (key == sdl.K_MINUS || key == sdl.K_KP_MINUS) {
+                global_ui_scale = max(0.5, global_ui_scale - 0.1)
+                app.cmd_prompt.message = fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0)
+                continue
+            }
+            if is_ctrl && (key == sdl.K_0 || key == sdl.K_KP_0) {
+                global_ui_scale = 1.0
+                app.cmd_prompt.message = "Zoom reset (100%)"
+                continue
+            }
+
+            // Handle pending leader key (Space)
+            if app.pending_leader {
+                app.pending_leader = false
+                app.cmd_prompt.message = ""
+                if key == sdl.K_F {
+                    file_picker_open(&app.file_picker, app.working_dir, app.window)
+                    continue
+                }
             }
 
             // Clear any transient message on new keypress
@@ -390,16 +502,15 @@ update :: proc(app: ^App) {
             }
 
             // Check for Ctrl+w initiation (when not in Insert mode)
-            is_insert := false
-            if app.active_pane != nil {
-                if app.active_pane.kind == .Editor {
-                    is_insert = app.active_pane.editor.mode == .Insert
-                } else if app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
-                    is_insert = app.active_pane.editor.mode == .Insert
-                }
-            }
             if !is_insert && is_ctrl && key == sdl.K_W {
                 app.pending_w_cmd = true
+                continue
+            }
+
+            // Trigger leader key on Space when not in Insert mode
+            if !is_insert && !is_ctrl && !is_alt && key == sdl.K_SPACE {
+                app.pending_leader = true
+                app.cmd_prompt.message = "Leader: <Space> (f: file picker)"
                 continue
             }
         }
@@ -434,7 +545,7 @@ draw :: proc(app: ^App) {
     split_compute_rects(app.root_split, main_area)
 
     // Render global background
-    sdl.SetRenderDrawColor(app.renderer, 20, 20, 24, 255)
+    sdl.SetRenderDrawColorFloat(app.renderer, app.theme.bg.r, app.theme.bg.g, app.theme.bg.b, app.theme.bg.a)
     sdl.RenderClear(app.renderer)
 
     // Render all panes
@@ -442,15 +553,15 @@ draw :: proc(app: ^App) {
         is_focused := (p == app.active_pane)
         switch p.kind {
         case .Editor:
-            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused)
+            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme)
         case .Dired:
             if p.dired.is_editing {
-                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused)
+                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme)
             } else {
-                dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused)
+                dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused, &app.theme)
             }
         case .Compilation:
-            compilation_render(&p.compilation, app.renderer, &app.font, p.rect, is_focused)
+            compilation_render(&p.compilation, app.renderer, &app.font, p.rect, is_focused, &app.theme)
         }
     }
 
@@ -464,7 +575,7 @@ draw :: proc(app: ^App) {
                 w = 1.0,
                 h = p.rect.h,
             }
-            sdl.SetRenderDrawColor(app.renderer, 48, 52, 64, 255)
+            sdl.SetRenderDrawColorFloat(app.renderer, app.theme.border.r, app.theme.border.g, app.theme.border.b, app.theme.border.a)
             sdl.RenderFillRect(app.renderer, &border_rect)
         }
         // Draw 1px bottom border if not at bottom of main area
@@ -475,7 +586,7 @@ draw :: proc(app: ^App) {
                 w = p.rect.w,
                 h = 1.0,
             }
-            sdl.SetRenderDrawColor(app.renderer, 48, 52, 64, 255)
+            sdl.SetRenderDrawColorFloat(app.renderer, app.theme.border.r, app.theme.border.g, app.theme.border.b, app.theme.border.a)
             sdl.RenderFillRect(app.renderer, &border_rect)
         }
     }
@@ -487,29 +598,45 @@ draw :: proc(app: ^App) {
         w = f32(w),
         h = cmd_bar_h,
     }
-    sdl.SetRenderDrawColor(app.renderer, 18, 19, 24, 255)
+    sdl.SetRenderDrawColorFloat(app.renderer, app.theme.cmd_bar_bg.r, app.theme.cmd_bar_bg.g, app.theme.cmd_bar_bg.b, app.theme.cmd_bar_bg.a)
     sdl.RenderFillRect(app.renderer, &cmd_bar_rect)
 
     // Divider line above cmd bar
     div_rect := sdl.FRect{0, main_area_h, f32(w), 1.0}
-    sdl.SetRenderDrawColor(app.renderer, 42, 45, 54, 255)
+    sdl.SetRenderDrawColorFloat(app.renderer, app.theme.border.r, app.theme.border.g, app.theme.border.b, app.theme.border.a)
     sdl.RenderFillRect(app.renderer, &div_rect)
 
     if app.cmd_prompt.active {
         cmd_str := fmt.tprintf(":%s", string(app.cmd_prompt.buffer[:]))
-        push_line(&app.font, cmd_str, Vec2{10.0, main_area_h + 3.0}, sdl.FColor{1.0, 0.9, 0.4, 1.0}, .HALF)
+        push_line(&app.font, cmd_str, Vec2{10.0, main_area_h + 3.0}, app.theme.keyword, .HALF)
 
         // Command cursor
         char_w := app.panes[0].editor.char_advance * get_font_scale_multiplier(.HALF) if len(app.panes) > 0 else 10.0
         cur_x := 10.0 + f32(len(cmd_str)) * char_w
         cur_rect := sdl.FRect{cur_x, main_area_h + 3.0, 2.0, get_line_height(.HALF)}
-        sdl.SetRenderDrawColor(app.renderer, 255, 255, 255, 255)
+        sdl.SetRenderDrawColorFloat(app.renderer, app.theme.cursor.r, app.theme.cursor.g, app.theme.cursor.b, app.theme.cursor.a)
         sdl.RenderFillRect(app.renderer, &cur_rect)
     } else if app.pending_w_cmd {
-        push_line(&app.font, "Ctrl+W (s: split, v: vsplit, h/j/k/l: move, w: cycle, q: close)", Vec2{10.0, main_area_h + 3.0}, sdl.FColor{0.95, 0.6, 0.2, 1.0}, .HALF)
+        push_line(
+           &app.font, 
+           "Ctrl+W (s: split, v: vsplit, h/j/k/l: move, w: cycle, q: close)", 
+           Vec2{10.0, main_area_h + 3.0}, 
+           sdl.FColor{0.95, 0.6, 0.2, 1.0}, 
+           .HALF ,
+         )
     } else if app.cmd_prompt.message != "" {
-        msg_color := sdl.FColor{0.9, 0.45, 0.45, 1.0} if strings.has_prefix(app.cmd_prompt.message, "Unknown") || strings.has_prefix(app.cmd_prompt.message, "Cannot") || strings.has_prefix(app.cmd_prompt.message, "E32") else sdl.FColor{0.6, 0.85, 0.6, 1.0}
+        msg_color := sdl.FColor{0.9, 0.45, 0.45, 1.0} if 
+        strings.has_prefix(app.cmd_prompt.message, "Unknown") || 
+        strings.has_prefix(app.cmd_prompt.message, "Cannot") || 
+        strings.has_prefix(app.cmd_prompt.message, "E32") else 
+        sdl.FColor{0.6, 0.85, 0.6, 1.0}
+
         push_line(&app.font, app.cmd_prompt.message, Vec2{10.0, main_area_h + 3.0}, msg_color, .HALF)
+    }
+
+    // Render file picker modal overlay if active
+    if app.file_picker.active {
+        file_picker_render(&app.file_picker, app.renderer, &app.font, f32(w), f32(h), &app.theme)
     }
 
     flush_text(&app.font, app.renderer)
@@ -517,6 +644,12 @@ draw :: proc(app: ^App) {
 }
 
 cleanup :: proc(app: ^App) {
+    file_picker_destroy(&app.file_picker)
+    if app.working_dir != "" {
+        delete(app.working_dir)
+        app.working_dir = ""
+    }
+
     split_destroy_tree(app.root_split)
     app.root_split = nil
 

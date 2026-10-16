@@ -11,7 +11,13 @@ FONT_START   :: 32   ;
 FONT_COUNT   :: 96   ;
 LINE_HEIGHT  :: 28.0 ;
 FONT_SEP     :: 10   ;
- 
+
+// Universal font size constant (in points/pixels, baked atlas is 40)
+DEFAULT_FONT_SIZE :: 20.0 ;
+
+// Dynamic global zoom scale (1.0 = 100%)
+global_ui_scale : f32 = 1.0 ;
+
 FONT_SCALE :: enum{
    HALF ,
    QUAT ,
@@ -159,16 +165,17 @@ push_text :: proc(
 }
 
 get_font_scale_multiplier :: proc(font_scale: FONT_SCALE) -> f32 {
+   base := (f32(DEFAULT_FONT_SIZE) / f32(FONT_SIZE)) // 20.0 / 40.0 = 0.5
    switch font_scale {
-   case .HALF: return 0.5
-   case .QUAT: return 0.25
+   case .HALF: return base * global_ui_scale
+   case .QUAT: return base * 0.5 * global_ui_scale
    }
-   return 1.0
+   return base * global_ui_scale
 }
 
 get_line_height :: proc(font_scale: FONT_SCALE) -> f32 {
    scale := get_font_scale_multiplier(font_scale)
-   return scale * FONT_SIZE + scale * FONT_SEP
+   return scale * f32(FONT_SIZE) + scale * f32(FONT_SEP)
 }
 
 push_line :: proc(
@@ -235,6 +242,7 @@ push_editor_line :: proc(
    font_scale:      FONT_SCALE,
    highlight_col:   int = -1,
    highlight_color: sdl.FColor = {},
+   char_colors:     []sdl.FColor = nil,
    atlas_w:         f32 = 2048.0,
    atlas_h:         f32 = 2048.0,
 ) -> f32 {
@@ -244,7 +252,8 @@ push_editor_line :: proc(
 
    col_idx := 0
    for ch in text {
-      char_color := highlight_color if col_idx == highlight_col else color
+      base_color := char_colors[col_idx] if (char_colors != nil && col_idx < len(char_colors)) else color
+      char_color := highlight_color if col_idx == highlight_col else base_color
 
       if ch == '\t' {
          space_b := font.char_coords[' ' - 32]
