@@ -11,9 +11,16 @@ import sdl "vendor:sdl3"
 TARGET :: 16_660 * time.Microsecond
 
 CommandPrompt :: struct {
-    active  : bool,
-    buffer  : [dynamic]u8,
-    message : string,
+    active      : bool,
+    buffer      : [dynamic]u8,
+    message     : string,
+    message_buf : [512]u8,
+}
+
+app_set_message :: proc(app: ^App, msg: string) {
+    if app == nil do return
+    n := copy(app.cmd_prompt.message_buf[:], msg)
+    app.cmd_prompt.message = string(app.cmd_prompt.message_buf[:n])
 }
 
 App :: struct {
@@ -33,13 +40,14 @@ App :: struct {
     current_theme_id : ThemeId,
     theme            : Theme,
     running          : bool,
+    lsp_client       : LspClient,
 }
 
 app_open_command_prompt :: proc(app: ^App) {
     app.cmd_prompt.active = true
     clear(&app.cmd_prompt.buffer)
     app.cmd_prompt.message = ""
-    _ = sdl.StartTextInput(app.window)
+    _ = sdl.StartTextInput(app.window) 
 }
 
 app_close_command_prompt :: proc(app: ^App) {
@@ -67,6 +75,12 @@ app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string) {
 
     pane.kind = .Editor
     app.active_pane = pane
+
+    if app.lsp_client.running && file_path != "" {
+        full_text := pt_full_text(&pane.editor.table)
+        defer delete(full_text)
+        lsp_did_open(&app.lsp_client, file_path, full_text)
+    }
 }
 
 app_pane_open_dired :: proc(app: ^App, pane: ^Pane, dir_path: string) {
@@ -135,23 +149,23 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         if app.active_pane != nil {
             if app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
                 msg := dired_apply_edits(&app.active_pane.dired, &app.active_pane.editor)
-                app.cmd_prompt.message = msg
+                app_set_message(app, msg)
                 _ = sdl.StopTextInput(app.window)
             } else if app.active_pane.kind == .Editor {
-                if editor_save_file(&app.active_pane.editor) {
-                    app.cmd_prompt.message = fmt.tprintf("\"%s\" written", app.active_pane.editor.file_path)
+                if editor_save_file(&app.active_pane.editor, app) {
+                    app_set_message(app, fmt.tprintf("\"%s\" written", app.active_pane.editor.file_path))
                 } else {
-                    app.cmd_prompt.message = "E32: No file name"
+                    app_set_message(app, "E32: No file name")
                 }
             } else {
-                app.cmd_prompt.message = "Cannot write non-file buffer"
+                app_set_message(app, "Cannot write non-file buffer")
             }
         }
     } else if cmd == "q" {
         if app.active_pane != nil && app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
             app.active_pane.dired.is_editing = false
             _ = sdl.StopTextInput(app.window)
-            app.cmd_prompt.message = "Dired: edit cancelled"
+            app_set_message(app, "Dired: edit cancelled")
             return
         }
         app_close_pane(app, app.active_pane)
@@ -159,10 +173,10 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         if app.active_pane != nil {
             if app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
                 msg := dired_apply_edits(&app.active_pane.dired, &app.active_pane.editor)
-                app.cmd_prompt.message = msg
+                app_set_message(app, msg)
                 _ = sdl.StopTextInput(app.window)
             } else if app.active_pane.kind == .Editor {
-                editor_save_file(&app.active_pane.editor)
+                editor_save_file(&app.active_pane.editor, app)
                 app_close_pane(app, app.active_pane)
             }
         }
@@ -181,18 +195,18 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                 dired_cycle_sort(&app.active_pane.dired)
             }
             dired_sort_entries(&app.active_pane.dired)
-            app.cmd_prompt.message = fmt.tprintf("Dired: sorted by %s (%s)", dired_sort_name(app.active_pane.dired.sort_by), "desc" if app.active_pane.dired.sort_order == .Desc else "asc")
+            app_set_message(app, fmt.tprintf("Dired: sorted by %s (%s)", dired_sort_name(app.active_pane.dired.sort_by), "desc" if app.active_pane.dired.sort_order == .Desc else "asc"))
         } else {
-            app.cmd_prompt.message = "Not in a Dired buffer"
+            app_set_message(app, "Not in a Dired buffer")
         }
     } else if cmd == "qa" || cmd == "q!" {
         app.running = false
     } else if cmd == "sp" || cmd == "split" {
         app_split_pane(app, app.active_pane, .Horizontal)
-        app.cmd_prompt.message = "Horizontal split"
+        app_set_message(app, "Horizontal split")
     } else if cmd == "vs" || cmd == "vsplit" {
         app_split_pane(app, app.active_pane, .Vertical)
-        app.cmd_prompt.message = "Vertical split"
+        app_set_message(app, "Vertical split")
     } else if cmd == "dired" || cmd == "d" || cmd == "e ." {
         dir := "."
         if app.active_pane != nil && app.active_pane.kind == .Editor && app.active_pane.editor.file_path != "" {
@@ -279,15 +293,15 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
             next_id := ThemeId((int(app.current_theme_id) + 1) % 4)
             app.current_theme_id = next_id
             app.theme = theme_get(next_id)
-            app.cmd_prompt.message = fmt.tprintf("Theme: %s", app.theme.name)
+            app_set_message(app, fmt.tprintf("Theme: %s", app.theme.name))
         } else {
             id, ok := theme_from_name(arg)
             if ok {
                 app.current_theme_id = id
                 app.theme = theme_get(id)
-                app.cmd_prompt.message = fmt.tprintf("Theme: %s", app.theme.name)
+                app_set_message(app, fmt.tprintf("Theme: %s", app.theme.name))
             } else {
-                app.cmd_prompt.message = fmt.tprintf("Unknown theme: %s (options: gruber-darker, naysayer, kanagawa, hemisu)", arg)
+                app_set_message(app, fmt.tprintf("Unknown theme: %s (options: gruber-darker, naysayer, kanagawa, hemisu)", arg))
             }
         }
     } else if strings.has_prefix(cmd, "cd ") || cmd == "cd" {
@@ -301,12 +315,12 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
             if app.working_dir != "" do delete(app.working_dir)
             app.working_dir = strings.clone(abs_target, context.allocator)
             _ = os.set_working_directory(app.working_dir)
-            app.cmd_prompt.message = fmt.tprintf("Working dir: %s", app.working_dir)
+            app_set_message(app, fmt.tprintf("Working dir: %s", app.working_dir))
         } else {
-            app.cmd_prompt.message = fmt.tprintf("Invalid directory: %s", arg)
+            app_set_message(app, fmt.tprintf("Invalid directory: %s", arg))
         }
     } else if cmd == "pwd" {
-        app.cmd_prompt.message = fmt.tprintf("Working dir: %s", app.working_dir)
+        app_set_message(app, fmt.tprintf("Working dir: %s", app.working_dir))
     } else if cmd == "files" || cmd == "find" || cmd == "picker" {
         file_picker_open(&app.file_picker, app.working_dir, app.window)
     } else if strings.has_prefix(cmd, "zoom ") || strings.has_prefix(cmd, "scale ") {
@@ -314,12 +328,12 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         scale_val, ok := strconv.parse_f32(val_str)
         if ok && scale_val >= 0.25 && scale_val <= 3.0 {
             global_ui_scale = scale_val
-            app.cmd_prompt.message = fmt.tprintf("UI Scale: %.2f", global_ui_scale)
+            app_set_message(app, fmt.tprintf("UI Scale: %.2f", global_ui_scale))
         } else {
-            app.cmd_prompt.message = "Usage: :zoom <0.5 .. 2.5>"
+            app_set_message(app, "Usage: :zoom <0.5 .. 2.5>")
         }
     } else {
-        app.cmd_prompt.message = fmt.tprintf("Unknown command: :%s", cmd)
+        app_set_message(app, fmt.tprintf("Unknown command: :%s", cmd))
     }
 }
 
@@ -370,9 +384,20 @@ load :: proc(app: ^App) {
         }
     }
 
+    // Initialize LSP (ols)
+    if os.exists("/usr/bin/ols") || os.exists("/usr/local/bin/ols") {
+        lsp_start(&app.lsp_client, "ols", app.working_dir)
+    }
+
     app.active_pane = initial_pane
     app.root_split = split_create_leaf(initial_pane)
     app.running = true
+
+    if initial_pane.kind == .Editor && app.lsp_client.running && initial_pane.editor.file_path != "" {
+        full_text := pt_full_text(&initial_pane.editor.table)
+        defer delete(full_text)
+        lsp_did_open(&app.lsp_client, initial_pane.editor.file_path, full_text)
+    }
 }
 
 update :: proc(app: ^App) {
@@ -450,17 +475,17 @@ update :: proc(app: ^App) {
             // Zoom controls
             if is_ctrl && (key == sdl.K_EQUALS || key == sdl.K_KP_PLUS) {
                 global_ui_scale = min(2.5, global_ui_scale + 0.1)
-                app.cmd_prompt.message = fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0)
+                app_set_message(app, fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0))
                 continue
             }
             if is_ctrl && (key == sdl.K_MINUS || key == sdl.K_KP_MINUS) {
                 global_ui_scale = max(0.5, global_ui_scale - 0.1)
-                app.cmd_prompt.message = fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0)
+                app_set_message(app, fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0))
                 continue
             }
             if is_ctrl && (key == sdl.K_0 || key == sdl.K_KP_0) {
                 global_ui_scale = 1.0
-                app.cmd_prompt.message = "Zoom reset (100%)"
+                app_set_message(app, "Zoom reset (100%)")
                 continue
             }
 
@@ -510,7 +535,7 @@ update :: proc(app: ^App) {
             // Trigger leader key on Space when not in Insert mode
             if !is_insert && !is_ctrl && !is_alt && key == sdl.K_SPACE {
                 app.pending_leader = true
-                app.cmd_prompt.message = "Leader: <Space> (f: file picker)"
+                app_set_message(app, "Leader: <Space> (f: file picker)")
                 continue
             }
         }
@@ -528,6 +553,88 @@ update :: proc(app: ^App) {
                 }
             case .Compilation:
                 compilation_handle_event(&app.active_pane.compilation, &event, app, app.active_pane)
+            }
+        }
+    }
+
+    // LSP update and response dispatch
+    lsp_update(&app.lsp_client, app)
+
+    // Handle completions transfer to active editor
+    if len(app.lsp_client.completions) > 0 {
+        if app.active_pane != nil && app.active_pane.kind == .Editor {
+            e := &app.active_pane.editor
+            if e.mode == .Insert {
+                for c in e.completion.all_items {
+                    delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+                }
+                clear(&e.completion.all_items)
+                for c in app.lsp_client.completions {
+                    append(&e.completion.all_items, LspCompletionItem{
+                        label         = strings.clone(c.label),
+                        detail        = strings.clone(c.detail),
+                        documentation = strings.clone(c.documentation),
+                        insert_text   = strings.clone(c.insert_text),
+                        kind          = c.kind,
+                    })
+                }
+                editor_filter_completions(e)
+            }
+        }
+        for c in app.lsp_client.completions {
+            delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+        }
+        clear(&app.lsp_client.completions)
+    }
+
+    // Handle Go to Definition result
+    if loc, ok := app.lsp_client.last_definition.?; ok {
+        app.lsp_client.last_definition = nil
+        if app.active_pane != nil && app.active_pane.kind == .Editor {
+            cur_abs, _ := filepath.abs(app.active_pane.editor.file_path, context.temp_allocator)
+            if cur_abs != loc.file_path {
+                app_pane_open_file(app, app.active_pane, loc.file_path)
+            }
+            e := &app.active_pane.editor
+            e.cursor.row = loc.row
+            e.cursor.col = loc.col
+            e.desired_col = loc.col
+            editor_clamp_cursor(e)
+            app_set_message(app, fmt.tprintf("Definition: %s:%d:%d", filepath.base(loc.file_path), loc.row + 1, loc.col + 1))
+        }
+    }
+
+    // Handle Hover result
+    if app.lsp_client.last_hover != "" {
+        clean_hover := strings.trim_space(app.lsp_client.last_hover)
+        first_nl := strings.index(clean_hover, "\n")
+        display_line := clean_hover
+        if first_nl >= 0 do display_line = clean_hover[:first_nl]
+        app_set_message(app, fmt.tprintf("Hover: %s", display_line))
+        delete(app.lsp_client.last_hover)
+        app.lsp_client.last_hover = ""
+    }
+
+    // Handle Range Formatting edits
+    if len(app.lsp_client.last_edits) > 0 {
+        if app.active_pane != nil && app.active_pane.kind == .Editor {
+            e := &app.active_pane.editor
+            editor_apply_lsp_edits(e, app.lsp_client.last_edits[:])
+            app_set_message(app, fmt.tprintf("LSP: Formatted range (%d edits)", len(app.lsp_client.last_edits)))
+        }
+        for ed in app.lsp_client.last_edits do delete(ed.new_text)
+        clear(&app.lsp_client.last_edits)
+    }
+
+    // Debounced LSP textDocument/didChange
+    if app.active_pane != nil && app.active_pane.kind == .Editor {
+        e := &app.active_pane.editor
+        if e.needs_lsp_sync && time.since(e.last_edit_time) > 250 * time.Millisecond {
+            e.needs_lsp_sync = false
+            if app.lsp_client.running && e.file_path != "" {
+                full_text := pt_full_text(&e.table)
+                defer delete(full_text)
+                lsp_did_change(&app.lsp_client, e.file_path, full_text)
             }
         }
     }
@@ -553,10 +660,10 @@ draw :: proc(app: ^App) {
         is_focused := (p == app.active_pane)
         switch p.kind {
         case .Editor:
-            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme)
+            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, &app.lsp_client)
         case .Dired:
             if p.dired.is_editing {
-                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme)
+                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, &app.lsp_client)
             } else {
                 dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused, &app.theme)
             }
@@ -668,6 +775,7 @@ cleanup :: proc(app: ^App) {
 
     sdl.DestroyRenderer(app.renderer)
     sdl.DestroyWindow(app.window)
+    lsp_stop(&app.lsp_client)
     sdl.Quit()
 }
 
@@ -687,5 +795,6 @@ main :: proc() {
         if remaining > 0 {
             time.sleep(remaining)
         }
+        free_all(context.temp_allocator)
     }
 }

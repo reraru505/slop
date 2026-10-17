@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 import "core:time"
 import sdl "vendor:sdl3"
@@ -14,22 +15,43 @@ EditorMode :: enum {
     Command,
 }
 
+CompletionState :: struct {
+    active         : bool,
+    items          : [dynamic]LspCompletionItem,
+    all_items      : [dynamic]LspCompletionItem,
+    selected       : int,
+    scroll_offset  : int,
+    trigger_row    : int,
+    trigger_col    : int,
+    prefix         : string,
+}
+
 Editor :: struct {
-    table            : PieceTable,
-    cursor           : Cursor,
-    selection_anchor : Cursor,
-    mode             : EditorMode,
-    scroll_row       : int,
-    scroll_col       : int,
-    last_action      : time.Time,
-    pending_cmd      : rune,
-    font_scale       : FONT_SCALE,
-    char_advance     : f32,
-    file_path        : string,
-    dirty            : bool,
-    command_buffer   : [dynamic]u8,
-    status_message   : string,
-    desired_col      : int,
+    table              : PieceTable,
+    cursor             : Cursor,
+    selection_anchor   : Cursor,
+    mode               : EditorMode,
+    scroll_row         : int,
+    scroll_col         : int,
+    last_action        : time.Time,
+    pending_cmd        : rune,
+    font_scale         : FONT_SCALE,
+    char_advance       : f32,
+    file_path          : string,
+    dirty              : bool,
+    command_buffer     : [dynamic]u8,
+    status_message     : string,
+    status_message_buf : [256]u8,
+    desired_col        : int,
+    needs_lsp_sync     : bool,
+    last_edit_time     : time.Time,
+    completion         : CompletionState,
+}
+
+editor_set_status_message :: proc(e: ^Editor, msg: string) {
+    if e == nil do return
+    n := copy(e.status_message_buf[:], msg)
+    e.status_message = string(e.status_message_buf[:n])
 }
 
 editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := "") {
@@ -52,12 +74,33 @@ editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := ""
     e.file_path = strings.clone(file_path)
     e.dirty = false
     e.command_buffer = make([dynamic]u8, context.allocator)
-    e.status_message = ""
+    editor_set_status_message(e, "")
+    e.needs_lsp_sync = false
+    e.last_edit_time = time.now()
+    e.completion.active = false
+    e.completion.items = make([dynamic]LspCompletionItem, 0, 32)
+    e.completion.all_items = make([dynamic]LspCompletionItem, 0, 64)
+    e.completion.prefix = ""
 }
 
 editor_destroy :: proc(e: ^Editor) {
     pt_destroy(&e.table)
     delete(e.command_buffer)
+    for c in e.completion.items {
+        delete(c.label)
+        delete(c.detail)
+        delete(c.documentation)
+        delete(c.insert_text)
+    }
+    delete(e.completion.items)
+    for c in e.completion.all_items {
+        delete(c.label)
+        delete(c.detail)
+        delete(c.documentation)
+        delete(c.insert_text)
+    }
+    delete(e.completion.all_items)
+    if e.completion.prefix != "" do delete(e.completion.prefix)
     if e.file_path != "" {
         delete(e.file_path)
         e.file_path = ""
@@ -143,17 +186,24 @@ editor_set_mode :: proc(e: ^Editor, new_mode: EditorMode, window: ^sdl.Window) {
     }
 }
 
-editor_save_file :: proc(e: ^Editor) -> bool {
+editor_save_file :: proc(e: ^Editor, app: ^App = nil) -> bool {
     if e.file_path == "" do return false
     full := pt_full_text(&e.table)
     defer delete(full)
     err := os.write_entire_file(e.file_path, transmute([]u8)full)
     if err == nil {
         e.dirty = false
-        e.status_message = "File saved successfully."
+        editor_set_status_message(e, "File saved successfully.")
+        if app != nil && app.lsp_client.running {
+            if e.needs_lsp_sync {
+                e.needs_lsp_sync = false
+                lsp_did_change(&app.lsp_client, e.file_path, full)
+            }
+            lsp_did_save(&app.lsp_client, e.file_path)
+        }
         return true
     }
-    e.status_message = "Error: Failed to save file."
+    editor_set_status_message(e, "Error: Failed to save file.")
     return false
 }
 
@@ -625,6 +675,226 @@ editor_move_lines :: proc(e: ^Editor, dir: int) {
     }
 }
 
+editor_filter_completions :: proc(e: ^Editor) {
+    for c in e.completion.items {
+        delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+    }
+    clear(&e.completion.items)
+
+    if len(e.completion.all_items) == 0 {
+        e.completion.active = false
+        return
+    }
+
+    // Determine current typed prefix
+    line_start := pt_line_to_offset(&e.table, e.cursor.row)
+    cur_off := line_start + e.cursor.col
+    trig_off := line_start + e.completion.trigger_col
+    cur_prefix := ""
+    if cur_off > trig_off && e.cursor.row == e.completion.trigger_row {
+        if s, ok := pt_text(&e.table, trig_off, cur_off - trig_off, context.temp_allocator); ok {
+            cur_prefix = s
+        }
+    }
+
+    if e.completion.prefix != "" do delete(e.completion.prefix)
+    e.completion.prefix = strings.clone(cur_prefix, context.allocator)
+
+    if cur_prefix == "" {
+        // No prefix: show items up to 100
+        count := min(100, len(e.completion.all_items))
+        for i in 0 ..< count {
+            c := e.completion.all_items[i]
+            append(&e.completion.items, LspCompletionItem{
+                label         = strings.clone(c.label),
+                detail        = strings.clone(c.detail),
+                documentation = strings.clone(c.documentation),
+                insert_text   = strings.clone(c.insert_text),
+                kind          = c.kind,
+            })
+        }
+    } else {
+        pref_lower := strings.to_lower(cur_prefix, context.temp_allocator)
+
+        // Pass 1: exact case prefix match
+        for c in e.completion.all_items {
+            if strings.has_prefix(c.label, cur_prefix) {
+                append(&e.completion.items, LspCompletionItem{
+                    label         = strings.clone(c.label),
+                    detail        = strings.clone(c.detail),
+                    documentation = strings.clone(c.documentation),
+                    insert_text   = strings.clone(c.insert_text),
+                    kind          = c.kind,
+                })
+            }
+        }
+
+        // Pass 2: case-insensitive prefix match (not already added)
+        for c in e.completion.all_items {
+            if !strings.has_prefix(c.label, cur_prefix) {
+                lbl_lower := strings.to_lower(c.label, context.temp_allocator)
+                if strings.has_prefix(lbl_lower, pref_lower) {
+                    append(&e.completion.items, LspCompletionItem{
+                        label         = strings.clone(c.label),
+                        detail        = strings.clone(c.detail),
+                        documentation = strings.clone(c.documentation),
+                        insert_text   = strings.clone(c.insert_text),
+                        kind          = c.kind,
+                    })
+                }
+            }
+        }
+
+        // Pass 3: substring match (not prefix)
+        for c in e.completion.all_items {
+            lbl_lower := strings.to_lower(c.label, context.temp_allocator)
+            if !strings.has_prefix(lbl_lower, pref_lower) && strings.contains(lbl_lower, pref_lower) {
+                append(&e.completion.items, LspCompletionItem{
+                    label         = strings.clone(c.label),
+                    detail        = strings.clone(c.detail),
+                    documentation = strings.clone(c.documentation),
+                    insert_text   = strings.clone(c.insert_text),
+                    kind          = c.kind,
+                })
+            }
+        }
+    }
+
+    e.completion.selected = 0
+    e.completion.scroll_offset = 0
+    e.completion.active = len(e.completion.items) > 0
+}
+
+editor_apply_completion :: proc(e: ^Editor) {
+    if !e.completion.active || len(e.completion.items) == 0 do return
+    if e.completion.selected < 0 || e.completion.selected >= len(e.completion.items) do return
+
+    item := e.completion.items[e.completion.selected]
+    insert_str := item.insert_text if item.insert_text != "" else item.label
+    if len(insert_str) == 0 do return
+
+    // If prefix was typed, replace it
+    if e.cursor.col > e.completion.trigger_col {
+        del_count := e.cursor.col - e.completion.trigger_col
+        offset := pt_line_to_offset(&e.table, e.cursor.row) + e.completion.trigger_col
+        pt_delete_range(&e.table, offset, del_count)
+        e.cursor.col = e.completion.trigger_col
+    }
+
+    offset := pt_line_to_offset(&e.table, e.cursor.row) + e.cursor.col
+    pt_insert(&e.table, offset, insert_str)
+    e.cursor.col += len(insert_str)
+    e.desired_col = e.cursor.col
+    e.dirty = true
+    e.needs_lsp_sync = true
+    e.last_edit_time = time.now()
+
+    for c in e.completion.items {
+        delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+    }
+    clear(&e.completion.items)
+    for c in e.completion.all_items {
+        delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+    }
+    clear(&e.completion.all_items)
+    e.completion.active = false
+}
+
+editor_open_completion_doc :: proc(e: ^Editor, app: ^App) {
+    if !e.completion.active || len(e.completion.items) == 0 do return
+    if e.completion.selected < 0 || e.completion.selected >= len(e.completion.items) do return
+
+    item := e.completion.items[e.completion.selected]
+    doc_title := fmt.tprintf("*doc: %s*", item.label)
+
+    b: strings.Builder
+    strings.builder_init(&b, context.temp_allocator)
+    strings.write_string(&b, "// LSP Documentation Preview\n")
+    strings.write_string(&b, fmt.tprintf("// Symbol: %s\n", item.label))
+    if item.detail != "" {
+        strings.write_string(&b, fmt.tprintf("// Detail: %s\n", item.detail))
+    }
+    strings.write_string(&b, "\n")
+    if item.documentation != "" {
+        strings.write_string(&b, item.documentation)
+        strings.write_byte(&b, '\n')
+    } else {
+        strings.write_string(&b, "(No documentation string provided by language server)\n")
+    }
+    doc_text := strings.to_string(b)
+
+    // Open in a vertical split pane
+    app_split_pane(app, app.active_pane, .Vertical)
+    doc_pane := app.active_pane
+    if doc_pane != nil {
+        doc_pane.kind = .Editor
+        editor_destroy(&doc_pane.editor)
+        editor_init(&doc_pane.editor, &app.font, doc_text, doc_title)
+        doc_pane.editor.dirty = false
+    }
+
+    for c in e.completion.items {
+        delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+    }
+    clear(&e.completion.items)
+    for c in e.completion.all_items {
+        delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+    }
+    clear(&e.completion.all_items)
+    e.completion.active = false
+}
+
+editor_apply_lsp_edits :: proc(e: ^Editor, edits: []LspTextEdit) {
+    if len(edits) == 0 do return
+
+    // Sort edits descending (bottom to top)
+    sorted_edits := slice.clone(edits, context.temp_allocator)
+    slice.sort_by(sorted_edits, proc(a, b: LspTextEdit) -> bool {
+        if a.start_row != b.start_row do return a.start_row > b.start_row
+        return a.start_col > b.start_col
+    })
+
+    total_len := pt_get_length(&e.table)
+    line_count := pt_get_line_count(&e.table)
+
+    for ed in sorted_edits {
+        s_off: int
+        if ed.start_row <= 0 {
+            s_off = ed.start_col
+        } else if ed.start_row > line_count {
+            s_off = total_len
+        } else {
+            s_off = pt_line_to_offset(&e.table, ed.start_row) + ed.start_col
+        }
+        s_off = clamp(s_off, 0, total_len)
+
+        e_off: int
+        if ed.end_row <= 0 {
+            e_off = ed.end_col
+        } else if ed.end_row > line_count {
+            e_off = total_len
+        } else {
+            e_off = pt_line_to_offset(&e.table, ed.end_row) + ed.end_col
+        }
+        e_off = clamp(e_off, s_off, total_len)
+
+        del_len := e_off - s_off
+        if del_len > 0 {
+            pt_delete_range(&e.table, s_off, del_len)
+        }
+        if len(ed.new_text) > 0 {
+            pt_insert(&e.table, s_off, ed.new_text)
+        }
+        total_len = pt_get_length(&e.table)
+        line_count = pt_get_line_count(&e.table)
+    }
+
+    e.dirty = true
+    e.needs_lsp_sync = true
+    e.last_edit_time = time.now()
+    editor_clamp_cursor(e)
+}
+
 editor_delete_current_line :: proc(e: ^Editor) {
     total_lines := pt_get_line_count(&e.table) + 1
     start_off := pt_line_to_offset(&e.table, e.cursor.row)
@@ -650,14 +920,32 @@ editor_delete_current_line :: proc(e: ^Editor) {
     editor_clamp_cursor(e)
 }
 
-editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, window: ^sdl.Window) -> bool {
+editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, window: ^sdl.Window, app: ^App) -> bool {
+    is_shift := (mod & sdl.KMOD_SHIFT) != {}
+    is_ctrl  := (mod & sdl.KMOD_CTRL) != {}
+
     switch key {
     case sdl.K_ESCAPE:
-        // ESC = Insert / Normal toggle
+        if e.completion.active {
+            e.completion.active = false
+            return true
+        }
         editor_set_mode(e, .Normal, window)
         return true
 
     case sdl.K_RETURN, sdl.K_KP_ENTER:
+        if e.completion.active && len(e.completion.items) > 0 {
+            if is_shift {
+                // Shift+Enter: open documentation / definition in a vertical split!
+                editor_open_completion_doc(e, app)
+                return true
+            } else {
+                // Enter: complete selected symbol
+                editor_apply_completion(e)
+                return true
+            }
+        }
+        e.completion.active = false
         editor_realize_virtual_spaces(e)
         offset := editor_get_cursor_offset(e)
         pt_insert(&e.table, offset, "\n")
@@ -665,15 +953,64 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         e.cursor.col = 0
         e.desired_col = 0
         e.dirty = true
+        e.needs_lsp_sync = true
+        e.last_edit_time = time.now()
         return true
 
     case sdl.K_TAB:
+        if e.completion.active && len(e.completion.items) > 0 {
+            if is_shift {
+                e.completion.selected = (e.completion.selected - 1 + len(e.completion.items)) % len(e.completion.items)
+            } else {
+                e.completion.selected = (e.completion.selected + 1) % len(e.completion.items)
+            }
+            return true
+        }
         editor_realize_virtual_spaces(e)
         offset := editor_get_cursor_offset(e)
         pt_insert(&e.table, offset, "    ")
         e.cursor.col += 4
         e.desired_col = e.cursor.col
         e.dirty = true
+        e.needs_lsp_sync = true
+        e.last_edit_time = time.now()
+        return true
+
+    case sdl.K_SPACE:
+        if is_ctrl {
+            // Ctrl+Space: explicit autocomplete trigger
+            trigger_col := e.cursor.col
+            line_start := pt_line_to_offset(&e.table, e.cursor.row)
+            for trigger_col > 0 {
+                prev_char := pt_byte_at(&e.table, line_start + trigger_col - 1)
+                if (prev_char >= 'a' && prev_char <= 'z') || (prev_char >= 'A' && prev_char <= 'Z') || (prev_char >= '0' && prev_char <= '9') || prev_char == '_' {
+                    trigger_col -= 1
+                } else {
+                    break
+                }
+            }
+            e.completion.trigger_row = e.cursor.row
+            e.completion.trigger_col = trigger_col
+            if app != nil && app.lsp_client.running && e.file_path != "" {
+                if e.needs_lsp_sync {
+                    e.needs_lsp_sync = false
+                    full_text := pt_full_text(&e.table)
+                    defer delete(full_text)
+                    lsp_did_change(&app.lsp_client, e.file_path, full_text)
+                }
+                lsp_request_completion(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.col)
+            }
+            return true
+        }
+        e.completion.active = false
+        editor_realize_virtual_spaces(e)
+        offset := editor_get_cursor_offset(e)
+        pt_insert(&e.table, offset, " ")
+        e.cursor.col += 1
+        e.desired_col = e.cursor.col
+        e.dirty = true
+        e.needs_lsp_sync = true
+        e.last_edit_time = time.now()
         return true
 
     case sdl.K_BACKSPACE:
@@ -687,6 +1024,8 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             e.cursor.col -= 1
             e.desired_col = e.cursor.col
             e.dirty = true
+            e.needs_lsp_sync = true
+            e.last_edit_time = time.now()
         } else if e.cursor.row > 0 {
             prev_len := editor_get_line_len(e, e.cursor.row - 1)
             offset := pt_line_to_offset(&e.table, e.cursor.row)
@@ -701,6 +1040,15 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             e.cursor.col = prev_len
             e.desired_col = e.cursor.col
             e.dirty = true
+            e.needs_lsp_sync = true
+            e.last_edit_time = time.now()
+        }
+        if e.completion.active {
+            if e.cursor.col < e.completion.trigger_col || e.cursor.row != e.completion.trigger_row {
+                e.completion.active = false
+            } else if len(e.completion.all_items) > 0 {
+                editor_filter_completions(e)
+            }
         }
         return true
 
@@ -715,12 +1063,17 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             }
             pt_delete_range(&e.table, offset, del_len)
             e.dirty = true
+            e.needs_lsp_sync = true
+            e.last_edit_time = time.now()
         }
         return true
 
     case sdl.K_LEFT:
         e.cursor.col = max(0, e.cursor.col - 1)
         e.desired_col = e.cursor.col
+        if e.completion.active && e.cursor.col < e.completion.trigger_col {
+            e.completion.active = false
+        }
         return true
 
     case sdl.K_RIGHT:
@@ -729,17 +1082,27 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
 
     case sdl.K_UP:
+        if e.completion.active && len(e.completion.items) > 0 {
+            e.completion.selected = (e.completion.selected - 1 + len(e.completion.items)) % len(e.completion.items)
+            return true
+        }
         if e.cursor.row > 0 {
             e.cursor.row -= 1
             e.cursor.col = e.desired_col
+            e.completion.active = false
         }
         return true
 
     case sdl.K_DOWN:
+        if e.completion.active && len(e.completion.items) > 0 {
+            e.completion.selected = (e.completion.selected + 1) % len(e.completion.items)
+            return true
+        }
         total_lines := pt_get_line_count(&e.table) + 1
         if e.cursor.row + 1 < total_lines {
             e.cursor.row += 1
             e.cursor.col = e.desired_col
+            e.completion.active = false
         }
         return true
     }
@@ -767,11 +1130,11 @@ editor_handle_command_key :: proc(e: ^Editor, key: sdl.Keycode, window: ^sdl.Win
         clear(&e.command_buffer)
 
         if cmd == "w" {
-            editor_save_file(e)
+            editor_save_file(e, app)
         } else if cmd == "q" {
             app.running = false
         } else if cmd == "wq" || cmd == "x" {
-            editor_save_file(e)
+            editor_save_file(e, app)
             app.running = false
         } else if cmd == "dired" || cmd == "d" || cmd == "e ." {
             dir := filepath.dir(e.file_path)
@@ -810,6 +1173,26 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         if key == sdl.K_G {
             e.cursor.row = 0
             e.cursor.col = 0
+            return true
+        }
+        if key == sdl.K_D {
+            // gd: Go to definition
+            if app != nil && app.lsp_client.running && e.file_path != "" {
+                lsp_request_definition(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.col)
+                app_set_message(app, "LSP: Requesting definition...")
+            }
+            return true
+        }
+    }
+
+    if e.pending_cmd == '=' {
+        e.pending_cmd = 0
+        if key == sdl.K_EQUALS {
+            // ==: Format current line
+            if app != nil && app.lsp_client.running && e.file_path != "" {
+                lsp_request_range_formatting(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.row)
+                app_set_message(app, fmt.tprintf("LSP: Formatting line %d...", e.cursor.row + 1))
+            }
             return true
         }
     }
@@ -899,11 +1282,34 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
 
     case sdl.K_K, sdl.K_UP:
+        if key == sdl.K_K && is_shift {
+            // K: Hover
+            if app != nil && app.lsp_client.running && e.file_path != "" {
+                lsp_request_hover(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.col)
+                app_set_message(app, "LSP: Requesting hover...")
+            }
+            return true
+        }
         if e.cursor.row > 0 {
             e.cursor.row -= 1
             e.cursor.col = e.desired_col
         }
         return true
+
+    case sdl.K_EQUALS:
+        if e.mode == .Visual {
+            start_row := min(e.cursor.row, e.selection_anchor.row)
+            end_row := max(e.cursor.row, e.selection_anchor.row)
+            if app != nil && app.lsp_client.running && e.file_path != "" {
+                lsp_request_range_formatting(&app.lsp_client, e.file_path, start_row, end_row)
+                app_set_message(app, fmt.tprintf("LSP: Formatting lines %d-%d...", start_row + 1, end_row + 1))
+            }
+            editor_set_mode(e, .Normal, window)
+            return true
+        } else {
+            e.pending_cmd = '='
+            return true
+        }
 
     case sdl.K_LEFT:
         e.cursor.col = max(0, e.cursor.col - 1)
@@ -942,7 +1348,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         if app.active_pane != nil && app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
             app.active_pane.dired.is_editing = false
             _ = sdl.StopTextInput(window)
-            app.cmd_prompt.message = "Dired: edit cancelled"
+            app_set_message(app, "Dired: edit cancelled")
             return true
         }
 
@@ -1071,7 +1477,51 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                 e.cursor.col += len(text_str)
                 e.desired_col = e.cursor.col
                 e.dirty = true
+                e.needs_lsp_sync = true
+                e.last_edit_time = time.now()
                 e.last_action = time.now()
+
+                // Trigger or update completion when typing identifier or dot
+                if app != nil && app.lsp_client.running && e.file_path != "" {
+                    ch := text_str[len(text_str) - 1]
+                    if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' {
+                        if ch == '.' || !e.completion.active || e.cursor.row != e.completion.trigger_row {
+                            trigger_col := e.cursor.col
+                            if ch == '.' {
+                                trigger_col = e.cursor.col
+                            } else {
+                                line_start := pt_line_to_offset(&e.table, e.cursor.row)
+                                for trigger_col > 0 {
+                                    prev_char := pt_byte_at(&e.table, line_start + trigger_col - 1)
+                                    if (prev_char >= 'a' && prev_char <= 'z') || (prev_char >= 'A' && prev_char <= 'Z') || (prev_char >= '0' && prev_char <= '9') || prev_char == '_' {
+                                        trigger_col -= 1
+                                    } else {
+                                        break
+                                    }
+                                }
+                            }
+                            e.completion.trigger_row = e.cursor.row
+                            e.completion.trigger_col = trigger_col
+                        }
+
+                        // Immediate didChange sync so server has exact current buffer
+                        if e.needs_lsp_sync {
+                            e.needs_lsp_sync = false
+                            full_text := pt_full_text(&e.table)
+                            defer delete(full_text)
+                            lsp_did_change(&app.lsp_client, e.file_path, full_text)
+                        }
+
+                        // Immediate local filter on existing all_items for zero-latency keystrokes
+                        if len(e.completion.all_items) > 0 {
+                            editor_filter_completions(e)
+                        }
+
+                        lsp_request_completion(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.col)
+                    } else {
+                        e.completion.active = false
+                    }
+                }
             }
             return true
         } else if e.mode == .Command {
@@ -1117,7 +1567,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
         }
 
         if is_ctrl && key == sdl.K_S {
-            editor_save_file(e)
+            editor_save_file(e, app)
             return true
         }
 
@@ -1136,7 +1586,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
         }
 
         if e.mode == .Insert {
-            return editor_handle_insert_key(e, key, mod, window)
+            return editor_handle_insert_key(e, key, mod, window, app)
         } else if e.mode == .Command {
             return editor_handle_command_key(e, key, window, app)
         } else {
@@ -1156,7 +1606,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
     return false
 }
 
-editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme) {
+editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme, lsp: ^LspClient = nil) {
     if rect.w < 50 || rect.h < 50 do return
 
     scale := get_font_scale_multiplier(e.font_scale)
@@ -1271,6 +1721,37 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
         }
     }
 
+    // Diagnostic underlines on visible lines
+    if lsp != nil && e.file_path != "" {
+        norm_path, _ := filepath.abs(e.file_path, context.temp_allocator)
+        if diags, has_diags := lsp.diagnostics[norm_path]; has_diags {
+            for d in diags {
+                for i in 0 ..< visible_lines {
+                    line_idx := e.scroll_row + i
+                    if line_idx >= total_lines do break
+                    if d.start_row <= line_idx && d.end_row >= line_idx {
+                        c_st := d.start_col if d.start_row == line_idx else 0
+                        c_en := d.end_col if d.end_row == line_idx else editor_get_line_len(e, line_idx)
+                        if c_en <= c_st do c_en = c_st + 1
+
+                        vis_st := max(0, c_st - e.scroll_col)
+                        vis_en := max(vis_st + 1, c_en - e.scroll_col)
+                        if vis_st < visible_cols {
+                            vis_en = min(visible_cols, vis_en)
+                            dx := rect.x + gutter_w + 4.0 + f32(vis_st) * char_w
+                            dw := f32(vis_en - vis_st) * char_w
+                            dy := rect.y + f32(i) * line_h + line_h - 2.0
+                            under_rect := sdl.FRect{dx, dy, dw, 2.0}
+                            d_col := sdl.FColor{0.95, 0.25, 0.25, 0.9} if d.severity == .Error else sdl.FColor{0.95, 0.75, 0.2, 0.9}
+                            sdl.SetRenderDrawColorFloat(renderer, d_col.r, d_col.g, d_col.b, d_col.a)
+                            sdl.RenderFillRect(renderer, &under_rect)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 6. Block Cursor (rendered behind text)
     cx := rect.x + gutter_w + 4.0 + f32(e.cursor.col - e.scroll_col) * char_w
     cy := rect.y + f32(e.cursor.row - e.scroll_row) * line_h
@@ -1366,7 +1847,25 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
     file_display := e.file_path if e.file_path != "" else "[No Name]"
     focus_badge := "[ACTIVE] " if is_focused else ""
     status_info := fmt.tprintf("%s%s   %s%s   Line %d/%d, Col %d", focus_badge, mode_text, file_display, dirty_indicator, e.cursor.row + 1, total_lines, e.cursor.col + 1)
-    if e.status_message != "" {
+
+    // Diagnostic message on cursor line
+    current_diag_msg := ""
+    if lsp != nil && e.file_path != "" {
+        norm_path, _ := filepath.abs(e.file_path, context.temp_allocator)
+        if diags, has_diags := lsp.diagnostics[norm_path]; has_diags {
+            for d in diags {
+                if d.start_row <= e.cursor.row && d.end_row >= e.cursor.row {
+                    current_diag_msg = d.message
+                    break
+                }
+            }
+        }
+    }
+    if current_diag_msg != "" {
+        first_nl := strings.index(current_diag_msg, "\n")
+        short_msg := current_diag_msg if first_nl < 0 else current_diag_msg[:first_nl]
+        status_info = fmt.tprintf("%s   | [LSP: %s]", status_info, short_msg)
+    } else if e.status_message != "" {
         status_info = fmt.tprintf("%s   | %s", status_info, e.status_message)
     }
 
@@ -1378,5 +1877,103 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
     // 9. Bar Cursor (in Insert Mode)
     if is_focused && e.cursor.shape == .Bar {
         render_cursor(&e.cursor, renderer, cx, cy, char_w, line_h, e.last_action)
+    }
+
+    // 10. Autocomplete Popup
+    if is_focused && e.mode == .Insert && e.completion.active && len(e.completion.items) > 0 {
+        pop_w := min(460.0 * global_ui_scale, rect.w - 20.0)
+        item_h := line_h + 2.0
+        visible_items := min(7, len(e.completion.items))
+        items_h := f32(visible_items) * item_h
+
+        sel_idx := clamp(e.completion.selected, 0, len(e.completion.items) - 1)
+        sel_item := e.completion.items[sel_idx]
+        has_doc := (sel_item.documentation != "" || sel_item.detail != "")
+        doc_preview_h : f32 = 0
+        if has_doc {
+            doc_preview_h = line_h * 2 + 8.0
+        }
+        footer_h := line_h + 6.0
+        pop_h := items_h + doc_preview_h + footer_h + 4.0
+
+        pop_x := cx
+        if pop_x + pop_w > rect.x + rect.w - 8.0 {
+            pop_x = rect.x + rect.w - pop_w - 8.0
+        }
+        pop_x = max(rect.x + 8.0, pop_x)
+
+        pop_y := cy + line_h + 2.0
+        if pop_y + pop_h > rect.y + editor_h {
+            pop_y = cy - pop_h - 2.0
+        }
+        pop_y = max(rect.y + 2.0, pop_y)
+
+        // Dropdown background
+        pop_rect := sdl.FRect{pop_x, pop_y, pop_w, pop_h}
+        sdl.SetRenderDrawColorFloat(renderer, theme.bg.r * 0.85, theme.bg.g * 0.85, theme.bg.b * 0.85, 0.98)
+        sdl.RenderFillRect(renderer, &pop_rect)
+        sdl.SetRenderDrawColorFloat(renderer, theme.border.r, theme.border.g, theme.border.b, 1.0)
+        sdl.RenderRect(renderer, &pop_rect)
+
+        // Keep scroll offset aligned
+        if e.completion.selected < e.completion.scroll_offset {
+            e.completion.scroll_offset = e.completion.selected
+        } else if e.completion.selected >= e.completion.scroll_offset + visible_items {
+            e.completion.scroll_offset = e.completion.selected - visible_items + 1
+        }
+
+        // Render visible items
+        for vi in 0 ..< visible_items {
+            idx := e.completion.scroll_offset + vi
+            if idx >= len(e.completion.items) do break
+            it := e.completion.items[idx]
+            row_y := pop_y + 2.0 + f32(vi) * item_h
+
+            if idx == e.completion.selected {
+                row_sel_rect := sdl.FRect{pop_x + 2.0, row_y, pop_w - 4.0, item_h}
+                sdl.SetRenderDrawColorFloat(renderer, theme.selection_bg.r, theme.selection_bg.g, theme.selection_bg.b, 0.9)
+                sdl.RenderFillRect(renderer, &row_sel_rect)
+            }
+
+            lbl_color := theme.keyword if idx == e.completion.selected else theme.fg
+            push_line(font, it.label, Vec2{pop_x + 8.0, row_y + 1.0}, lbl_color, e.font_scale)
+
+            if it.detail != "" {
+                det_x := pop_x + pop_w * 0.45
+                det_str := it.detail
+                if len(det_str) > 28 do det_str = det_str[:28]
+                push_line(font, det_str, Vec2{det_x, row_y + 1.0}, theme.comment, e.font_scale)
+            }
+        }
+
+        // Render Doc preview if selected item has it
+        curr_y := pop_y + 2.0 + items_h
+        if has_doc {
+            div_rect := sdl.FRect{pop_x + 2.0, curr_y, pop_w - 4.0, 1.0}
+            sdl.SetRenderDrawColorFloat(renderer, theme.border.r, theme.border.g, theme.border.b, 0.7)
+            sdl.RenderFillRect(renderer, &div_rect)
+
+            doc_text := sel_item.documentation if sel_item.documentation != "" else sel_item.detail
+            lines := strings.split(doc_text, "\n", context.temp_allocator)
+            doc_line1 := strings.trim_space(lines[0])
+            doc_line2 := ""
+            if len(lines) > 1 do doc_line2 = strings.trim_space(lines[1])
+
+            push_line(font, doc_line1, Vec2{pop_x + 8.0, curr_y + 3.0}, theme.string_lit, e.font_scale)
+            if doc_line2 != "" {
+                push_line(font, doc_line2, Vec2{pop_x + 8.0, curr_y + 3.0 + line_h}, theme.comment, e.font_scale)
+            }
+            curr_y += doc_preview_h
+        }
+
+        // Render footer bar
+        foot_div := sdl.FRect{pop_x + 2.0, curr_y, pop_w - 4.0, 1.0}
+        sdl.SetRenderDrawColorFloat(renderer, theme.border.r, theme.border.g, theme.border.b, 0.7)
+        sdl.RenderFillRect(renderer, &foot_div)
+
+        footer_text := "[Enter: Complete | Shift+Enter: Doc Split | Tab: Cycle]"
+        push_line(font, footer_text, Vec2{pop_x + 8.0, curr_y + 3.0}, theme.gutter_fg, e.font_scale)
+
+        flush_text(font, renderer)
     }
 }
