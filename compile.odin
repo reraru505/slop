@@ -552,7 +552,15 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string, working_dir :=
     c.dragging = false
     c.pending_g = false
 
-    display_cwd := working_dir
+    // `working_dir` may alias c.working_dir (the recompile key passes it), so
+    // own a stable copy before the old field is released.
+    working_copy := ""
+    if working_dir != "" {
+        working_copy = strings.clone(working_dir, context.allocator)
+    }
+    defer if working_copy != "" do delete(working_copy)
+
+    display_cwd := working_copy
     if display_cwd == "" {
         cwd, _ := os.get_working_directory(context.temp_allocator)
         display_cwd = cwd
@@ -573,7 +581,7 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string, working_dir :=
 
     job := new(Compilation_Job, runtime.default_allocator())
     job.command = strings.clone(new_command, runtime.default_allocator())
-    if working_dir != "" do job.working_dir = strings.clone(working_dir, runtime.default_allocator())
+    if working_copy != "" do job.working_dir = strings.clone(working_copy, runtime.default_allocator())
     job.thread = background_thread(rawptr(job), compilation_worker)
     c.job = job
 }

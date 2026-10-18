@@ -615,3 +615,36 @@ test_compilation_g_prefix_top_bottom :: proc(t: ^testing.T) {
 
     fmt.println("  ✓ [Compilation] gg/G jump to top/bottom; g is not recompile")
 }
+
+@(test)
+test_compilation_recompile_aliases_are_stable :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/recompile_alias"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+    compilation_run_command(&c, "printf 'first\\n'", dir)
+    compilation_wait(&c)
+    testing.expect_value(t, c.working_dir, dir)
+
+    // The r key passes c.command/c.working_dir straight back in.
+    compilation_run_command(&c, c.command, c.working_dir)
+    compilation_wait(&c)
+
+    testing.expect_value(t, c.command, "printf 'first\\n'")
+    testing.expect_value(t, c.working_dir, dir)
+    found := false
+    banner_ok := false
+    for line in c.lines {
+        if strings.trim_space(line.text) == "first" do found = true
+        if strings.has_prefix(line.text, "Compilation started:") && strings.contains(line.text, dir) {
+            banner_ok = true
+        }
+    }
+    testing.expect_value(t, found, true)
+    testing.expect_value(t, banner_ok, true)
+    fmt.println("  ✓ [Compilation] recompile reuses command/cwd without corruption")
+}
