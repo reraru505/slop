@@ -1,14 +1,15 @@
 package main
 
 import "core:c"
+import "core:strings"
 import sdl "vendor:sdl3"
 import ttf "vendor:sdl3/ttf"
 
 FONT_FILE    :: #load("assets/CaskaydiaCoveNerdFont-Regular.ttf");
-// 96 ASCII glyphs at even 2x-density/250%-zoom sizes fit comfortably in
-// 1024x1024, keeping the per-rebake texture upload cheap.
-ATLAS_WIDTH  :: 1024 ;
-ATLAS_HEIGHT :: 1024 ;
+// 96 ASCII glyphs plus ligature tiles at 2x-density/250%-zoom sizes need the
+// extra room; 2048x2048 covers the full zoom range without overflow.
+ATLAS_WIDTH  :: 2048 ;
+ATLAS_HEIGHT :: 2048 ;
 FONT_START   :: 32   ;
 FONT_COUNT   :: 96   ;
 // Transparent border around each glyph so linear filtering cannot sample a
@@ -101,11 +102,32 @@ Glyph :: struct {
    w, h:          int,
 }
 
+// A shaped sequence such as "->" or "=>" drawn as a single tile. Ligatures are
+// ordered longest-first so the longest match wins.
+Ligature :: struct {
+   text:  string,
+   glyph: Glyph,
+}
+
+// Common Cascadia Code ligatures. Keep each span short; they occupy the same
+// number of cells as their characters so cursor/selection columns are unchanged.
+LIGATURE_SEQUENCES :: []string{
+   // 4 cells
+   ">>>=", "<<<=",
+   // 3 cells
+   "<=>", "<->", "===", "!==", "=/=", ">>>", "<<<", "-->", "<--", "=>>",
+   "=<<", "..<", "...", ":::", "///", "/**", "~~>", "??=",
+   // 2 cells
+   "->", "<-", "=>", "<=", ">=", "==", "!=", "|>", "<|", "||", "&&", "?.",
+   "//", "/*", "*/", "..", "~~", "><", "|]", "[|", "?:", "??",
+}
+
 Font :: struct {
-   texture : ^sdl.Texture ,
-   glyphs  : [FONT_COUNT]Glyph ,
-   batcher : TextBatcher ,
-   metrics : Font_Metrics ,
+   texture   : ^sdl.Texture ,
+   glyphs    : [FONT_COUNT]Glyph ,
+   ligatures : [dynamic]Ligature ,
+   batcher   : TextBatcher ,
+   metrics   : Font_Metrics ,
 }
 
 // Rasterize the embedded font with FreeType (through SDL_ttf) at the native
@@ -220,6 +242,68 @@ load_font :: proc(renderer : ^sdl.Renderer, window : ^sdl.Window = nil) -> Font 
       row_h = max(row_h, gh)
    }
 
+   // Shaped ligature tiles. SDL_ttf runs HarfBuzz shaping, so rendering the
+   // whole sequence produces Cascadia's contextual alternates. Each tile is
+   // still drawn in exactly len(sequence) cells, preserving cursor columns.
+   ligatures: [dynamic]Ligature
+   for seq in LIGATURE_SEQUENCES {
+      raw := ttf.RenderText_Blended(face, raw_data(seq), c.size_t(len(seq)), white)
+      if raw == nil do continue
+      surface := sdl.ConvertSurface(raw, .RGBA32)
+      sdl.DestroySurface(raw)
+      if surface == nil do continue
+
+      gw := int(surface.w)
+      gh := int(surface.h)
+      expected := f32(len(seq)) * cell_width
+      if gw <= 0 || gh <= 0 || abs(f32(gw) - expected) > 2.0 {
+         sdl.DestroySurface(surface)
+         continue
+      }
+
+      if pack_x + gw + ATLAS_PADDING > ATLAS_WIDTH {
+         pack_x = ATLAS_PADDING
+         pack_y += row_h + ATLAS_PADDING * 2
+         row_h = 0
+      }
+      if pack_y + gh + ATLAS_PADDING > ATLAS_HEIGHT {
+         panic("Font atlas is full")
+      }
+
+      gx := pack_x
+      gy := pack_y
+      _ = sdl.LockSurface(surface)
+      pixels := ([^]u8)(surface.pixels)
+      pitch := int(surface.pitch)
+      for yy in 0 ..< gh {
+         for xx in 0 ..< gw {
+            alpha := pixels[yy * pitch + xx * 4 + 3]
+            di := ((gy + yy) * ATLAS_WIDTH + (gx + xx)) * 4
+            atlas[di + 0] = 255
+            atlas[di + 1] = 255
+            atlas[di + 2] = 255
+            atlas[di + 3] = alpha
+         }
+      }
+      sdl.UnlockSurface(surface)
+      sdl.DestroySurface(surface)
+
+      append(&ligatures, Ligature{
+         text = strings.clone(seq),
+         glyph = Glyph{
+            u0 = f32(gx) / f32(ATLAS_WIDTH),
+            v0 = f32(gy) / f32(ATLAS_HEIGHT),
+            u1 = f32(gx + gw) / f32(ATLAS_WIDTH),
+            v1 = f32(gy + gh) / f32(ATLAS_HEIGHT),
+            w  = gw,
+            h  = gh,
+         },
+      })
+
+      pack_x += gw + ATLAS_PADDING * 2
+      row_h = max(row_h, gh)
+   }
+
    texture := sdl.CreateTexture(renderer, .RGBA32, .STATIC, ATLAS_WIDTH, ATLAS_HEIGHT)
    sdl.SetTextureBlendMode(texture, sdl.BLENDMODE_BLEND)
    // Glyphs are rasterized at native size, so linear filtering is effectively
@@ -237,10 +321,11 @@ load_font :: proc(renderer : ^sdl.Renderer, window : ^sdl.Window = nil) -> Font 
    g_font_metrics = metrics
 
    return Font {
-      texture = texture,
-      glyphs  = glyphs,
-      batcher = init_text_batcher(),
-      metrics = metrics,
+      texture   = texture,
+      glyphs    = glyphs,
+      ligatures = ligatures,
+      batcher   = init_text_batcher(),
+      metrics   = metrics,
    }
 }
 
@@ -250,9 +335,60 @@ font_reload :: proc(font: ^Font, renderer: ^sdl.Renderer, window: ^sdl.Window = 
    if font == nil || renderer == nil do return
    fresh := load_font(renderer, window)
    if font.texture != nil do sdl.DestroyTexture(font.texture)
+   for l in font.ligatures do delete(l.text)
+   delete(font.ligatures)
    delete(font.batcher.vertices)
    delete(font.batcher.indices)
    font^ = fresh
+}
+
+// Append one atlas tile as a quad.
+push_glyph :: proc(font: ^Font, g: Glyph, x, y, w, h: f32, color: sdl.FColor) {
+   if g.w <= 0 || g.h <= 0 || w <= 0 || h <= 0 do return
+   base := i32(len(font.batcher.vertices))
+   append(&font.batcher.vertices,
+      sdl.Vertex{ position = {x, y},     tex_coord = {g.u0, g.v0}, color = color },
+      sdl.Vertex{ position = {x + w, y}, tex_coord = {g.u1, g.v0}, color = color },
+      sdl.Vertex{ position = {x + w, y + h}, tex_coord = {g.u1, g.v1}, color = color },
+      sdl.Vertex{ position = {x, y + h}, tex_coord = {g.u0, g.v1}, color = color },
+   )
+   append(&font.batcher.indices,
+      base + 0, base + 1, base + 2,
+      base + 0, base + 2, base + 3,
+   )
+}
+
+// Find the longest ligature starting at pos. Ligatures are skipped when the
+// span crosses a syntax-color boundary, and the caller may veto a match when
+// the cursor highlight falls inside it.
+find_ligature :: proc(font: ^Font, text: string, pos: int, colors: []sdl.FColor) -> (Glyph, int, bool) {
+   if pos >= len(text) do return {}, 0, false
+   switch text[pos] {
+   case '-', '=', '!', '<', '>', '|', '/', '.', ':', '?', '~', '#', '&':
+   case:
+      return {}, 0, false
+   }
+
+   color := sdl.FColor{}
+   if colors != nil && pos < len(colors) do color = colors[pos]
+
+   for lig in font.ligatures {
+      n := len(lig.text)
+      if pos + n > len(text) do continue
+      if text[pos:pos + n] != lig.text do continue
+      if colors != nil {
+         uniform := true
+         for k in 0 ..< n {
+            if pos + k >= len(colors) || colors[pos + k] != color {
+               uniform = false
+               break
+            }
+         }
+         if !uniform do continue
+      }
+      return lig.glyph, n, true
+   }
+   return {}, 0, false
 }
 
 push_text :: proc(
@@ -270,45 +406,37 @@ push_text :: proc(
    baseline := pos.y + font_baseline(font, font_scale)
    top := baseline - font.metrics.ascent * scale
 
-   for ch in text {
+   i := 0
+   for i < len(text) {
+      ch := text[i]
       if ch == '\n' {
          x = pos.x + left_margin * scale
          baseline += line_h
          top += line_h
+         i += 1
          continue
       }
       if ch == '\t' {
          x += cell_w * 4
+         i += 1
          continue
       }
       if ch < 32 || ch > 126 {
+         i += 1
+         continue
+      }
+
+      if lig, n, ok := find_ligature(font, text, i, nil); ok {
+         push_glyph(font, lig, x, top, f32(n) * cell_w, f32(lig.h) * scale, color)
+         x += f32(n) * cell_w
+         i += n
          continue
       }
 
       g := font.glyphs[ch - 32]
-      if g.w <= 0 || g.h <= 0 {
-         x += cell_w
-         continue
-      }
-
-      x0 := x
-      y0 := top
-      x1 := x0 + f32(g.w) * scale
-      y1 := y0 + f32(g.h) * scale
-
-      base := i32(len(font.batcher.vertices))
-      append(&font.batcher.vertices,
-         sdl.Vertex{ position = {x0, y0}, tex_coord = {g.u0, g.v0}, color = color },
-         sdl.Vertex{ position = {x1, y0}, tex_coord = {g.u1, g.v0}, color = color },
-         sdl.Vertex{ position = {x1, y1}, tex_coord = {g.u1, g.v1}, color = color },
-         sdl.Vertex{ position = {x0, y1}, tex_coord = {g.u0, g.v1}, color = color },
-      )
-      append(&font.batcher.indices,
-         base + 0, base + 1, base + 2,
-         base + 0, base + 2, base + 3,
-      )
-
+      push_glyph(font, g, x, top, f32(g.w) * scale, f32(g.h) * scale, color)
       x += cell_w
+      i += 1
    }
 }
 
@@ -339,39 +467,30 @@ push_line :: proc(
    x := pos.x
    top := pos.y + font_baseline(font, font_scale) - font.metrics.ascent * scale
 
-   for ch in text {
+   i := 0
+   for i < len(text) {
+      ch := text[i]
       if ch == '\t' {
          x += cell_w * 4
+         i += 1
          continue
       }
       if ch < 32 || ch > 126 {
+         i += 1
+         continue
+      }
+
+      if lig, n, ok := find_ligature(font, text, i, nil); ok {
+         push_glyph(font, lig, x, top, f32(n) * cell_w, f32(lig.h) * scale, color)
+         x += f32(n) * cell_w
+         i += n
          continue
       }
 
       g := font.glyphs[ch - 32]
-      if g.w <= 0 || g.h <= 0 {
-         x += cell_w
-         continue
-      }
-
-      x0 := x
-      y0 := top
-      x1 := x0 + f32(g.w) * scale
-      y1 := y0 + f32(g.h) * scale
-
-      base := i32(len(font.batcher.vertices))
-      append(&font.batcher.vertices,
-         sdl.Vertex{ position = {x0, y0}, tex_coord = {g.u0, g.v0}, color = color },
-         sdl.Vertex{ position = {x1, y0}, tex_coord = {g.u1, g.v0}, color = color },
-         sdl.Vertex{ position = {x1, y1}, tex_coord = {g.u1, g.v1}, color = color },
-         sdl.Vertex{ position = {x0, y1}, tex_coord = {g.u0, g.v1}, color = color },
-      )
-      append(&font.batcher.indices,
-         base + 0, base + 1, base + 2,
-         base + 0, base + 2, base + 3,
-      )
-
+      push_glyph(font, g, x, top, f32(g.w) * scale, f32(g.h) * scale, color)
       x += cell_w
+      i += 1
    }
 
    return x
@@ -392,48 +511,38 @@ push_editor_line :: proc(
    x := pos.x
    top := pos.y + font_baseline(font, font_scale) - font.metrics.ascent * scale
 
-   col_idx := 0
-   for ch in text {
-      base_color := char_colors[col_idx] if (char_colors != nil && col_idx < len(char_colors)) else color
-      char_color := highlight_color if col_idx == highlight_col else base_color
+   i := 0
+   for i < len(text) {
+      ch := text[i]
+      base_color := char_colors[i] if (char_colors != nil && i < len(char_colors)) else color
+      char_color := highlight_color if i == highlight_col else base_color
 
       if ch == '\t' {
          x += cell_w * 4
-         col_idx += 1
+         i += 1
          continue
       }
 
       if ch < 32 || ch > 126 {
-         col_idx += 1
+         i += 1
          continue
+      }
+
+      if lig, n, ok := find_ligature(font, text, i, char_colors); ok {
+         // Keep the cursor-highlighted character visible rather than hiding it
+         // inside a ligature tile.
+         if !(highlight_col >= i && highlight_col < i + n) {
+            push_glyph(font, lig, x, top, f32(n) * cell_w, f32(lig.h) * scale, char_color)
+            x += f32(n) * cell_w
+            i += n
+            continue
+         }
       }
 
       g := font.glyphs[ch - 32]
-      if g.w <= 0 || g.h <= 0 {
-         x += cell_w
-         col_idx += 1
-         continue
-      }
-
-      x0 := x
-      y0 := top
-      x1 := x0 + f32(g.w) * scale
-      y1 := y0 + f32(g.h) * scale
-
-      base := i32(len(font.batcher.vertices))
-      append(&font.batcher.vertices,
-         sdl.Vertex{ position = {x0, y0}, tex_coord = {g.u0, g.v0}, color = char_color },
-         sdl.Vertex{ position = {x1, y0}, tex_coord = {g.u1, g.v0}, color = char_color },
-         sdl.Vertex{ position = {x1, y1}, tex_coord = {g.u1, g.v1}, color = char_color },
-         sdl.Vertex{ position = {x0, y1}, tex_coord = {g.u0, g.v1}, color = char_color },
-      )
-      append(&font.batcher.indices,
-         base + 0, base + 1, base + 2,
-         base + 0, base + 2, base + 3,
-      )
-
+      push_glyph(font, g, x, top, f32(g.w) * scale, f32(g.h) * scale, char_color)
       x += cell_w
-      col_idx += 1
+      i += 1
    }
 
    return x

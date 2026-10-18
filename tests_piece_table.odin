@@ -477,6 +477,74 @@ test_pt_undo_controls :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_pt_undo_grouping_typing :: proc(t: ^testing.T) {
+    pt: PieceTable
+    pt_init(&pt, "")
+    defer pt_destroy(&pt)
+    set_undo_grouping(&pt, true)
+
+    for ch in "hello" {
+        pt_insert(&pt, pt_get_length(&pt), string([]u8{u8(ch)}))
+    }
+    text := pt_full_text(&pt)
+    defer delete(text)
+    testing.expect_value(t, text, "hello")
+
+    // The whole typing burst is one undo step.
+    testing.expect_value(t, pt_undo(&pt), true)
+    undone := pt_full_text(&pt)
+    defer delete(undone)
+    testing.expect_value(t, undone, "")
+    testing.expect_value(t, pt_undo(&pt), false)
+
+    testing.expect_value(t, pt_redo(&pt), true)
+    redone := pt_full_text(&pt)
+    defer delete(redone)
+    testing.expect_value(t, redone, "hello")
+
+    // An explicit break starts a fresh step.
+    break_undo_group(&pt)
+    pt_insert(&pt, 5, "!")
+    testing.expect_value(t, pt_undo(&pt), true)
+    after_first := pt_full_text(&pt)
+    defer delete(after_first)
+    testing.expect_value(t, after_first, "hello")
+    testing.expect_value(t, pt_undo(&pt), true)
+    after_second := pt_full_text(&pt)
+    defer delete(after_second)
+    testing.expect_value(t, after_second, "")
+    fmt.println("  ✓ [PieceTable] typing bursts collapse into one undo step")
+}
+
+@(test)
+test_pt_undo_grouping_backspace :: proc(t: ^testing.T) {
+    pt: PieceTable
+    pt_init(&pt, "hello")
+    defer pt_destroy(&pt)
+    set_undo_grouping(&pt, true)
+
+    // Backspaces walk left; all three deletions are one undo step.
+    pt_delete_range(&pt, 4, 1)
+    pt_delete_range(&pt, 3, 1)
+    pt_delete_range(&pt, 2, 1)
+    text := pt_full_text(&pt)
+    defer delete(text)
+    testing.expect_value(t, text, "he")
+
+    testing.expect_value(t, pt_undo(&pt), true)
+    restored := pt_full_text(&pt)
+    defer delete(restored)
+    testing.expect_value(t, restored, "hello")
+    testing.expect_value(t, pt_undo(&pt), false)
+
+    testing.expect_value(t, pt_redo(&pt), true)
+    redone := pt_full_text(&pt)
+    defer delete(redone)
+    testing.expect_value(t, redone, "he")
+    fmt.println("  ✓ [PieceTable] backspace runs collapse into one undo step")
+}
+
+@(test)
 test_pt_piece_coalescing :: proc(t: ^testing.T) {
     pt: PieceTable
     pt_init(&pt, "")

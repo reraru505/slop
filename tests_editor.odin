@@ -506,6 +506,42 @@ test_editor_line_len_and_virtual_space :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_editor_visual_columns_with_tabs :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "\tab\nx\ty")
+    defer editor_destroy(&e)
+
+    testing.expect_value(t, editor_visual_col(&e, 0, 0), 0)
+    testing.expect_value(t, editor_visual_col(&e, 0, 1), TAB_WIDTH)
+    testing.expect_value(t, editor_visual_col(&e, 0, 2), TAB_WIDTH + 1)
+    testing.expect_value(t, editor_visual_col(&e, 0, 3), TAB_WIDTH + 2)
+
+    // A position inside the expanded tab snaps back to the tab's byte.
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 1), 0)
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 3), 0)
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 4), 1)
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 5), 2)
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 6), 3)
+    // Past EOL the column is virtual.
+    testing.expect_value(t, editor_visual_col(&e, 0, 9), 12)
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 9), 6)
+
+    // desired_col is measured in visual cells, so vertical motion preserves the
+    // screen column across lines where tabs expand differently.
+    e.cursor.row = 0
+    e.cursor.col = 2
+    e.desired_col = editor_visual_col(&e, 0, e.cursor.col) // visual 5
+    editor_handle_normal_key(&e, sdl.K_J, {}, nil, nil)
+    testing.expect_value(t, e.cursor.row, 1)
+    testing.expect_value(t, editor_visual_col(&e, 1, e.cursor.col), 5)
+    testing.expect_value(t, e.cursor.col, 2)
+    editor_handle_normal_key(&e, sdl.K_K, {}, nil, nil)
+    testing.expect_value(t, e.cursor.row, 0)
+    testing.expect_value(t, e.cursor.col, 2)
+    fmt.println("  ✓ [Editor] byte<->visual columns map tabs and preserve desired column")
+}
+
+@(test)
 test_editor_line_len_crlf :: proc(t: ^testing.T) {
     e: Editor
     editor_init(&e, nil, "abc\r\ndef\r\n")
@@ -1160,6 +1196,46 @@ test_editor_apply_lsp_edits :: proc(t: ^testing.T) {
     testing.expect_value(t, text5, "abc!")
     testing.expect_value(t, e5.cursor.row <= 0, true)
     fmt.println("  ✓ [Editor] LSP text edits applied bottom-up and clamped")
+}
+
+@(test)
+test_editor_undo_grouping_typing_burst :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "")
+    defer editor_destroy(&e)
+    editor_set_mode(&e, .Insert, nil)
+
+    // One TEXT_INPUT per character; the editor should group the burst.
+    simulate_typing(&e, "h")
+    simulate_typing(&e, "e")
+    simulate_typing(&e, "l")
+    simulate_typing(&e, "l")
+    simulate_typing(&e, "o")
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "hello")
+
+    editor_set_mode(&e, .Normal, nil)
+    send_key_event(&e, sdl.K_U)
+    undone := pt_full_text(&e.table)
+    defer delete(undone)
+    testing.expect_value(t, undone, "")
+    send_key_event(&e, sdl.K_0)
+
+    // A motion starts a new group: only the second burst is undone.
+    editor_set_mode(&e, .Insert, nil)
+    simulate_typing(&e, "ab")
+    editor_set_mode(&e, .Normal, nil)
+    send_key_event(&e, sdl.K_H)
+    editor_set_mode(&e, .Insert, nil)
+    simulate_typing(&e, "cd")
+    editor_set_mode(&e, .Normal, nil)
+
+    send_key_event(&e, sdl.K_U)
+    after_undo := pt_full_text(&e.table)
+    defer delete(after_undo)
+    testing.expect_value(t, after_undo, "ab")
+    fmt.println("  ✓ [Editor] typing bursts group; motions break the group")
 }
 
 @(test)

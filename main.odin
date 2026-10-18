@@ -37,6 +37,26 @@ app_set_message :: proc(app: ^App, msg: string) {
     app.cmd_prompt.message = string(app.cmd_prompt.message_buf[:n])
 }
 
+pane_has_unsaved_changes :: proc(p: ^Pane) -> bool {
+    return p != nil && p.kind == .Editor && p.editor.dirty && !p.editor.read_only
+}
+
+app_has_unsaved_changes :: proc(app: ^App) -> bool {
+    for p in app.panes {
+        if pane_has_unsaved_changes(p) do return true
+    }
+    return false
+}
+
+app_close_current_pane :: proc(app: ^App, force: bool) {
+    if app.active_pane == nil do return
+    if !force && pane_has_unsaved_changes(app.active_pane) {
+        app_set_message(app, "E37: No write since last change (add ! to override)")
+        return
+    }
+    app_close_pane(app, app.active_pane)
+}
+
 App :: struct {
     window           : ^sdl.Window,
     renderer         : ^sdl.Renderer,
@@ -156,6 +176,7 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
                 "bnext", "bn",
                 "theme", "colorscheme",
                 "sort", "cd", "pwd", "files", "zoom", "linespace", "lineheight", "help",
+                "qa!", "goto", "line",
             }
             for cmd in ALL_COMMANDS {
                 if strings.has_prefix(cmd, curr_str) {
@@ -333,7 +354,9 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
             app_set_message(app, "Dired: edit cancelled")
             return
         }
-        app_close_pane(app, app.active_pane)
+        app_close_current_pane(app, false)
+    } else if cmd == "q!" {
+        app_close_current_pane(app, true)
     } else if cmd == "wq" || cmd == "x" {
         if app.active_pane != nil {
             if app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
@@ -341,8 +364,11 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                 app_set_message(app, msg)
                 _ = sdl.StopTextInput(app.window)
             } else if app.active_pane.kind == .Editor {
-                editor_save_file(&app.active_pane.editor, app)
-                app_close_pane(app, app.active_pane)
+                if editor_save_file(&app.active_pane.editor, app) {
+                    app_close_pane(app, app.active_pane)
+                } else if app.active_pane.editor.file_path == "" {
+                    app_set_message(app, "E32: No file name")
+                }
             }
         }
     } else if strings.has_prefix(cmd, "sort ") || cmd == "sort" {
@@ -364,7 +390,13 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         } else {
             app_set_message(app, "Not in a Dired buffer")
         }
-    } else if cmd == "qa" || cmd == "q!" {
+    } else if cmd == "qa" {
+        if app_has_unsaved_changes(app) {
+            app_set_message(app, "E37: No write since last change (add ! to override)")
+            return
+        }
+        app.running = false
+    } else if cmd == "qa!" {
         app.running = false
     } else if cmd == "sp" || cmd == "split" {
         app_split_pane(app, app.active_pane, .Horizontal)
@@ -486,6 +518,33 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         }
     } else if cmd == "pwd" {
         app_set_message(app, fmt.tprintf("Working dir: %s", app.working_dir))
+    } else if cmd[0] >= '0' && cmd[0] <= '9' {
+        line, ok := strconv.parse_int(cmd)
+        if ok {
+            if app.active_pane != nil && app.active_pane.kind == .Editor {
+                editor_goto_line(&app.active_pane.editor, line)
+                app_set_message(app, fmt.tprintf("Line %d", app.active_pane.editor.cursor.row + 1))
+            } else {
+                app_set_message(app, "Not an editor buffer")
+            }
+        } else {
+            app_set_message(app, fmt.tprintf("Unknown command: :%s", cmd))
+        }
+    } else if strings.has_prefix(cmd, "goto ") || strings.has_prefix(cmd, "line ") || cmd == "goto" || cmd == "line" {
+        arg := ""
+        if strings.has_prefix(cmd, "goto ") do arg = strings.trim_space(cmd[5:])
+        else if strings.has_prefix(cmd, "line ") do arg = strings.trim_space(cmd[5:])
+        line, ok := strconv.parse_int(arg)
+        if ok && line > 0 {
+            if app.active_pane != nil && app.active_pane.kind == .Editor {
+                editor_goto_line(&app.active_pane.editor, line)
+                app_set_message(app, fmt.tprintf("Line %d", app.active_pane.editor.cursor.row + 1))
+            } else {
+                app_set_message(app, "Not an editor buffer")
+            }
+        } else {
+            app_set_message(app, "Usage: :goto <line>")
+        }
     } else if cmd == "help" || cmd == "h" || cmd == "?" {
         app_open_help(app)
     } else if cmd == "files" || cmd == "find" || cmd == "picker" {

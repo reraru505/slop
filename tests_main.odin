@@ -101,6 +101,64 @@ test_app_theme_commands :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_app_dirty_quit_guard :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    app.running = true
+    app.active_pane.editor.dirty = true
+
+    app_execute_command(&app, "q")
+    testing.expect_value(t, len(app.panes), 1)
+    testing.expect_value(t, app.running, true)
+    testing.expect(t, strings.contains(app.cmd_prompt.message, "E37"))
+
+    // Force-close the last pane; the app asks to quit.
+    app_execute_command(&app, "q!")
+    testing.expect_value(t, app.running, false)
+
+    // :qa refuses while another buffer is dirty; :qa! forces it.
+    app.running = true
+    app.active_pane.editor.dirty = true
+    app_execute_command(&app, "qa")
+    testing.expect_value(t, app.running, true)
+    testing.expect(t, strings.contains(app.cmd_prompt.message, "E37"))
+    app_execute_command(&app, "qa!")
+    testing.expect_value(t, app.running, false)
+
+    // :wq on an unnamed buffer does not close it.
+    app.running = true
+    app.active_pane.editor.dirty = true
+    app_execute_command(&app, "wq")
+    testing.expect_value(t, len(app.panes), 1)
+    testing.expect_value(t, app.running, true)
+    testing.expect_value(t, app.cmd_prompt.message, "E32: No file name")
+    fmt.println("  ✓ [App] dirty-buffer guards for :q / :q! / :qa / :qa! / :wq")
+}
+
+@(test)
+test_app_goto_line_command :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    set_editor_text(&app.active_pane.editor, "zero\none\ntwo\nthree\nfour")
+
+    app_execute_command(&app, "3")
+    testing.expect_value(t, app.active_pane.editor.cursor.row, 2)
+    testing.expect_value(t, app.cmd_prompt.message, "Line 3")
+
+    app_execute_command(&app, "goto 5")
+    testing.expect_value(t, app.active_pane.editor.cursor.row, 4)
+    testing.expect_value(t, app.cmd_prompt.message, "Line 5")
+
+    // Out-of-range lines clamp to the last line.
+    app_execute_command(&app, "999")
+    testing.expect_value(t, app.active_pane.editor.cursor.row, 4)
+
+    app_execute_command(&app, "goto nope")
+    testing.expect_value(t, app.cmd_prompt.message, "Usage: :goto <line>")
+    fmt.println("  ✓ [App] :<n> and :goto <n> jump with clamping")
+}
+
+@(test)
 test_app_linespace_command :: proc(t: ^testing.T) {
     app := make_test_app()
     defer destroy_test_app(&app)

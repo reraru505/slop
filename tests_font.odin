@@ -3,6 +3,8 @@ package main
 import "core:fmt"
 import "core:math"
 import "core:testing"
+import "core:strings"
+import sdl "vendor:sdl3"
 
 font_metrics_fixture :: proc() -> Font_Metrics {
     // Values measured from the embedded Caskaydia Cove Nerd Font at a 40px bake.
@@ -62,6 +64,58 @@ test_font_metrics_line_layout :: proc(t: ^testing.T) {
     expect_close(t, font_line_height_for(hidpi, .HALF, 1.0, 1.0), 20.0, "HiDPI line height")
     expect_close(t, font_baseline_for(hidpi, .HALF, 1.0, 1.0), 15.9665, "HiDPI baseline")
     fmt.println("  ✓ [Font] line height and baseline derive from font metrics")
+}
+
+@(test)
+test_font_ligature_sequences_sorted :: proc(t: ^testing.T) {
+    seqs := LIGATURE_SEQUENCES
+    for i in 1 ..< len(seqs) {
+        testing.expectf(
+            t,
+            len(seqs[i - 1]) >= len(seqs[i]),
+            "ligature list is not longest-first at %d",
+            i,
+        )
+    }
+    fmt.println("  ✓ [Font] ligature table is ordered longest-first")
+}
+
+@(test)
+test_font_ligature_matching :: proc(t: ^testing.T) {
+    f: Font
+    append(&f.ligatures, Ligature{text = strings.clone("<=>"), glyph = Glyph{w = 3, h = 10}})
+    append(&f.ligatures, Ligature{text = strings.clone("->"), glyph = Glyph{w = 2, h = 10}})
+    defer {
+        for l in f.ligatures do delete(l.text)
+        delete(f.ligatures)
+    }
+
+    g, n, ok := find_ligature(&f, "a->b", 1, nil)
+    testing.expect_value(t, ok, true)
+    testing.expect_value(t, n, 2)
+    testing.expect_value(t, g.w, 2)
+
+    _, n2, ok2 := find_ligature(&f, "<=>", 0, nil)
+    testing.expect_value(t, ok2, true)
+    testing.expect_value(t, n2, 3)
+
+    // A syntax-color boundary disables the ligature.
+    split_colors := []sdl.FColor{
+        {1.0, 0.0, 0.0, 1.0},
+        {0.0, 1.0, 0.0, 1.0},
+        {0.0, 1.0, 0.0, 1.0},
+    }
+    _, _, split_ok := find_ligature(&f, "->", 0, split_colors)
+    testing.expect_value(t, split_ok, false)
+
+    uniform_colors := []sdl.FColor{
+        {1.0, 0.0, 0.0, 1.0},
+        {1.0, 0.0, 0.0, 1.0},
+    }
+    _, n4, uniform_ok := find_ligature(&f, "->", 0, uniform_colors)
+    testing.expect_value(t, uniform_ok, true)
+    testing.expect_value(t, n4, 2)
+    fmt.println("  ✓ [Font] ligature matching respects length order and color runs")
 }
 
 @(test)

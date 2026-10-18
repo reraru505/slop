@@ -52,7 +52,8 @@ LSP (when a language server is available)
 
 COMMANDS  (type ':' in Normal mode)
   :w  :q  :wq  :x       write / quit / write and quit
-  :qa  :q!              quit all / force quit
+  :q!  :qa  :qa!        force-close buffer / quit all / force quit all
+  :<n>  :goto <n>       jump to line n
   :e <path>             edit a file or directory
   :sp [file]            horizontal split (also Ctrl+W s)
   :vs [file]            vertical split (also Ctrl+W v)

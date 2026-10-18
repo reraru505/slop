@@ -25,6 +25,11 @@ package main
 
 import "core:fmt"
 import "core:strings"
+import "core:time"
+
+// Consecutive adjacent edits within this window collapse into one undo step
+// when undo grouping is enabled.
+UNDO_GROUP_TIMEOUT :: 750 * time.Millisecond
 
 // Byte block size for a buffer's newline index. `cum[j]` holds the number of
 // newlines in data[0 : j*NEWLINE_BLOCK], so counting newlines before an offset
@@ -92,6 +97,13 @@ PieceTable :: struct {
 	undo_stack:  [dynamic]Edit,
 	redo_stack:  [dynamic]Edit,
 
+	// Undo grouping: adjacent edits in a typing burst become one undo step.
+	// Disabled by default so each library edit is its own step; the editor
+	// enables it. break_undo_group forces the next edit to start a new step.
+	group_undo:     bool,
+	group_broken:   bool,
+	last_edit_time: time.Time,
+
 	rng: u64,
 
 	// lazily materialized flat view of the piece list (for inspection)
@@ -105,6 +117,7 @@ init :: proc(pt: ^PieceTable, initial: string = "") {
 	buf_init(&pt.original)
 	buf_init(&pt.add)
 	pt.record_undo = true
+	pt.last_edit_time = time.now()
 	pt.rng = 0x9E3779B97F4A7C15
 	pt.pieces_valid = true
 	if len(initial) == 0 {
@@ -200,7 +213,9 @@ insert :: proc(pt: ^PieceTable, offset: int, text: string) {
 	o := clamp(offset, 0, pt.length)
 	added := insert_impl(pt, o, text)
 	if pt.record_undo {
-		push_edit(pt, Edit{offset = o, added = added})
+		if !coalesce_insert(pt, o, added) {
+			push_edit(pt, Edit{offset = o, added = added})
+		}
 	}
 }
 
@@ -218,7 +233,9 @@ delete_range :: proc(pt: ^PieceTable, offset, length: int) {
 	removed: [dynamic]Piece
 	if pt.record_undo {
 		delete_impl(pt, o, l, &removed)
-		push_edit(pt, Edit{offset = o, removed = removed})
+		if !coalesce_delete(pt, o, &removed) {
+			push_edit(pt, Edit{offset = o, removed = removed})
+		}
 	} else {
 		delete_impl(pt, o, l, nil)
 	}
@@ -253,6 +270,69 @@ replace :: proc(pt: ^PieceTable, offset, length: int, text: string) {
 	if pt.record_undo {
 		push_edit(pt, Edit{offset = o, added = added, removed = removed})
 	}
+}
+
+// set_undo_grouping controls whether adjacent edits in a typing burst merge
+// into one undo step. Disabled by default so each library edit is its own step.
+set_undo_grouping :: proc(pt: ^PieceTable, enabled: bool) {
+	pt.group_undo = enabled
+	pt.group_broken = true
+}
+
+// break_undo_group forces the next recorded edit to start a new undo step.
+break_undo_group :: proc(pt: ^PieceTable) {
+	pt.group_broken = true
+}
+
+// coalesce_insert folds an adjacent insertion into the previous undo step.
+coalesce_insert :: proc(pt: ^PieceTable, offset: int, added: Piece) -> bool {
+	if !pt.group_undo || pt.group_broken || len(pt.undo_stack) == 0 do return false
+	if time.since(pt.last_edit_time) > UNDO_GROUP_TIMEOUT do return false
+
+	e := &pt.undo_stack[len(pt.undo_stack) - 1]
+	if e.added.length == 0 || len(e.removed) != 0 do return false
+	if e.offset + e.added.length != offset do return false
+	if e.added.kind != added.kind || e.added.start + e.added.length != added.start do return false
+
+	e.added.length += added.length
+	e.added.lines += added.lines
+	clear_redo(pt)
+	pt.last_edit_time = time.now()
+	return true
+}
+
+// coalesce_delete folds an adjacent deletion (backspace or forward delete) into
+// the previous undo step.
+coalesce_delete :: proc(pt: ^PieceTable, offset: int, removed: ^[dynamic]Piece) -> bool {
+	if !pt.group_undo || pt.group_broken || len(pt.undo_stack) == 0 do return false
+	if time.since(pt.last_edit_time) > UNDO_GROUP_TIMEOUT do return false
+
+	e := &pt.undo_stack[len(pt.undo_stack) - 1]
+	if e.added.length != 0 || len(e.removed) == 0 do return false
+
+	new_len := 0
+	for p in removed^ do new_len += p.length
+	old_len := 0
+	for p in e.removed do old_len += p.length
+
+	if offset + new_len == e.offset {
+		// Backspace: the new span is immediately before the existing group.
+		inject_at(&e.removed, 0, ..removed^[:])
+		delete(removed^)
+		removed^ = {}
+		e.offset = offset
+	} else if offset == e.offset + old_len {
+		// Forward delete: the new span is immediately after the group.
+		append(&e.removed, ..removed^[:])
+		delete(removed^)
+		removed^ = {}
+	} else {
+		return false
+	}
+
+	clear_redo(pt)
+	pt.last_edit_time = time.now()
+	return true
 }
 
 // --- Reading ---------------------------------------------------------------
@@ -398,6 +478,7 @@ set_undo_enabled :: proc(pt: ^PieceTable, enabled: bool) {
 // undo reverts the most recent recorded edit. Returns false if there is
 // nothing to undo.
 undo :: proc(pt: ^PieceTable) -> bool {
+	pt.group_broken = true
 	if len(pt.undo_stack) == 0 {
 		return false
 	}
@@ -415,6 +496,7 @@ undo :: proc(pt: ^PieceTable) -> bool {
 // redo reapplies the most recently undone edit. Returns false if there is
 // nothing to redo.
 redo :: proc(pt: ^PieceTable) -> bool {
+	pt.group_broken = true
 	if len(pt.redo_stack) == 0 {
 		return false
 	}
@@ -534,6 +616,8 @@ insert_spans_impl :: proc(pt: ^PieceTable, offset: int, spans: []Piece) {
 push_edit :: proc(pt: ^PieceTable, e: Edit) {
 	clear_redo(pt)
 	append(&pt.undo_stack, e)
+	pt.group_broken = false
+	pt.last_edit_time = time.now()
 }
 
 // --- Treap -----------------------------------------------------------------
@@ -993,3 +1077,5 @@ pt_byte_at         :: byte_at
 pt_text            :: text
 pt_undo            :: undo
 pt_redo            :: redo
+pt_set_undo_grouping :: set_undo_grouping
+pt_break_undo_group  :: break_undo_group
