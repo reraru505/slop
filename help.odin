@@ -268,6 +268,46 @@ is_help_token_char :: proc(ch: byte) -> bool {
     return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'
 }
 
+// Dot-leader alignment target (0-based description column). Long labels fall
+// back to a single separating space instead of shifting the whole line.
+HELP_DESC_COLUMN :: 34
+
+// Align one already-rendered help line. Lines without a ` .... ` leader are
+// returned unchanged (cloned with the requested allocator).
+help_align_line :: proc(line: string, allocator := context.allocator) -> string {
+    dot_start := -1
+    dot_end := -1
+    for i := 1; i + 1 < len(line); i += 1 {
+        if line[i] != '.' || line[i - 1] != ' ' do continue
+        j := i
+        for j < len(line) && line[j] == '.' do j += 1
+        if j - i >= 2 && j < len(line) && line[j] == ' ' {
+            dot_start = i
+            dot_end = j
+            break
+        }
+    }
+    if dot_start < 0 do return strings.clone(line, allocator)
+
+    left := strings.trim_right(line[:dot_start], " \t")
+    desc := strings.trim_left(line[dot_end:], " \t")
+    if desc == "" do return strings.clone(line, allocator)
+
+    b: strings.Builder
+    strings.builder_init(&b, 0, len(line) + 8, allocator)
+    strings.write_string(&b, left)
+    pad := HELP_DESC_COLUMN - len(left)
+    if pad >= 3 {
+        strings.write_byte(&b, ' ')
+        for _ in 0 ..< pad - 2 do strings.write_byte(&b, '.')
+        strings.write_byte(&b, ' ')
+    } else {
+        strings.write_byte(&b, ' ')
+    }
+    strings.write_string(&b, desc)
+    return strings.to_string(b)
+}
+
 // Render the embedded help template, substituting {tokens} from config.odin.
 // Unknown tokens, empty `{}`, and lone `{` are left untouched. Caller owns the
 // returned string.
@@ -301,5 +341,14 @@ help_render :: proc(allocator := context.allocator) -> string {
         i += 1
     }
 
-    return strings.to_string(b)
+    raw := strings.to_string(b)
+    lines := strings.split(raw, "\n", context.temp_allocator)
+    aligned: strings.Builder
+    strings.builder_init(&aligned, 0, len(raw) + 64, allocator)
+    for line, idx in lines {
+        strings.write_string(&aligned, help_align_line(line, context.temp_allocator))
+        if idx + 1 < len(lines) do strings.write_byte(&aligned, '\n')
+    }
+    delete(raw, allocator)
+    return strings.to_string(aligned)
 }

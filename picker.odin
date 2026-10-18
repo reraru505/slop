@@ -7,13 +7,8 @@ import "core:path/filepath"
 import "core:slice"
 import "core:strings"
 import "core:sync"
-import "core:thread"
 import "core:time"
 import sdl "vendor:sdl3"
-
-// Cap the walk so opening the picker in a huge tree stays bounded. The scan
-// runs off the main thread, so even a slow filesystem cannot freeze the UI.
-FILE_PICKER_MAX_ITEMS :: 20_000
 
 FilePickerItem :: struct {
     rel_path : string,
@@ -29,15 +24,24 @@ FilePicker :: struct {
     query_len       : int,
     selected_index  : int,
     scroll_offset   : int,
-
-    // Background walk state. `scan_thread` itself is main-thread-owned; the
-    // result fields are guarded by scan_mutex.
-    scan_thread     : ^thread.Thread,
-    scan_mutex      : sync.Mutex,
-    scan_done       : bool,
-    scan_cancel     : bool,
-    scan_items      : [dynamic]FilePickerItem,
+    items_truncated : bool,
+    scan_job        : ^File_Picker_Scan_Job,
 }
+
+// Self-contained walk state. The worker never touches FilePicker; a canceled
+// job can be abandoned and freed once its thread has finished.
+File_Picker_Scan_Job :: struct {
+    mutex      : sync.Mutex,
+    cancel     : bool,
+    done       : bool,
+    root       : string,
+    max_items  : int,
+    items      : [dynamic]FilePickerItem,
+    truncated  : bool,
+}
+
+file_picker_orphan_jobs: [dynamic]^File_Picker_Scan_Job
+file_picker_orphan_mutex: sync.Mutex
 
 file_picker_init :: proc(fp: ^FilePicker) {
     fp.active = false
@@ -47,10 +51,8 @@ file_picker_init :: proc(fp: ^FilePicker) {
     fp.query_len = 0
     fp.selected_index = 0
     fp.scroll_offset = 0
-    fp.scan_thread = nil
-    fp.scan_done = false
-    fp.scan_cancel = false
-    fp.scan_items = nil
+    fp.scan_job = nil
+    fp.items_truncated = false
 }
 
 file_picker_destroy :: proc(fp: ^FilePicker) {
@@ -61,7 +63,7 @@ file_picker_destroy :: proc(fp: ^FilePicker) {
     }
     delete(fp.items)
     delete(fp.filtered_indices)
-    if fp.root_dir != "" do delete(fp.root_dir)
+    if fp.root_dir != "" do delete(fp.root_dir, runtime.default_allocator())
 }
 
 file_picker_close :: proc(fp: ^FilePicker, app: ^App = nil) {
@@ -138,28 +140,24 @@ file_picker_filter :: proc(fp: ^FilePicker) {
 }
 
 file_picker_scan_worker :: proc(data: rawptr) {
-    fp := (^FilePicker)(data)
+    job := (^File_Picker_Scan_Job)(data)
     alloc := runtime.default_allocator()
     items := make([dynamic]FilePickerItem, 0, 256, alloc)
+    truncated := false
     canceled := false
 
-    w := os.walker_create(fp.root_dir)
+    w := os.walker_create(job.root)
     defer os.walker_destroy(&w)
 
     for info in os.walker_walk(&w) {
-        if sync.atomic_load(&fp.scan_cancel) {
+        if sync.atomic_load(&job.cancel) {
             canceled = true
             break
         }
-        // walker_error persists after one bad directory. Error iterations
-        // yield a zero File_Info; skip just those, not every later entry.
-        if info.fullpath == "" {
-            continue
-        }
+        if info.fullpath == "" do continue
 
         if info.type == .Directory {
             name := info.name
-            // Hidden directories cover .git, .cache, .local, .cargo, etc.
             if name != "" && name[0] == '.' {
                 os.walker_skip_dir(&w)
                 continue
@@ -172,27 +170,18 @@ file_picker_scan_worker :: proc(data: rawptr) {
             continue
         }
 
-        // The walker does not descend symlinks; skip symlinked directories so
-        // they are not offered as (unopenable) files.
-        if info.type == .Symlink && os.is_dir(info.fullpath) {
-            continue
-        }
+        if info.type == .Symlink && os.is_dir(info.fullpath) do continue
+        if strings.has_suffix(info.name, "~") || strings.has_suffix(info.name, ".swp") do continue
 
-        // Skip editor backup/swap files.
-        if strings.has_suffix(info.name, "~") || strings.has_suffix(info.name, ".swp") {
-            continue
-        }
-
-        rel, rel_err := filepath.rel(fp.root_dir, info.fullpath, alloc)
-        if rel_err != .None {
-            rel = strings.clone(info.name, alloc)
-        }
+        rel, rel_err := filepath.rel(job.root, info.fullpath, alloc)
+        if rel_err != .None do rel = strings.clone(info.name, alloc)
 
         append(&items, FilePickerItem{
             rel_path  = rel,
             full_path = strings.clone(info.fullpath, alloc),
         })
-        if len(items) >= FILE_PICKER_MAX_ITEMS {
+        if len(items) >= job.max_items {
+            truncated = true
             break
         }
     }
@@ -203,41 +192,83 @@ file_picker_scan_worker :: proc(data: rawptr) {
         })
     }
 
-    sync.mutex_lock(&fp.scan_mutex)
-    fp.scan_done = true
+    sync.mutex_lock(&job.mutex)
     if canceled {
-        sync.mutex_unlock(&fp.scan_mutex)
         for it in items {
             delete(it.rel_path, alloc)
             delete(it.full_path, alloc)
         }
         delete(items)
+        job.items = nil
+        job.truncated = false
     } else {
-        fp.scan_items = items
-        sync.mutex_unlock(&fp.scan_mutex)
+        job.items = items
+        job.truncated = truncated
+    }
+    sync.mutex_unlock(&job.mutex)
+    sync.atomic_store(&job.done, true)
+}
+
+file_picker_free_job :: proc(job: ^File_Picker_Scan_Job) {
+    if job == nil do return
+    for it in job.items {
+        delete(it.rel_path, runtime.default_allocator())
+        delete(it.full_path, runtime.default_allocator())
+    }
+    delete(job.items)
+    if job.root != "" do delete(job.root, runtime.default_allocator())
+    free(job, runtime.default_allocator())
+}
+
+file_picker_orphan_job :: proc(fp: ^FilePicker) {
+    if fp.scan_job == nil do return
+    job := fp.scan_job
+    fp.scan_job = nil
+    sync.atomic_store(&job.cancel, true)
+    if file_picker_orphan_jobs.allocator.procedure == nil {
+        file_picker_orphan_jobs.allocator = runtime.default_allocator()
+    }
+    sync.mutex_lock(&file_picker_orphan_mutex)
+    append(&file_picker_orphan_jobs, job)
+    sync.mutex_unlock(&file_picker_orphan_mutex)
+}
+
+file_picker_poll_orphans :: proc() {
+    sync.mutex_lock(&file_picker_orphan_mutex)
+    defer sync.mutex_unlock(&file_picker_orphan_mutex)
+    i := 0
+    for i < len(file_picker_orphan_jobs) {
+        job := file_picker_orphan_jobs[i]
+        if sync.atomic_load(&job.done) {
+            ordered_remove(&file_picker_orphan_jobs, i)
+            file_picker_free_job(job)
+        } else {
+            i += 1
+        }
     }
 }
 
 // Adopt results from a finished scan. Called on the main thread each frame.
 file_picker_poll :: proc(fp: ^FilePicker) {
-    if fp.scan_thread == nil do return
-
-    done := false
-    sync.mutex_lock(&fp.scan_mutex)
-    done = fp.scan_done
-    sync.mutex_unlock(&fp.scan_mutex)
-    if !done do return
-
-    thread.join(fp.scan_thread)
-    thread.destroy(fp.scan_thread)
-    fp.scan_thread = nil
+    job := fp.scan_job
+    if job == nil {
+        file_picker_poll_orphans()
+        return
+    }
+    if !sync.atomic_load(&job.done) {
+        file_picker_poll_orphans()
+        return
+    }
 
     scan_items: [dynamic]FilePickerItem
-    sync.mutex_lock(&fp.scan_mutex)
-    scan_items = fp.scan_items
-    fp.scan_items = nil
-    fp.scan_done = false
-    sync.mutex_unlock(&fp.scan_mutex)
+    truncated := false
+    sync.mutex_lock(&job.mutex)
+    scan_items = job.items
+    job.items = nil
+    truncated = job.truncated
+    sync.mutex_unlock(&job.mutex)
+    fp.scan_job = nil
+    file_picker_free_job(job)
 
     if scan_items != nil {
         alloc := runtime.default_allocator()
@@ -248,45 +279,36 @@ file_picker_poll :: proc(fp: ^FilePicker) {
         delete(fp.items)
         fp.items = scan_items
     }
-
+    fp.items_truncated = truncated
     fp.selected_index = 0
     fp.scroll_offset = 0
     file_picker_filter(fp)
+    file_picker_poll_orphans()
 }
 
-// Cancel and join a running scan, discarding partial results.
+// Cancel a running scan without joining it: a blocked readdir must never
+// freeze the UI. The job is reaped once its thread finishes.
 file_picker_stop_scan :: proc(fp: ^FilePicker) {
-    if fp.scan_thread == nil do return
+    file_picker_orphan_job(fp)
+}
 
-    sync.atomic_store(&fp.scan_cancel, true)
-    thread.join(fp.scan_thread)
-    thread.destroy(fp.scan_thread)
-    fp.scan_thread = nil
-
-    scan_items: [dynamic]FilePickerItem
-    sync.mutex_lock(&fp.scan_mutex)
-    scan_items = fp.scan_items
-    fp.scan_items = nil
-    fp.scan_done = false
-    sync.mutex_unlock(&fp.scan_mutex)
-
-    alloc := runtime.default_allocator()
-    for it in scan_items {
-        delete(it.rel_path, alloc)
-        delete(it.full_path, alloc)
-    }
-    delete(scan_items)
+file_picker_scan_running :: proc(fp: ^FilePicker) -> bool {
+    return fp.scan_job != nil
 }
 
 // Blocking wait used by tests.
 file_picker_wait :: proc(fp: ^FilePicker) {
-    for fp.scan_thread != nil {
+    for fp.scan_job != nil {
         file_picker_poll(fp)
-        if fp.scan_thread != nil do time.sleep(time.Millisecond)
+        if fp.scan_job != nil do time.sleep(time.Millisecond)
+    }
+    for len(file_picker_orphan_jobs) > 0 {
+        file_picker_poll_orphans()
+        if len(file_picker_orphan_jobs) > 0 do time.sleep(time.Millisecond)
     }
 }
 
-file_picker_open :: proc(fp: ^FilePicker, root: string, window: ^sdl.Window = nil) {
+file_picker_open :: proc(fp: ^FilePicker, root: string, window: ^sdl.Window = nil, max_items := FILE_PICKER_MAX_ITEMS) {
     file_picker_stop_scan(fp)
 
     alloc := runtime.default_allocator()
@@ -297,12 +319,13 @@ file_picker_open :: proc(fp: ^FilePicker, root: string, window: ^sdl.Window = ni
     delete(fp.items)
     fp.items = nil
     clear(&fp.filtered_indices)
+    fp.items_truncated = false
 
-    abs_root, abs_err := filepath.abs(root, context.allocator)
+    abs_root, abs_err := filepath.abs(root, alloc)
     if abs_err != nil {
-        abs_root, _ = filepath.clean(root, context.allocator)
+        abs_root, _ = filepath.clean(root, alloc)
     }
-    if fp.root_dir != "" do delete(fp.root_dir)
+    if fp.root_dir != "" do delete(fp.root_dir, alloc)
     fp.root_dir = abs_root
 
     fp.query_len = 0
@@ -311,11 +334,13 @@ file_picker_open :: proc(fp: ^FilePicker, root: string, window: ^sdl.Window = ni
     file_picker_filter(fp)
     fp.active = true
 
-    sync.atomic_store(&fp.scan_cancel, false)
-    sync.mutex_lock(&fp.scan_mutex)
-    fp.scan_done = false
-    sync.mutex_unlock(&fp.scan_mutex)
-    fp.scan_thread = thread.create_and_start_with_data(rawptr(fp), file_picker_scan_worker)
+    job := new(File_Picker_Scan_Job, alloc)
+    job.root = strings.clone(abs_root, alloc)
+    job.max_items = max_items
+    job.cancel = false
+    job.done = false
+    fp.scan_job = job
+    background_thread_detached(rawptr(job), file_picker_scan_worker)
 
     if window != nil {
         _ = sdl.StartTextInput(window)
@@ -508,8 +533,9 @@ file_picker_render :: proc(fp: ^FilePicker, renderer: ^sdl.Renderer, font: ^Font
     sdl.RenderFillRect(renderer, &cursor_rect)
 
     // Match count on top right
-    scanning := fp.scan_thread != nil
+    scanning := file_picker_scan_running(fp)
     count_str := "scanning..." if scanning else fmt.tprintf("%d / %d", len(fp.filtered_indices), len(fp.items))
+    if !scanning && fp.items_truncated do count_str = fmt.tprintf("%d / %d+ (truncated)", len(fp.filtered_indices), len(fp.items))
     count_w := f32(len(count_str)) * 10.0 * scale
     push_line(font, count_str, Vec2{modal_x + modal_w - count_w - 16.0, modal_y + 8.0}, theme.comment, .HALF)
 

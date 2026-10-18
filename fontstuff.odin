@@ -2,13 +2,14 @@ package main
 
 import "core:c"
 import "core:strings"
+import "core:unicode/utf8"
 import sdl "vendor:sdl3"
 import ttf "vendor:sdl3/ttf"
 
-// 96 ASCII glyphs plus ligature tiles at 2x-density/250%-zoom sizes need the
-// extra room; 2048x2048 covers the full zoom range without overflow.
-ATLAS_WIDTH  :: 2048 ;
-ATLAS_HEIGHT :: 2048 ;
+// 96 ASCII glyphs, ligature tiles, and lazily rasterized Unicode glyphs share
+// one atlas. 4096x4096 covers several thousand fallback glyphs at 4K density.
+ATLAS_WIDTH  :: 4096 ;
+ATLAS_HEIGHT :: 4096 ;
 FONT_START   :: 32   ;
 FONT_COUNT   :: 96   ;
 // Transparent border around each glyph so linear filtering cannot sample a
@@ -92,9 +93,11 @@ init_text_batcher :: proc(initial_capacity := 4096) -> TextBatcher {
 }
 
 // One atlas tile. w/h are physical pixels; UVs are normalized atlas coords.
+// ascent is the font-specific baseline offset used to place fallback glyphs.
 Glyph :: struct {
    u0, v0, u1, v1: f32,
    w, h:          int,
+   ascent:        f32,
 }
 
 // A shaped sequence such as "->" or "=>" drawn as a single tile. Ligatures are
@@ -118,12 +121,23 @@ LIGATURE_SEQUENCES :: []string{
 }
 
 Font :: struct {
-   texture   : ^sdl.Texture ,
-   glyphs    : [FONT_COUNT]Glyph ,
-   ligatures : [dynamic]Ligature ,
-   batcher   : TextBatcher ,
-   metrics   : Font_Metrics ,
+   texture        : ^sdl.Texture ,
+   glyphs         : [FONT_COUNT]Glyph ,
+   extra_glyphs   : map[rune]Glyph ,
+   ligatures      : [dynamic]Ligature ,
+   batcher        : TextBatcher ,
+   metrics        : Font_Metrics ,
+   // Kept alive for lazy rasterization of non-ASCII runes.
+   face           : ^ttf.Font ,
+   fallback_faces : [dynamic]^ttf.Font ,
+   atlas          : []u8 ,
+   pack_x         : int ,
+   pack_y         : int ,
+   row_h          : int ,
 }
+
+// SDL_ttf is initialized once and kept alive while the font face is open.
+g_ttf_initialized := false
 
 // Rasterize the embedded font with FreeType (through SDL_ttf) at the native
 // physical size, with light hinting. This mirrors Ghostty's defaults: hinted
@@ -136,10 +150,12 @@ load_font :: proc(renderer : ^sdl.Renderer, window : ^sdl.Window = nil) -> Font 
    }
    target_px := max(1.0, f32(BASE_FONT_SIZE) * density * global_ui_scale)
 
-   if !ttf.Init() {
-      panic("Failed to initialize SDL_ttf")
+   if !g_ttf_initialized {
+      if !ttf.Init() {
+         panic("Failed to initialize SDL_ttf")
+      }
+      g_ttf_initialized = true
    }
-   defer ttf.Quit()
 
    io := sdl.IOFromConstMem(raw_data(FONT_FILE), uint(len(FONT_FILE)))
    if io == nil {
@@ -149,7 +165,15 @@ load_font :: proc(renderer : ^sdl.Renderer, window : ^sdl.Window = nil) -> Font 
    if face == nil {
       panic("Failed to load embedded font")
    }
-   defer ttf.CloseFont(face)
+
+   fallback_faces: [dynamic]^ttf.Font
+   for path in FALLBACK_FONT_PATHS {
+      cpath := strings.clone_to_cstring(path, context.temp_allocator)
+      if fb := ttf.OpenFont(cpath, target_px); fb != nil {
+         ttf.SetFontHinting(fb, .LIGHT)
+         append(&fallback_faces, fb)
+      }
+   }
 
    // Match BASE_FONT_SIZE semantics: the font's line height (ascent+descent+
    // line gap) should equal target_px physical pixels.
@@ -172,7 +196,6 @@ load_font :: proc(renderer : ^sdl.Renderer, window : ^sdl.Window = nil) -> Font 
    }
 
    atlas := make([]u8, ATLAS_WIDTH * ATLAS_HEIGHT * 4)
-   defer delete(atlas)
 
    glyphs: [FONT_COUNT]Glyph
    white := sdl.Color{255, 255, 255, 255}
@@ -231,6 +254,7 @@ load_font :: proc(renderer : ^sdl.Renderer, window : ^sdl.Window = nil) -> Font 
          v1 = f32(gy + gh) / f32(ATLAS_HEIGHT),
          w  = gw,
          h  = gh,
+         ascent = ascent,
       }
 
       pack_x += gw + ATLAS_PADDING * 2
@@ -292,6 +316,7 @@ load_font :: proc(renderer : ^sdl.Renderer, window : ^sdl.Window = nil) -> Font 
             v1 = f32(gy + gh) / f32(ATLAS_HEIGHT),
             w  = gw,
             h  = gh,
+            ascent = ascent,
          },
       })
 
@@ -316,12 +341,57 @@ load_font :: proc(renderer : ^sdl.Renderer, window : ^sdl.Window = nil) -> Font 
    g_font_metrics = metrics
 
    return Font {
-      texture   = texture,
-      glyphs    = glyphs,
-      ligatures = ligatures,
-      batcher   = init_text_batcher(),
-      metrics   = metrics,
+      texture        = texture,
+      glyphs         = glyphs,
+      extra_glyphs   = make(map[rune]Glyph),
+      ligatures      = ligatures,
+      batcher        = init_text_batcher(),
+      metrics        = metrics,
+      face           = face,
+      fallback_faces = fallback_faces,
+      atlas          = atlas,
+      pack_x         = pack_x,
+      pack_y         = pack_y,
+      row_h          = row_h,
    }
+}
+
+// font_free_contents releases everything owned by a loaded font. TTF itself
+// stays initialized while the editor lives; font_destroy quits it.
+font_free_contents :: proc(font: ^Font, quit_ttf := false) {
+   if font == nil do return
+   if font.texture != nil {
+      sdl.DestroyTexture(font.texture)
+      font.texture = nil
+   }
+   for l in font.ligatures do delete(l.text)
+   delete(font.ligatures)
+   font.ligatures = nil
+   delete(font.batcher.vertices)
+   delete(font.batcher.indices)
+   font.batcher.vertices = nil
+   font.batcher.indices = nil
+   delete(font.extra_glyphs)
+   font.extra_glyphs = nil
+   if font.face != nil {
+      ttf.CloseFont(font.face)
+      font.face = nil
+   }
+   for fb in font.fallback_faces {
+      ttf.CloseFont(fb)
+   }
+   delete(font.fallback_faces)
+   font.fallback_faces = nil
+   delete(font.atlas)
+   font.atlas = nil
+   if quit_ttf && g_ttf_initialized {
+      ttf.Quit()
+      g_ttf_initialized = false
+   }
+}
+
+font_destroy :: proc(font: ^Font) {
+   font_free_contents(font, quit_ttf = true)
 }
 
 // Re-bake the atlas at the current UI scale. Glyphs are rasterized natively,
@@ -329,12 +399,132 @@ load_font :: proc(renderer : ^sdl.Renderer, window : ^sdl.Window = nil) -> Font 
 font_reload :: proc(font: ^Font, renderer: ^sdl.Renderer, window: ^sdl.Window = nil) {
    if font == nil || renderer == nil do return
    fresh := load_font(renderer, window)
-   if font.texture != nil do sdl.DestroyTexture(font.texture)
-   for l in font.ligatures do delete(l.text)
-   delete(font.ligatures)
-   delete(font.batcher.vertices)
-   delete(font.batcher.indices)
+   font_free_contents(font)
    font^ = fresh
+}
+
+// Pack one rasterized surface into the atlas and upload only its rectangle.
+// Returns false when the atlas is full or the surface is unusable.
+font_pack_surface :: proc(font: ^Font, surface: ^sdl.Surface, ascent: f32) -> (Glyph, bool) {
+   gw := int(surface.w)
+   gh := int(surface.h)
+   if gw <= 0 || gh <= 0 do return {}, false
+
+   if font.pack_x + gw + ATLAS_PADDING > ATLAS_WIDTH {
+      font.pack_x = ATLAS_PADDING
+      font.pack_y += font.row_h + ATLAS_PADDING * 2
+      font.row_h = 0
+   }
+   if font.pack_y + gh + ATLAS_PADDING > ATLAS_HEIGHT do return {}, false
+
+   gx := font.pack_x
+   gy := font.pack_y
+
+   _ = sdl.LockSurface(surface)
+   pixels := ([^]u8)(surface.pixels)
+   pitch := int(surface.pitch)
+   for yy in 0 ..< gh {
+      for xx in 0 ..< gw {
+         alpha := pixels[yy * pitch + xx * 4 + 3]
+         di := ((gy + yy) * ATLAS_WIDTH + (gx + xx)) * 4
+         font.atlas[di + 0] = 255
+         font.atlas[di + 1] = 255
+         font.atlas[di + 2] = 255
+         font.atlas[di + 3] = alpha
+      }
+   }
+   sdl.UnlockSurface(surface)
+
+   rect := sdl.Rect{i32(gx), i32(gy), i32(gw), i32(gh)}
+   src := rawptr(&font.atlas[(gy * ATLAS_WIDTH + gx) * 4])
+   _ = sdl.UpdateTexture(font.texture, &rect, src, ATLAS_WIDTH * 4)
+
+   font.pack_x += gw + ATLAS_PADDING * 2
+   font.row_h = max(font.row_h, gh)
+
+   return Glyph{
+      u0 = f32(gx) / f32(ATLAS_WIDTH),
+      v0 = f32(gy) / f32(ATLAS_HEIGHT),
+      u1 = f32(gx + gw) / f32(ATLAS_WIDTH),
+      v1 = f32(gy + gh) / f32(ATLAS_HEIGHT),
+      w  = gw,
+      h  = gh,
+      ascent = ascent,
+   }, true
+}
+
+// Lazily rasterize a non-ASCII rune, trying fallback faces when the primary
+// font has no glyph. The result is cached in extra_glyphs (including the
+// replacement glyph for characters no configured font covers).
+font_ensure_glyph :: proc(font: ^Font, r: rune) -> (Glyph, bool) {
+   if font == nil do return {}, false
+   if g, ok := font.extra_glyphs[r]; ok do return g, true
+   if font.texture == nil do return {}, false
+
+   white := sdl.Color{255, 255, 255, 255}
+   faces: [16]^ttf.Font
+   face_count := 0
+   if font.face != nil {
+      faces[face_count] = font.face
+      face_count += 1
+   }
+   for fb in font.fallback_faces {
+      if face_count >= len(faces) do break
+      faces[face_count] = fb
+      face_count += 1
+   }
+
+   chosen: ^ttf.Font = nil
+   for i in 0 ..< face_count {
+      if ttf.FontHasGlyph(faces[i], u32(r)) {
+         chosen = faces[i]
+         break
+      }
+   }
+
+   // Unknown rune: try U+FFFD, then fall back to '?' so text still reads.
+   render_rune := r
+   if chosen == nil {
+      render_rune = 0xFFFD
+      for i in 0 ..< face_count {
+         if ttf.FontHasGlyph(faces[i], u32(render_rune)) {
+            chosen = faces[i]
+            break
+         }
+      }
+   }
+   if chosen == nil {
+      render_rune = '?'
+      for i in 0 ..< face_count {
+         if ttf.FontHasGlyph(faces[i], u32(render_rune)) {
+            chosen = faces[i]
+            break
+         }
+      }
+   }
+   if chosen == nil do return {}, false
+
+   raw := ttf.RenderGlyph_Blended(chosen, u32(render_rune), white)
+   if raw == nil do return {}, false
+   surface := sdl.ConvertSurface(raw, .RGBA32)
+   sdl.DestroySurface(raw)
+   if surface == nil do return {}, false
+   defer sdl.DestroySurface(surface)
+
+   glyph, ok := font_pack_surface(font, surface, f32(ttf.GetFontAscent(chosen)))
+   if !ok do return {}, false
+   font.extra_glyphs[r] = glyph
+   return glyph, true
+}
+
+// Look up a rune, rasterizing non-ASCII glyphs on first use.
+font_lookup_glyph :: proc(font: ^Font, r: rune) -> (Glyph, bool) {
+   if font == nil do return {}, false
+   if r >= FONT_START && r < FONT_START + FONT_COUNT {
+      g := font.glyphs[r - FONT_START]
+      return g, g.w > 0 && g.h > 0
+   }
+   return font_ensure_glyph(font, r)
 }
 
 // Append one atlas tile as a quad.
@@ -407,35 +597,39 @@ push_text :: proc(
 
    i := 0
    for i < len(text) {
-      ch := text[i]
-      if ch == '\n' {
+      r, size := utf8.decode_rune_in_string(text[i:])
+      if size <= 0 {
+         r = utf8.RUNE_ERROR
+         size = 1
+      }
+      if r == '\n' {
          x = pos.x + left_margin * scale
          baseline += line_h
          top += line_h
-         i += 1
+         i += size
          continue
       }
-      if ch == '\t' {
+      if r == '\t' {
          x += cell_w * 4
-         i += 1
-         continue
-      }
-      if ch < 32 || ch > 126 {
-         i += 1
+         i += size
          continue
       }
 
-      if lig, n, ok := find_ligature(font, text, i, nil); ok {
-         push_glyph(font, lig, x, top, f32(n) * cell_w, f32(lig.h) * scale, color)
-         x += f32(n) * cell_w
-         i += n
-         continue
+      if r >= 32 && r <= 126 {
+         if lig, n, ok := find_ligature(font, text, i, nil); ok {
+            push_glyph(font, lig, x, top, f32(n) * cell_w, f32(lig.h) * scale, color)
+            x += f32(n) * cell_w
+            i += n
+            continue
+         }
       }
 
-      g := font.glyphs[ch - 32]
-      push_glyph(font, g, x, top, f32(g.w) * scale, f32(g.h) * scale, color)
-      x += cell_w
-      i += 1
+      if g, ok := font_lookup_glyph(font, r); ok {
+         glyph_top := baseline - g.ascent * scale
+         push_glyph(font, g, x, glyph_top, f32(g.w) * scale, f32(g.h) * scale, color)
+      }
+      x += f32(rune_display_width(r)) * cell_w
+      i += size
    }
 }
 
@@ -468,28 +662,32 @@ push_line :: proc(
 
    i := 0
    for i < len(text) {
-      ch := text[i]
-      if ch == '\t' {
+      r, size := utf8.decode_rune_in_string(text[i:])
+      if size <= 0 {
+         r = utf8.RUNE_ERROR
+         size = 1
+      }
+      if r == '\t' {
          x += cell_w * 4
-         i += 1
-         continue
-      }
-      if ch < 32 || ch > 126 {
-         i += 1
+         i += size
          continue
       }
 
-      if lig, n, ok := find_ligature(font, text, i, nil); ok {
-         push_glyph(font, lig, x, top, f32(n) * cell_w, f32(lig.h) * scale, color)
-         x += f32(n) * cell_w
-         i += n
-         continue
+      if r >= 32 && r <= 126 {
+         if lig, n, ok := find_ligature(font, text, i, nil); ok {
+            push_glyph(font, lig, x, top, f32(n) * cell_w, f32(lig.h) * scale, color)
+            x += f32(n) * cell_w
+            i += n
+            continue
+         }
       }
 
-      g := font.glyphs[ch - 32]
-      push_glyph(font, g, x, top, f32(g.w) * scale, f32(g.h) * scale, color)
-      x += cell_w
-      i += 1
+      if g, ok := font_lookup_glyph(font, r); ok {
+         glyph_top := top + (font.metrics.ascent - g.ascent) * scale
+         push_glyph(font, g, x, glyph_top, f32(g.w) * scale, f32(g.h) * scale, color)
+      }
+      x += f32(rune_display_width(r)) * cell_w
+      i += size
    }
 
    return x
@@ -512,36 +710,39 @@ push_editor_line :: proc(
 
    i := 0
    for i < len(text) {
-      ch := text[i]
+      r, size := utf8.decode_rune_in_string(text[i:])
+      if size <= 0 {
+         r = utf8.RUNE_ERROR
+         size = 1
+      }
       base_color := char_colors[i] if (char_colors != nil && i < len(char_colors)) else color
-      char_color := highlight_color if i == highlight_col else base_color
+      char_color := highlight_color if (highlight_col >= i && highlight_col < i + size) else base_color
 
-      if ch == '\t' {
+      if r == '\t' {
          x += cell_w * 4
-         i += 1
+         i += size
          continue
       }
 
-      if ch < 32 || ch > 126 {
-         i += 1
-         continue
-      }
-
-      if lig, n, ok := find_ligature(font, text, i, char_colors); ok {
-         // Keep the cursor-highlighted character visible rather than hiding it
-         // inside a ligature tile.
-         if !(highlight_col >= i && highlight_col < i + n) {
-            push_glyph(font, lig, x, top, f32(n) * cell_w, f32(lig.h) * scale, char_color)
-            x += f32(n) * cell_w
-            i += n
-            continue
+      if r >= 32 && r <= 126 {
+         if lig, n, ok := find_ligature(font, text, i, char_colors); ok {
+            // Keep the cursor-highlighted character visible rather than hiding
+            // it inside a ligature tile.
+            if !(highlight_col >= i && highlight_col < i + n) {
+               push_glyph(font, lig, x, top, f32(n) * cell_w, f32(lig.h) * scale, char_color)
+               x += f32(n) * cell_w
+               i += n
+               continue
+            }
          }
       }
 
-      g := font.glyphs[ch - 32]
-      push_glyph(font, g, x, top, f32(g.w) * scale, f32(g.h) * scale, char_color)
-      x += cell_w
-      i += 1
+      if g, ok := font_lookup_glyph(font, r); ok {
+         glyph_top := top + (font.metrics.ascent - g.ascent) * scale
+         push_glyph(font, g, x, glyph_top, f32(g.w) * scale, f32(g.h) * scale, char_color)
+      }
+      x += f32(rune_display_width(r)) * cell_w
+      i += size
    }
 
    return x

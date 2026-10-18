@@ -364,3 +364,41 @@ test_dired_wdired_rejects_unsafe_edits :: proc(t: ^testing.T) {
     testing.expect_value(t, string(content), "original")
     fmt.println("  ✓ [Dired] wdired rejects duplicates, path escapes and type changes")
 }
+
+@(test)
+test_dired_async_load_and_stale_results :: proc(t: ^testing.T) {
+    dir1 := "/tmp/odin_editor_tests/dired_async_one"
+    dir2 := "/tmp/odin_editor_tests/dired_async_two"
+    _ = os.remove_all(dir1)
+    _ = os.remove_all(dir2)
+    testing.expect(t, os.make_directory_all(dir1) == nil)
+    testing.expect(t, os.make_directory_all(dir2) == nil)
+    defer os.remove_all(dir1)
+    defer os.remove_all(dir2)
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/one.txt", dir1), "") == nil)
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/two.txt", dir2), "") == nil)
+
+    d: Dired
+    dired_init(&d)
+    defer dired_destroy(&d)
+
+    dired_request_load(&d, dir1, .Name, .Asc)
+    testing.expect_value(t, d.loading, true)
+    dired_wait_load(&d)
+    testing.expect_value(t, d.loading, false)
+    testing.expect_value(t, d.path, dir1)
+    testing.expect_value(t, len(d.entries), 2)
+
+    // A second request supersedes the first; only the newest listing lands.
+    dired_request_load(&d, dir1, .Name, .Asc)
+    dired_request_load(&d, dir2, .Name, .Asc)
+    dired_wait_load(&d)
+    testing.expect_value(t, d.path, dir2)
+    found_two := false
+    for e in d.entries {
+        if e.name == "two.txt" do found_two = true
+        testing.expect(t, e.name != "one.txt")
+    }
+    testing.expect_value(t, found_two, true)
+    fmt.println("  ✓ [Dired] async loads apply the latest generation only")
+}

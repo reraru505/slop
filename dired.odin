@@ -1,10 +1,13 @@
 package main
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 import "core:time"
 import sdl "vendor:sdl3"
 
@@ -36,7 +39,33 @@ Dired :: struct {
     sort_order   : DiredSortOrder,
     is_editing   : bool,
     orig_entries : [dynamic]DiredEntry,
+    // Async listing state; the worker never references the Dired itself.
+    job          : ^Dired_Load_Job,
+    generation   : u64,
+    loading      : bool,
+    load_failed  : bool,
+    apply_ok     : bool,
+    // Allocator that owns entries/path (sync loads use context, async jobs use
+    // the default allocator because the worker outlives the caller's context).
+    allocator    : runtime.Allocator,
 }
+
+Dired_Load_Job :: struct {
+    thread     : ^thread.Thread,
+    mutex      : sync.Mutex,
+    cancel     : bool,
+    done       : bool,
+    generation : u64,
+    path       : string,
+    sort_by    : DiredSortBy,
+    sort_order : DiredSortOrder,
+    entries    : [dynamic]DiredEntry,
+    ok         : bool,
+}
+
+// Canceled jobs whose owner is gone. Joined only after thread.is_done.
+dired_orphan_jobs: [dynamic]^Dired_Load_Job
+dired_orphan_mutex: sync.Mutex
 
 dired_init :: proc(d: ^Dired) {
     d.entries = make([dynamic]DiredEntry, context.allocator)
@@ -47,21 +76,28 @@ dired_init :: proc(d: ^Dired) {
     d.sort_by = .Name
     d.sort_order = .Asc
     d.is_editing = false
+    d.job = nil
+    d.generation = 0
+    d.loading = false
+    d.load_failed = false
+    d.apply_ok = false
+    d.allocator = context.allocator
 }
 
 dired_destroy :: proc(d: ^Dired) {
+    dired_orphan_job(&d.job)
     for e in d.entries {
-        delete(e.name)
+        delete(e.name, d.allocator)
     }
     delete(d.entries)
 
     for e in d.orig_entries {
-        delete(e.name)
+        delete(e.name, context.allocator)
     }
     delete(d.orig_entries)
 
     if d.path != "" {
-        delete(d.path)
+        delete(d.path, d.allocator)
         d.path = ""
     }
 }
@@ -110,16 +146,16 @@ dired_compare_entries :: proc(a, b: DiredEntry, sort_by: DiredSortBy, order: Dir
     return result
 }
 
-dired_sort_entries :: proc(d: ^Dired) {
-    if len(d.entries) <= 2 do return // entry 0 is always ".."
+dired_sort_entry_list :: proc(entries: ^[dynamic]DiredEntry, sort_by: DiredSortBy, order: DiredSortOrder) {
+    if len(entries^) <= 2 do return // entry 0 is always ".."
 
-    dirs := make([dynamic]DiredEntry, context.allocator)
+    dirs := make([dynamic]DiredEntry, 0, len(entries^), context.allocator)
     defer delete(dirs)
-    files := make([dynamic]DiredEntry, context.allocator)
+    files := make([dynamic]DiredEntry, 0, len(entries^), context.allocator)
     defer delete(files)
 
-    for i := 1; i < len(d.entries); i += 1 {
-        entry := d.entries[i]
+    for i := 1; i < len(entries^); i += 1 {
+        entry := entries^[i]
         if entry.is_dir {
             append(&dirs, entry)
         } else {
@@ -131,7 +167,7 @@ dired_sort_entries :: proc(d: ^Dired) {
         sort_by:    DiredSortBy,
         sort_order: DiredSortOrder,
     }
-    sort_ctx := Sort_Context{sort_by = d.sort_by, sort_order = d.sort_order}
+    sort_ctx := Sort_Context{sort_by = sort_by, sort_order = order}
     less := proc(a, b: DiredEntry, user_data: rawptr) -> bool {
         ctx := (^Sort_Context)(user_data)
         return dired_compare_entries(a, b, ctx.sort_by, ctx.sort_order)
@@ -139,15 +175,91 @@ dired_sort_entries :: proc(d: ^Dired) {
     slice.sort_by_with_data(dirs[:], less, rawptr(&sort_ctx))
     slice.sort_by_with_data(files[:], less, rawptr(&sort_ctx))
 
-    parent := d.entries[0]
-    clear(&d.entries)
-    append(&d.entries, parent)
+    parent := entries^[0]
+    clear(entries)
+    append(entries, parent)
     for de in dirs {
-        append(&d.entries, de)
+        append(entries, de)
     }
     for fe in files {
-        append(&d.entries, fe)
+        append(entries, fe)
     }
+}
+
+dired_sort_entries :: proc(d: ^Dired) {
+    dired_sort_entry_list(&d.entries, d.sort_by, d.sort_order)
+}
+
+// Build a sorted listing for one directory without touching a Dired. Used by
+// the synchronous path and the background worker.
+dired_scan_path :: proc(
+    abs_path: string,
+    allocator: runtime.Allocator,
+    cancel: ^bool,
+    sort_by: DiredSortBy,
+    order: DiredSortOrder,
+) -> ([dynamic]DiredEntry, bool) {
+    if cancel != nil && sync.atomic_load(cancel) do return nil, false
+
+    handle, err := os.open(abs_path)
+    if err != nil do return nil, false
+    defer os.close(handle)
+
+    files, ferr := os.read_dir(handle, -1, allocator)
+    if ferr != nil do return nil, false
+    defer os.file_info_slice_delete(files, allocator)
+
+    new_entries := make([dynamic]DiredEntry, 0, len(files) + 1, allocator)
+    append(&new_entries, DiredEntry{
+        name     = strings.clone("..", allocator),
+        is_dir   = true,
+        size     = 0,
+        mod_time = time.now(),
+    })
+
+    for f in files {
+        if cancel != nil && sync.atomic_load(cancel) {
+            for e in new_entries do delete(e.name, allocator)
+            delete(new_entries)
+            return nil, false
+        }
+        if f.name == "." || f.name == ".." do continue
+        is_directory := f.type == .Directory
+        if f.type == .Symlink {
+            if full, join_err := filepath.join([]string{abs_path, f.name}, context.temp_allocator); join_err == nil {
+                is_directory = os.is_dir(full)
+            }
+        }
+        append(&new_entries, DiredEntry{
+            name     = strings.clone(f.name, allocator),
+            is_dir   = is_directory,
+            size     = f.size,
+            mod_time = f.modification_time,
+        })
+    }
+
+    dired_sort_entry_list(&new_entries, sort_by, order)
+    return new_entries, true
+}
+
+dired_install_entries :: proc(d: ^Dired, entries: [dynamic]DiredEntry, abs_path: string, allocator: runtime.Allocator) {
+    old_alloc := d.allocator
+    for e in d.entries do delete(e.name, old_alloc)
+    delete(d.entries)
+    if d.path != "" do delete(d.path, old_alloc)
+
+    d.entries = entries
+    d.allocator = allocator
+    d.path = abs_path
+
+    for orig in d.orig_entries do delete(orig.name, context.allocator)
+    clear(&d.orig_entries)
+    d.is_editing = false
+
+    d.cursor = 0
+    d.scroll = 0
+    d.load_failed = false
+    d.last_action = time.now()
 }
 
 dired_load_path :: proc(d: ^Dired, dir_path: string) -> bool {
@@ -156,68 +268,128 @@ dired_load_path :: proc(d: ^Dired, dir_path: string) -> bool {
         abs_path, _ = filepath.clean(dir_path, context.allocator)
     }
 
-    handle, err := os.open(abs_path)
-    if err != nil {
+    entries, ok := dired_scan_path(abs_path, context.allocator, nil, d.sort_by, d.sort_order)
+    if !ok {
         delete(abs_path)
         return false
     }
-    defer os.close(handle)
-
-    files, ferr := os.read_dir(handle, -1, context.allocator)
-    if ferr != nil {
-        delete(abs_path)
-        return false
-    }
-    defer os.file_info_slice_delete(files, context.allocator)
-
-    // Build the new listing first; a failed load must leave the old one intact.
-    new_entries := make([dynamic]DiredEntry, 0, len(files) + 1, context.allocator)
-    append(&new_entries, DiredEntry{
-        name     = strings.clone(".."),
-        is_dir   = true,
-        size     = 0,
-        mod_time = time.now(),
-    })
-
-    for f in files {
-        if f.name == "." || f.name == ".." do continue
-        is_directory := f.type == .Directory
-        // readdir reports symlinks as .Symlink; follow them for navigation.
-        if f.type == .Symlink {
-            if full, join_err := filepath.join([]string{abs_path, f.name}, context.temp_allocator); join_err == nil {
-                is_directory = os.is_dir(full)
-            }
-        }
-
-        append(&new_entries, DiredEntry{
-            name     = strings.clone(f.name),
-            is_dir   = is_directory,
-            size     = f.size,
-            mod_time = f.modification_time,
-        })
-    }
-
-    // Swap in the successful result.
-    for e in d.entries {
-        delete(e.name)
-    }
-    delete(d.entries)
-    d.entries = new_entries
-
-    if d.path != "" do delete(d.path)
-    d.path = abs_path
-
-    // A directory reload ends any wdired session and its snapshot.
-    for orig in d.orig_entries do delete(orig.name)
-    clear(&d.orig_entries)
-    d.is_editing = false
-
-    dired_sort_entries(d)
-
-    d.cursor = 0
-    d.scroll = 0
-    d.last_action = time.now()
+    dired_install_entries(d, entries, abs_path, context.allocator)
     return true
+}
+
+dired_job_worker :: proc(data: rawptr) {
+    job := (^Dired_Load_Job)(data)
+    alloc := runtime.default_allocator()
+    entries, ok := dired_scan_path(job.path, alloc, &job.cancel, job.sort_by, job.sort_order)
+
+    sync.mutex_lock(&job.mutex)
+    if sync.atomic_load(&job.cancel) {
+        if ok {
+            for e in entries do delete(e.name, alloc)
+            delete(entries)
+        }
+        job.ok = false
+    } else {
+        job.entries = entries
+        job.ok = ok
+    }
+    sync.mutex_unlock(&job.mutex)
+    sync.atomic_store(&job.done, true)
+}
+
+dired_orphan_job :: proc(job: ^^Dired_Load_Job) {
+    if job^ == nil do return
+    if dired_orphan_jobs.allocator.procedure == nil {
+        dired_orphan_jobs.allocator = runtime.default_allocator()
+    }
+    sync.atomic_store(&job^.cancel, true)
+    sync.mutex_lock(&dired_orphan_mutex)
+    append(&dired_orphan_jobs, job^)
+    sync.mutex_unlock(&dired_orphan_mutex)
+    job^ = nil
+}
+
+dired_poll_orphans :: proc() {
+    sync.mutex_lock(&dired_orphan_mutex)
+    defer sync.mutex_unlock(&dired_orphan_mutex)
+    i := 0
+    for i < len(dired_orphan_jobs) {
+        job := dired_orphan_jobs[i]
+        if sync.atomic_load(&job.done) {
+            ordered_remove(&dired_orphan_jobs, i)
+            if job.ok {
+                for e in job.entries do delete(e.name, runtime.default_allocator())
+                delete(job.entries)
+            }
+            if job.path != "" do delete(job.path, runtime.default_allocator())
+            free(job, runtime.default_allocator())
+        } else {
+            i += 1
+        }
+    }
+}
+
+dired_request_load :: proc(d: ^Dired, dir_path: string, sort_by: DiredSortBy, order: DiredSortOrder) {
+    dired_orphan_job(&d.job)
+
+    abs_path, abs_err := filepath.abs(dir_path, runtime.default_allocator())
+    if abs_err != nil {
+        abs_path, _ = filepath.clean(dir_path, runtime.default_allocator())
+    }
+
+    d.generation += 1
+    job := new(Dired_Load_Job, runtime.default_allocator())
+    job.path = abs_path
+    job.generation = d.generation
+    job.sort_by = sort_by
+    job.sort_order = order
+    job.cancel = false
+    job.done = false
+    d.job = job
+    d.loading = true
+    d.load_failed = false
+    background_thread_detached(rawptr(job), dired_job_worker)
+}
+
+// Blocking wait used by tests and one-shot callers that need the listing.
+dired_wait_load :: proc(d: ^Dired) {
+    for d.loading {
+        dired_poll(d)
+        dired_poll_orphans()
+        time.sleep(1 * time.Millisecond)
+    }
+}
+
+dired_poll :: proc(d: ^Dired) {
+    job := d.job
+    if job == nil do return
+
+    if !sync.atomic_load(&job.done) do return
+
+    entries: [dynamic]DiredEntry
+    ok := false
+    generation: u64 = 0
+    path := ""
+    sync.mutex_lock(&job.mutex)
+    entries = job.entries
+    job.entries = nil
+    ok = job.ok
+    generation = job.generation
+    path = job.path
+    job.path = ""
+    sync.mutex_unlock(&job.mutex)
+    free(job, runtime.default_allocator())
+    d.job = nil
+    d.loading = false
+
+    if generation != d.generation || !ok {
+        for e in entries do delete(e.name, runtime.default_allocator())
+        delete(entries)
+        if path != "" do delete(path, runtime.default_allocator())
+        if generation == d.generation do d.load_failed = true
+        return
+    }
+    dired_install_entries(d, entries, path, runtime.default_allocator())
 }
 
 dired_format_size :: proc(size: i64) -> string {
@@ -273,6 +445,7 @@ dired_enter_edit_mode :: proc(d: ^Dired, e: ^Editor, font: ^Font, window: ^sdl.W
 }
 
 dired_apply_edits :: proc(d: ^Dired, e: ^Editor) -> string {
+    d.apply_ok = false
     full_text := pt_full_text(&e.table)
     defer delete(full_text)
 
@@ -404,6 +577,7 @@ dired_apply_edits :: proc(d: ^Dired, e: ^Editor) -> string {
     // Refresh directory & sort
     dired_load_path(d, d.path)
     d.is_editing = false
+    d.apply_ok = true
 
     return fmt.tprintf("Dired: applied changes (%d created, %d renamed, %d deleted)", created_count, renamed_count, deleted_count)
 }
@@ -472,25 +646,27 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
         }
 
         if key == KEY_DIRED_PARENT || key == KEY_DIRED_PARENT_ALT {
+            if d.loading do return true
             parent := filepath.dir(d.path)
             if parent != "" {
-                dired_load_path(d, parent)
+                dired_request_load(d, parent, d.sort_by, d.sort_order)
             }
             return true
         }
 
         if key == KEY_DIRED_OPEN || key == sdl.K_RETURN || key == sdl.K_KP_ENTER {
+            if d.loading do return true
             if d.cursor >= 0 && d.cursor < len(d.entries) {
                 entry := d.entries[d.cursor]
                 if entry.name == ".." {
                     parent := filepath.dir(d.path)
                     if parent != "" {
-                        dired_load_path(d, parent)
+                        dired_request_load(d, parent, d.sort_by, d.sort_order)
                     }
                 } else if entry.is_dir {
                     new_path, _ := filepath.join([]string{d.path, entry.name}, context.allocator)
                     defer delete(new_path)
-                    dired_load_path(d, new_path)
+                    dired_request_load(d, new_path, d.sort_by, d.sort_order)
                 } else {
                     target_file, _ := filepath.join([]string{d.path, entry.name}, context.allocator)
                     defer delete(target_file)
@@ -563,7 +739,8 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
     sdl.RenderFillRect(renderer, &header_rect)
 
     sort_info := fmt.tprintf("[Sort: %s (%s)]", dired_sort_name(d.sort_by), "desc" if d.sort_order == .Desc else "asc")
-    header_line := fmt.tprintf("DIR: %s   %s", d.path, sort_info)
+    load_suffix := "   (loading...)" if d.loading else ("   (unreadable)" if d.load_failed else "")
+    header_line := fmt.tprintf("DIR: %s   %s%s", d.path, sort_info, load_suffix)
     push_line(font, header_line, Vec2{rect.x + 16.0, rect.y + 4.0}, theme.keyword, .HALF)
     hint := fmt.tprintf(
         "<%s>/<Esc> edit, <Enter>/<%s> open, <%s>/<%s> parent, <%s> sort, <:> command",

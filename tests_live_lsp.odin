@@ -200,4 +200,45 @@ test_live_lsp_odin :: proc(t: ^testing.T) {
     fmt.println("  ✓ [Live LSP] Odin (OLS): Handshake and initialization verified")
 }
 
+@(test)
+test_live_lsp_manager_root_lifecycle :: proc(t: ^testing.T) {
+    root := "/home/fnln/.cache/test_live_manager_ws"
+    _ = os.remove_all(root)
+    _ = os.make_directory_all(root)
+    defer os.remove_all(root)
+
+    path, _ := filepath.join([]string{root, "main.odin"}, context.temp_allocator)
+    _ = os.write_entire_file_from_string(path, "package main\n\nmain :: proc() {}\n")
+
+    mgr: LspManager
+    lsp_manager_init(&mgr, root)
+    defer lsp_manager_stop_all(&mgr)
+
+    lsp_manager_open_doc(&mgr, path, "package main\n\nmain :: proc() {}\n")
+    start := time.now()
+    initialized := false
+    for time.since(start) < 8 * time.Second {
+        lsp_manager_poll(&mgr)
+        for client in mgr.clients {
+            lsp_update(client, nil)
+            if client.initialized do initialized = true
+        }
+        if initialized do break
+        time.sleep(20 * time.Millisecond)
+    }
+    testing.expect_value(t, initialized, true)
+    if !initialized do return
+
+    lsp_manager_poll(&mgr)
+    lsp_manager_change_doc(&mgr, path, "package main\n\nmain :: proc() { println(\"hi\") }\n")
+    lsp_manager_close_doc(&mgr, path)
+    testing.expect_value(t, len(mgr.docs), 0)
+
+    stop_start := time.now()
+    lsp_manager_stop_all(&mgr)
+    elapsed := time.since(stop_start)
+    testing.expect(t, elapsed < 3 * time.Second, "manager shutdown stalled")
+    fmt.println("  ✓ [Live LSP] manager spawns, opens, re-roots, and shuts down")
+}
+
 } // when LIVE_LSP_TESTS

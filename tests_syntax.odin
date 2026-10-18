@@ -364,3 +364,160 @@ test_syntax_toml_header_with_comment :: proc(t: ^testing.T) {
     testing.expect_value(t, colors[11], th.comment)
     fmt.println("  ✓ [Syntax] TOML headers stop before trailing comments")
 }
+
+// Runs the stateful highlighter over a sequence of lines and returns the
+// outgoing state plus the colors of the last line.
+highlight_sequence_last :: proc(path: string, lines: []string, th: ^Theme) -> (Syntax_State, []sdl.FColor) {
+    state: Syntax_State
+    last: []sdl.FColor
+    for line in lines {
+        colors := make([]sdl.FColor, len(line), context.temp_allocator)
+        state = syntax_highlight_line_state(path, line, th, colors, state)
+        last = colors
+    }
+    return state, last
+}
+
+@(test)
+test_syntax_multiline_odin_block_and_raw :: proc(t: ^testing.T) {
+    th := theme_get(.GruberDarker)
+
+    state, last := highlight_sequence_last("a.odin", []string{
+        "/* outer",
+        "/* inner */ still outer",
+        "end */ let value = 1",
+    }, &th)
+    testing.expect_value(t, state.kind, Syntax_State_Kind.Normal)
+    testing.expect_value(t, last[0], th.comment)
+
+    state2, last2 := highlight_sequence_last("a.odin", []string{
+        "/* outer",
+        "/* nested",
+        "*/ still outer",
+    }, &th)
+    testing.expect_value(t, state2.kind, Syntax_State_Kind.Block_Comment)
+    testing.expect_value(t, state2.depth, 1)
+    testing.expect_value(t, last2[0], th.comment)
+    _ = last2 // rest of the line is comment
+
+    state3, last3 := highlight_sequence_last("a.odin", []string{
+        "msg := `raw",
+        "still raw",
+        "done`",
+    }, &th)
+    testing.expect_value(t, state3.kind, Syntax_State_Kind.Normal)
+    testing.expect_value(t, last3[0], th.string_lit)
+
+    _, last4 := highlight_sequence_last("a.odin", []string{"msg := `raw", "still raw"}, &th)
+    testing.expect_value(t, last4[0], th.string_lit)
+
+    fmt.println("  ✓ [Syntax] Odin block comments nest and raw strings span lines")
+}
+
+@(test)
+test_syntax_multiline_c_rust_go :: proc(t: ^testing.T) {
+    th := theme_get(.GruberDarker)
+
+    c_state, c_last := highlight_sequence_last("a.c", []string{
+        "int x; /* start",
+        "middle",
+        "end */ int y;",
+    }, &th)
+    testing.expect_value(t, c_state.kind, Syntax_State_Kind.Normal)
+    testing.expect_value(t, c_last[0], th.comment)
+
+    r_state, _ := highlight_sequence_last("a.rs", []string{
+        "/* outer",
+        "/* inner",
+        "*/",
+    }, &th)
+    testing.expect_value(t, r_state.kind, Syntax_State_Kind.Block_Comment)
+    testing.expect_value(t, r_state.depth, 1)
+
+    _, r_raw := highlight_sequence_last("a.rs", []string{
+        "let s = r#\"one",
+        "two",
+        "three\"#;",
+    }, &th)
+    testing.expect_value(t, r_raw[0], th.string_lit)
+
+    _, go_raw := highlight_sequence_last("a.go", []string{
+        "s := `one",
+        "two",
+        "three`",
+    }, &th)
+    testing.expect_value(t, go_raw[0], th.string_lit)
+
+    fmt.println("  ✓ [Syntax] C/Rust/Go block comments and raw strings continue")
+}
+
+@(test)
+test_syntax_multiline_lua_toml_bash :: proc(t: ^testing.T) {
+    th := theme_get(.GruberDarker)
+
+    lua_state, _ := highlight_sequence_last("a.lua", []string{
+        "--[=[ comment",
+        "still comment",
+    }, &th)
+    testing.expect_value(t, lua_state.kind, Syntax_State_Kind.Block_Comment)
+    testing.expect_value(t, lua_state.bracket_level, 1)
+
+    _, lua_end := highlight_sequence_last("a.lua", []string{
+        "--[=[ comment",
+        "still comment",
+        "]=] local x = 1",
+    }, &th)
+    testing.expect_value(t, lua_end[4], th.keyword)
+
+    toml_state, _ := highlight_sequence_last("a.toml", []string{
+        `desc = """line one`,
+        "line two",
+    }, &th)
+    testing.expect_value(t, toml_state.kind, Syntax_State_Kind.Quoted_String)
+
+    bash_state, _ := highlight_sequence_last("a.sh", []string{
+        "cat <<EOF",
+        "body line",
+    }, &th)
+    testing.expect_value(t, bash_state.kind, Syntax_State_Kind.Here_Doc)
+
+    bash_done, bash_last := highlight_sequence_last("a.sh", []string{
+        "cat <<EOF",
+        "body line",
+        "EOF",
+        "echo done",
+    }, &th)
+    testing.expect_value(t, bash_done.kind, Syntax_State_Kind.Normal)
+    testing.expect_value(t, bash_last[0], th.fn_name)
+
+    bash_quote, _ := highlight_sequence_last("a.sh", []string{
+        `echo "one`,
+        "two",
+    }, &th)
+    testing.expect_value(t, bash_quote.kind, Syntax_State_Kind.Quoted_String)
+
+    fmt.println("  ✓ [Syntax] Lua long comments, TOML triple strings, Bash heredocs/quotes")
+}
+
+@(test)
+test_editor_syntax_state_cache_invalidation :: proc(t: ^testing.T) {
+    th := theme_get(.GruberDarker)
+    e: Editor
+    editor_init(&e, nil, "/* start\nmiddle\nend */ let x = 1", "a.odin")
+    defer editor_destroy(&e)
+
+    mid_state := editor_ensure_syntax_state(&e, 1, &th)
+    testing.expect_value(t, mid_state.kind, Syntax_State_Kind.Block_Comment)
+    after_state := editor_ensure_syntax_state(&e, 2, &th)
+    testing.expect_value(t, after_state.kind, Syntax_State_Kind.Block_Comment)
+    final_state := editor_ensure_syntax_state(&e, 3, &th)
+    testing.expect_value(t, final_state.kind, Syntax_State_Kind.Normal)
+
+    // Removing the opening delimiter on line 0 must invalidate lines below.
+    pt_replace(&e.table, 0, 2, "")
+    editor_invalidate_syntax(&e, 0)
+    changed := editor_ensure_syntax_state(&e, 1, &th)
+    testing.expect_value(t, changed.kind, Syntax_State_Kind.Normal)
+
+    fmt.println("  ✓ [Syntax] per-line state cache invalidates after edits")
+}

@@ -87,17 +87,13 @@ app_picker_root :: proc(app: ^App) -> string {
     return app.working_dir
 }
 
-// Change the project root. This is also the base directory for compilation,
-// the picker, relative :e/:sp/:vs paths, and new LSP clients. It intentionally
-// does not call chdir; :cd does that as well.
+// Change the project root. This is the base directory for compilation, the
+// picker, relative :e/:sp/:vs paths, and LSP workspaces. The session working
+// directory (`:pwd`) is independent and only changes with :cd.
 app_set_project_root :: proc(app: ^App, dir: string) {
     if app.root_dir != "" do delete(app.root_dir)
     app.root_dir = strings.clone(dir, context.allocator)
-
-    if app.working_dir != "" do delete(app.working_dir)
-    app.working_dir = strings.clone(dir, context.allocator)
-
-    lsp_manager_set_working_dir(&app.lsp_manager, dir)
+    lsp_manager_set_project_root(&app.lsp_manager, dir)
 }
 
 // Resolve a user-supplied path against the project root. Absolute paths are
@@ -114,10 +110,29 @@ app_resolve_path :: proc(app: ^App, path: string) -> string {
     return joined
 }
 
+// Lookup only: rendering and request paths must never fork a server during
+// draw. Clients are spawned from lsp_manager_poll in update().
 app_get_lsp_for_file :: proc(app: ^App, file_path: string) -> ^LspClient {
     if app == nil || file_path == "" do return nil
     lang := language_from_file_path(file_path)
-    return lsp_manager_get_client(&app.lsp_manager, lang, file_path)
+    return lsp_manager_peek(&app.lsp_manager, lang, file_path)
+}
+
+app_lsp_doc_open :: proc(app: ^App, e: ^Editor, text: string) {
+    if app == nil || e == nil || e.file_path == "" || strings.has_prefix(e.file_path, "*") do return
+    lsp_manager_open_doc(&app.lsp_manager, e.file_path, text)
+    e.lsp_doc_open = true
+}
+
+app_lsp_doc_close :: proc(app: ^App, e: ^Editor) {
+    if app == nil || e == nil || !e.lsp_doc_open do return
+    lsp_manager_close_doc(&app.lsp_manager, e.file_path)
+    e.lsp_doc_open = false
+}
+
+app_lsp_doc_change :: proc(app: ^App, file_path, text: string) {
+    if app == nil || file_path == "" do return
+    lsp_manager_change_doc(&app.lsp_manager, file_path, text)
 }
 
 app_get_active_lsp :: proc(app: ^App) -> ^LspClient {
@@ -376,6 +391,11 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
 app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string, force := false) -> bool {
     if pane == nil do return false
 
+    target_path := file_path
+    if target_path != "" && !strings.has_prefix(target_path, "*") {
+        target_path = lsp_abs_path(target_path, context.temp_allocator)
+    }
+
     // Refuse to silently replace a modified or read-only editor buffer.
     if pane.kind == .Editor {
         if pane.editor.read_only && !force {
@@ -391,14 +411,15 @@ app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string, force := f
     // Any editor replacement ends a wdired session in this pane.
     pane.dired.is_editing = false
 
-    data, err := os.read_entire_file(file_path, context.allocator)
+    data, err := os.read_entire_file(target_path, context.allocator)
     initial_text := ""
     if err == nil && data != nil {
         initial_text = string(data)
     }
 
+    app_lsp_doc_close(app, &pane.editor)
     editor_destroy(&pane.editor)
-    editor_init(&pane.editor, &app.font, initial_text, file_path)
+    editor_init(&pane.editor, &app.font, initial_text, target_path)
 
     // read_entire_file can return a partial buffer together with an error.
     if data != nil do delete(data)
@@ -406,13 +427,9 @@ app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string, force := f
     pane.kind = .Editor
     app.active_pane = pane
 
-    if file_path != "" {
-        if lsp := app_get_lsp_for_file(app, file_path); lsp != nil && lsp_is_running(lsp) {
-            full_text := pt_full_text(&pane.editor.table)
-            defer delete(full_text)
-            lsp_did_open(lsp, file_path, full_text)
-        }
-    }
+    full_text := pt_full_text(&pane.editor.table)
+    defer delete(full_text)
+    app_lsp_doc_open(app, &pane.editor, full_text)
     return true
 }
 
@@ -431,10 +448,15 @@ app_pane_open_dired :: proc(app: ^App, pane: ^Pane, dir_path: string) {
             return
         }
     }
-    if dired_load_path(&pane.dired, dir_path) {
-        pane.kind = .Dired
-        app.active_pane = pane
+    abs_dir := lsp_abs_path(dir_path, context.temp_allocator)
+    if !os.is_dir(abs_dir) {
+        app_set_message(app, fmt.tprintf("Not a directory: %s", dir_path))
+        return
     }
+    app_lsp_doc_close(app, &pane.editor)
+    pane.kind = .Dired
+    app.active_pane = pane
+    dired_request_load(&pane.dired, abs_dir, pane.dired.sort_by, pane.dired.sort_order)
 }
 
 app_pane_open :: proc(app: ^App, pane: ^Pane, target: string, force := false) {
@@ -576,6 +598,9 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                 msg := dired_apply_edits(&app.active_pane.dired, &app.active_pane.editor)
                 app_set_message(app, msg)
                 _ = sdl.StopTextInput(app.window)
+                if app.active_pane.dired.apply_ok {
+                    app_close_current_pane(app, false)
+                }
             } else if app.active_pane.kind == .Editor {
                 e := &app.active_pane.editor
                 if e.read_only {
@@ -738,12 +763,23 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
             arg = os.get_env("HOME", context.temp_allocator)
             if arg == "" do arg = "."
         }
-        // Relative :cd paths are relative to the current project root.
-        arg = app_resolve_path(app, arg)
+        arg = expand_home_path(arg)
+        // Relative :cd paths resolve against the session directory, falling
+        // back to the project root. The editor never calls chdir(); all path
+        // resolution is explicit, which keeps process-global state stable.
+        if arg != "" && !filepath.is_abs(arg) {
+            base := app.working_dir
+            if base == "" do base = app_picker_root(app)
+            if joined, join_err := filepath.join([]string{base, arg}, context.temp_allocator); join_err == nil {
+                arg = joined
+            }
+        }
         abs_target, abs_err := filepath.abs(arg, context.temp_allocator)
         if abs_err == nil && os.is_dir(abs_target) {
+            if app.working_dir != "" do delete(app.working_dir)
+            app.working_dir = strings.clone(abs_target, context.allocator)
+            // The project scope follows an explicit cd.
             app_set_project_root(app, abs_target)
-            _ = os.set_working_directory(app.working_dir)
             app_set_message(app, fmt.tprintf("Working dir: %s", app.working_dir))
         } else {
             app_set_message(app, fmt.tprintf("Invalid directory: %s", arg))
@@ -768,7 +804,12 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
             }
         }
     } else if cmd == "pwd" {
-        app_set_message(app, fmt.tprintf("Working dir: %s", app.working_dir))
+        root := app_picker_root(app)
+        if root != "" && root != app.working_dir {
+            app_set_message(app, fmt.tprintf("Working dir: %s (root: %s)", app.working_dir, root))
+        } else {
+            app_set_message(app, fmt.tprintf("Working dir: %s", app.working_dir))
+        }
     } else if cmd[0] >= '0' && cmd[0] <= '9' {
         line, ok := strconv.parse_int(cmd)
         if ok {
@@ -922,15 +963,11 @@ load :: proc(app: ^App) {
     }
 
     app.root_dir = resolve_startup_root(app.working_dir)
-    // Features operate from the project root, not the shell's launch dir.
-    if app.root_dir != app.working_dir {
-        delete(app.working_dir)
-        app.working_dir = strings.clone(app.root_dir, context.allocator)
-    }
 
     file_picker_init(&app.file_picker)
 
-    target_path := app.working_dir
+    // Open the project root (or cwd fallback) when no file/dir is given.
+    target_path := app_picker_root(app)
     if len(os.args) > 1 {
         target_path = os.args[1]
         // Resolve CLI-relative paths now, while the process cwd is still the
@@ -949,7 +986,7 @@ load :: proc(app: ^App) {
     initial_pane: ^Pane
     if os.is_dir(target_path) {
         initial_pane = pane_create(app, .Dired)
-        dired_load_path(&initial_pane.dired, target_path)
+        dired_request_load(&initial_pane.dired, target_path, .Name, .Asc)
     } else {
         initial_pane = pane_create(app, .Editor)
         data, err := os.read_entire_file(target_path, context.allocator)
@@ -963,19 +1000,17 @@ load :: proc(app: ^App) {
         if data != nil do delete(data)
     }
 
-    // Initialize LSP manager
-    lsp_manager_init(&app.lsp_manager, app.working_dir)
+    // Initialize LSP manager with the project scope, not the launch cwd.
+    lsp_manager_init(&app.lsp_manager, app_picker_root(app))
 
     app.active_pane = initial_pane
     app.root_split = split_create_leaf(initial_pane)
     app.running = true
 
     if initial_pane.kind == .Editor && initial_pane.editor.file_path != "" {
-        if lsp := app_get_lsp_for_file(app, initial_pane.editor.file_path); lsp != nil && lsp_is_running(lsp) {
-            full_text := pt_full_text(&initial_pane.editor.table)
-            defer delete(full_text)
-            lsp_did_open(lsp, initial_pane.editor.file_path, full_text)
-        }
+        full_text := pt_full_text(&initial_pane.editor.table)
+        defer delete(full_text)
+        app_lsp_doc_open(app, &initial_pane.editor, full_text)
     }
 }
 
@@ -990,8 +1025,19 @@ update :: proc(app: ^App) {
 
     // Collect finished background builds and picker scans. Poll every pane:
     // a compilation pane can be repurposed to an editor while its build runs.
-    for p in app.panes do compilation_poll(&p.compilation)
+    for p in app.panes {
+        compilation_poll(&p.compilation)
+        dired_poll(&p.dired)
+    }
+    compilation_poll_orphans()
+    dired_poll_orphans()
     file_picker_poll(&app.file_picker)
+    lsp_manager_poll(&app.lsp_manager)
+    if app.lsp_manager.last_message != "" {
+        app_set_message(app, app.lsp_manager.last_message)
+        delete(app.lsp_manager.last_message)
+        app.lsp_manager.last_message = ""
+    }
 
     event: sdl.Event
     for sdl.PollEvent(&event) {
@@ -1174,8 +1220,7 @@ update :: proc(app: ^App) {
     }
 
     // LSP update and response dispatch for all running servers
-    for server_kind in LspServerKind {
-        client := app.lsp_manager.clients[server_kind]
+    for client in app.lsp_manager.clients {
         if client != nil && lsp_is_running(client) {
             lsp_update(client, app)
         }
@@ -1279,10 +1324,10 @@ update :: proc(app: ^App) {
             e := &pane.editor
             if e.needs_lsp_sync && time.since(e.last_edit_time) > 250 * time.Millisecond {
                 e.needs_lsp_sync = false
-                if lsp := app_get_lsp_for_file(app, e.file_path); lsp != nil && lsp_is_running(lsp) && e.file_path != "" {
+                if e.file_path != "" {
                     full_text := pt_full_text(&e.table)
                     defer delete(full_text)
-                    lsp_did_change(lsp, e.file_path, full_text)
+                    app_lsp_doc_change(app, e.file_path, full_text)
                 }
             }
         }
@@ -1467,6 +1512,7 @@ cleanup :: proc(app: ^App) {
         app.last_compile_cmd = ""
     }
 
+    font_destroy(&app.font)
     sdl.DestroyRenderer(app.renderer)
     sdl.DestroyWindow(app.window)
     lsp_manager_stop_all(&app.lsp_manager)

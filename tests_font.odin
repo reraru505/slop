@@ -144,3 +144,77 @@ test_font_ligature_table_has_reachable_starts :: proc(t: ^testing.T) {
     }
     fmt.println("  ✓ [Font] every ligature sequence has a reachable start byte")
 }
+
+@(test)
+test_font_rune_widths_and_glyph_lookup :: proc(t: ^testing.T) {
+    testing.expect_value(t, rune_display_width('a'), 1)
+    testing.expect_value(t, rune_display_width('é'), 1)
+    testing.expect_value(t, rune_display_width('日'), 2)
+    testing.expect_value(t, rune_display_width(0x0301), 0) // combining acute
+    testing.expect_value(t, rune_display_width('😀'), 2)
+
+    f: Font
+    f.extra_glyphs = make(map[rune]Glyph)
+    defer delete(f.extra_glyphs)
+    f.glyphs['A' - FONT_START] = Glyph{w = 4, h = 6, ascent = 8, u1 = 0.1, v1 = 0.1}
+    f.extra_glyphs['é'] = Glyph{w = 4, h = 6, ascent = 8, u1 = 0.2, v1 = 0.2}
+
+    g, ok := font_lookup_glyph(&f, 'A')
+    testing.expect_value(t, ok, true)
+    testing.expect_value(t, g.w, 4)
+    g2, ok2 := font_lookup_glyph(&f, 'é')
+    testing.expect_value(t, ok2, true)
+    testing.expect_value(t, g2.h, 6)
+    _, ok3 := font_lookup_glyph(&f, '日')
+    testing.expect_value(t, ok3, false) // no face/texture available in this fixture
+
+    fmt.println("  ✓ [Font] rune cell widths and ASCII/lazy glyph lookup")
+}
+
+RUN_SDL_FONT_TESTS :: #config(ODIN_TEST_SDL_FONT, false)
+
+when RUN_SDL_FONT_TESTS {
+@(test)
+test_font_lazy_glyph_rasterization :: proc(t: ^testing.T) {
+    _ = sdl.SetHint(sdl.HINT_VIDEO_DRIVER, "dummy")
+    if !sdl.Init({.VIDEO}) do return
+    defer sdl.Quit()
+
+    window: ^sdl.Window
+    renderer: ^sdl.Renderer
+    if !sdl.CreateWindowAndRenderer("font-test", 320, 240, {.HIDDEN}, &window, &renderer) {
+        fmt.println("SDL renderer unavailable, skipping font rasterization test")
+        return
+    }
+    defer {
+        sdl.DestroyRenderer(renderer)
+        sdl.DestroyWindow(window)
+    }
+
+    f := load_font(renderer, window)
+    defer font_destroy(&f)
+
+    ascii, ascii_ok := font_lookup_glyph(&f, 'A')
+    testing.expect_value(t, ascii_ok, true)
+    testing.expect(t, ascii.w > 0)
+
+    cjk, cjk_ok := font_lookup_glyph(&f, '日')
+    testing.expect_value(t, cjk_ok, true)
+    testing.expect(t, cjk.w > 0)
+    _, cached_ok := f.extra_glyphs['日']
+    testing.expect_value(t, cached_ok, true)
+
+    emoji, emoji_ok := font_lookup_glyph(&f, '😀')
+    testing.expect_value(t, emoji_ok, true) // replacement glyph when unavailable
+    testing.expect(t, emoji.w > 0)
+
+    // Wide cells advance two cells; combining marks advance zero.
+    start_x: f32 = 100.0
+    end_x := push_editor_line(&f, "é日", Vec2{start_x, 0}, sdl.FColor{1, 1, 1, 1}, .HALF)
+    cell := font_cell_width(&f) * get_font_scale_multiplier(.HALF)
+    testing.expect(t, abs(end_x - (start_x + 3 * cell)) < 0.1, "wide runes must advance two cells")
+    combined_end := push_editor_line(&f, "é", Vec2{start_x, 0}, sdl.FColor{1, 1, 1, 1}, .HALF)
+    testing.expect(t, abs(combined_end - (start_x + cell)) < 0.1, "combining marks must not advance")
+    fmt.println("  ✓ [Font] lazy Unicode glyphs rasterize into the atlas")
+}
+}

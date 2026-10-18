@@ -3,7 +3,9 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:testing"
+import "core:time"
 import sdl "vendor:sdl3"
 
 destroy_parsed_line :: proc(line: ^CompilationLine) {
@@ -122,16 +124,21 @@ test_compilation_run_command_is_async :: proc(t: ^testing.T) {
     testing.expect(t, c.job != nil)
     testing.expect_value(t, c.finished, false)
 
-    // A second build is refused while the first is in flight.
+    // A second build cancels the first and replaces it.
     compilation_run_command(&c, "printf 'second\\n'")
-    testing.expect_value(t, c.status, "Compilation already running")
+    testing.expect_value(t, c.status, "Running...")
     testing.expect(t, c.job != nil)
 
     compilation_wait(&c)
     testing.expect_value(t, c.finished, true)
     testing.expect_value(t, c.exit_code, 0)
     testing.expect(t, c.job == nil)
-    fmt.println("  ✓ [Compilation] commands run off-thread and concurrent starts are refused")
+    found_second := false
+    for line in c.lines {
+        if strings.trim_space(line.text) == "second" do found_second = true
+    }
+    testing.expect_value(t, found_second, true)
+    fmt.println("  ✓ [Compilation] commands run off-thread and a new start cancels the old build")
 }
 
 @(test)
@@ -299,4 +306,47 @@ test_compilation_recompile_self_alias :: proc(t: ^testing.T) {
     }
     testing.expect_value(t, found, true)
     fmt.println("  ✓ [Compilation] recompile safely aliases its own command")
+}
+
+@(test)
+test_compilation_cancel_kills_build :: proc(t: ^testing.T) {
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+
+    compilation_run_command(&c, "sleep 10")
+    // Wait until the child has actually started before canceling.
+    deadline := time.now()
+    for {
+        sync.mutex_lock(&c.job.mutex)
+        started := c.job.process_started
+        sync.mutex_unlock(&c.job.mutex)
+        if started do break
+        if time.since(deadline) > 2 * time.Second do break
+        time.sleep(1 * time.Millisecond)
+    }
+
+    start := time.now()
+    compilation_cancel(&c)
+    compilation_wait(&c)
+    elapsed := time.since(start)
+
+    testing.expect_value(t, c.finished, true)
+    testing.expect_value(t, c.status, "Cancelled")
+    testing.expect(t, elapsed < 2 * time.Second, "cancel took too long")
+    fmt.println("  ✓ [Compilation] cancel kills a running build without waiting for it")
+}
+
+@(test)
+test_compilation_destroy_cancels_without_blocking :: proc(t: ^testing.T) {
+    c: Compilation
+    compilation_init(&c)
+
+    compilation_run_command(&c, "sleep 10")
+    start := time.now()
+    compilation_destroy(&c)
+    elapsed := time.since(start)
+    testing.expect(t, elapsed < 500 * time.Millisecond, "destroy blocked on a running build")
+    compilation_poll_orphans()
+    fmt.println("  ✓ [Compilation] destroying a pane cancels its build without blocking")
 }

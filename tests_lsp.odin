@@ -254,6 +254,11 @@ lsp_test_cleanup :: proc(client: ^LspClient) {
     lsp_test_clear_diagnostics(client)
     for k in client.file_versions do delete(k)
     delete(client.file_versions)
+    for k, v in client.file_texts {
+        delete(k)
+        delete(v)
+    }
+    delete(client.file_texts)
 }
 
 @(test)
@@ -538,6 +543,11 @@ test_lsp_did_change_queue_coalescing :: proc(t: ^testing.T) {
         delete(client.writer_queue)
         for k in client.file_versions do delete(k)
         delete(client.file_versions)
+        for k, v in client.file_texts {
+            delete(k)
+            delete(v)
+        }
+        delete(client.file_texts)
     }
 
     // A pipe stands in for the server's stdin; nothing reads it because the
@@ -629,4 +639,300 @@ test_lsp_reader_handles_batched_messages :: proc(t: ^testing.T) {
     }
     testing.expect_value(t, count, 2)
     fmt.println("  ✓ [LSP Unit] reader parses multiple messages batched in one read")
+}
+
+@(test)
+test_lsp_utf16_position_conversion :: proc(t: ^testing.T) {
+    client: LspClient
+    defer lsp_test_cleanup(&client)
+    client.position_encoding = .UTF16
+    path := "/tmp/unicode_positions.odin"
+    line := "é日😀x" // bytes: 2 + 3 + 4 + 1; UTF-16 units: 1 + 1 + 2 + 1
+    client.file_texts[strings.clone(path, context.allocator)] = strings.clone(line, context.allocator)
+
+    testing.expect_value(t, lsp_byte_col_to_character(&client, path, 0, 0), 0)
+    testing.expect_value(t, lsp_byte_col_to_character(&client, path, 0, 2), 1)
+    testing.expect_value(t, lsp_byte_col_to_character(&client, path, 0, 5), 2)
+    testing.expect_value(t, lsp_byte_col_to_character(&client, path, 0, 9), 4)
+    testing.expect_value(t, lsp_byte_col_to_character(&client, path, 0, 10), 5)
+
+    testing.expect_value(t, lsp_character_to_byte_col(&client, path, 0, 0), 0)
+    testing.expect_value(t, lsp_character_to_byte_col(&client, path, 0, 1), 2)
+    testing.expect_value(t, lsp_character_to_byte_col(&client, path, 0, 2), 5)
+    // Mid-surrogate snaps to the emoji start.
+    testing.expect_value(t, lsp_character_to_byte_col(&client, path, 0, 3), 5)
+    testing.expect_value(t, lsp_character_to_byte_col(&client, path, 0, 4), 9)
+    testing.expect_value(t, lsp_character_to_byte_col(&client, path, 0, 5), 10)
+
+    client.position_encoding = .UTF8
+    testing.expect_value(t, lsp_byte_col_to_character(&client, path, 0, 5), 5)
+    testing.expect_value(t, lsp_character_to_byte_col(&client, path, 0, 5), 5)
+    fmt.println("  ✓ [LSP Unit] UTF-8 byte columns and UTF-16 code units convert both ways")
+}
+
+@(test)
+test_lsp_initialize_selects_position_encoding :: proc(t: ^testing.T) {
+    client: LspClient
+    defer lsp_test_cleanup(&client)
+    client.position_encoding = .UTF16
+    append(&client.pending_requests, PendingRequest{id = 1, kind = .Initialize})
+
+    msg := `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-8"}}}`
+    obj, ok := lsp_test_parse_object(msg)
+    testing.expect_value(t, ok, true)
+    lsp_handle_response(&client, 1, obj, nil)
+    testing.expect_value(t, client.initialized, true)
+    testing.expect_value(t, client.position_encoding, Lsp_Position_Encoding.UTF8)
+
+    // Servers that omit the field use the protocol default.
+    other: LspClient
+    defer lsp_test_cleanup(&other)
+    append(&other.pending_requests, PendingRequest{id = 2, kind = .Initialize})
+    msg2 := `{"jsonrpc":"2.0","id":2,"result":{"capabilities":{}}}`
+    obj2, ok2 := lsp_test_parse_object(msg2)
+    testing.expect_value(t, ok2, true)
+    lsp_handle_response(&other, 2, obj2, nil)
+    testing.expect_value(t, other.position_encoding, Lsp_Position_Encoding.UTF16)
+    fmt.println("  ✓ [LSP Unit] initialize honors the server's positionEncoding choice")
+}
+
+@(test)
+test_lsp_diagnostics_use_utf16_columns :: proc(t: ^testing.T) {
+    client: LspClient
+    defer lsp_test_cleanup(&client)
+    client.position_encoding = .UTF16
+    path := "/tmp/odin_unicode_diag.odin"
+    client.file_texts[strings.clone(path, context.allocator)] = strings.clone("é日😀x", context.allocator)
+
+    msg := `{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///tmp/odin_unicode_diag.odin","diagnostics":[{"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}},"severity":1,"message":"bad"}]}}`
+    obj, ok := lsp_test_parse_object(msg)
+    testing.expect_value(t, ok, true)
+    lsp_handle_notification(&client, "textDocument/publishDiagnostics", obj, nil)
+
+    diags, has := client.diagnostics[path]
+    testing.expect_value(t, has, true)
+    if has && len(diags) > 0 {
+        testing.expect_value(t, diags[0].start_col, 2)
+        testing.expect_value(t, diags[0].end_col, 5)
+    }
+    fmt.println("  ✓ [LSP Unit] diagnostics UTF-16 columns become byte offsets")
+}
+
+@(test)
+test_lsp_definition_and_format_use_utf16_columns :: proc(t: ^testing.T) {
+    client: LspClient
+    defer lsp_test_cleanup(&client)
+    client.position_encoding = .UTF16
+    path := "/tmp/odin_unicode_fmt.odin"
+    target := "/tmp/odin_unicode_target.odin"
+    defer os.remove(target)
+    testing.expect(t, os.write_entire_file_from_string(target, "é日😀x") == nil)
+    client.file_texts[strings.clone(path, context.allocator)] = strings.clone("zero\né日😀x", context.allocator)
+
+    // Definition target at UTF-16 character 2 (start of the emoji at byte 5).
+    append(&client.pending_requests, PendingRequest{id = 12, kind = .Definition, file_path = strings.clone(path)})
+    def_msg := `{"jsonrpc":"2.0","id":12,"result":{"uri":"file:///tmp/odin_unicode_target.odin","range":{"start":{"line":0,"character":2},"end":{"line":0,"character":4}}}}`
+    def_obj, def_ok := lsp_test_parse_object(def_msg)
+    testing.expect_value(t, def_ok, true)
+    lsp_handle_response(&client, 12, def_obj, nil)
+    loc, has_loc := client.last_definition.?
+    testing.expect_value(t, has_loc, true)
+    if has_loc {
+        testing.expect_value(t, loc.col, 5)
+        delete(loc.file_path)
+    }
+    client.last_definition = nil
+
+    doc_line, line_ok := lsp_document_line(&client, path, 1, context.temp_allocator)
+    testing.expect_value(t, line_ok, true)
+    testing.expect_value(t, doc_line, "é日😀x")
+    testing.expect_value(t, lsp_character_to_byte_col(&client, path, 1, 1), 2)
+    testing.expect_value(t, lsp_character_to_byte_col(&client, path, 1, 2), 5)
+
+    // Multi-edit formatting on line 1: character 1..2 is bytes 2..5.
+    append(&client.pending_requests, PendingRequest{
+        id = 13, kind = .RangeFormatting, file_path = strings.clone(path), start_row = 1, end_row = 1,
+    })
+    fmt_msg := `{"jsonrpc":"2.0","id":13,"result":[{"range":{"start":{"line":1,"character":1},"end":{"line":1,"character":2}},"newText":"X"}]}`
+    fmt_obj, fmt_ok := lsp_test_parse_object(fmt_msg)
+    testing.expect_value(t, fmt_ok, true)
+    lsp_handle_response(&client, 13, fmt_obj, nil)
+    testing.expect_value(t, len(client.last_edits), 1)
+    if len(client.last_edits) == 1 {
+        testing.expect_value(t, client.last_edits[0].start_col, 2)
+        testing.expect_value(t, client.last_edits[0].end_col, 5)
+    }
+    fmt.println("  ✓ [LSP Unit] definition targets and format edits convert UTF-16 columns")
+}
+
+make_fake_lsp_client :: proc(kind: LspServerKind, root: string) -> ^LspClient {
+    c := new(LspClient)
+    c.server_kind = kind
+    c.root_dir = strings.clone(root, context.allocator)
+    c.started_at = time.now()
+    c.initialized = true
+    c.file_versions = make(map[string]int)
+    c.file_texts = make(map[string]string)
+    lsp_set_running(c, true)
+    return c
+}
+
+@(test)
+test_lsp_manager_document_lifecycle :: proc(t: ^testing.T) {
+    root := "/tmp/odin_editor_tests/lsp_root_one"
+    _ = os.remove_all(root)
+    testing.expect(t, os.make_directory_all(root) == nil)
+    defer os.remove_all(root)
+
+    mgr: LspManager
+    lsp_manager_init(&mgr, root)
+    mgr.spawn_enabled = false
+    defer lsp_manager_stop_all(&mgr)
+
+    fake := make_fake_lsp_client(.Odin, root)
+    append(&mgr.clients, fake)
+
+    path := fmt.tprintf("%s/main.odin", root)
+    lsp_manager_open_doc(&mgr, path, "package main")
+    testing.expect_value(t, len(mgr.docs), 1)
+    lsp_manager_poll(&mgr)
+    testing.expect_value(t, fake.file_versions[path], 1)
+    testing.expect_value(t, len(fake.file_texts), 1)
+
+    // A second pane showing the same file adds a ref, not a didOpen.
+    lsp_manager_open_doc(&mgr, path, "package main")
+    lsp_manager_poll(&mgr)
+    testing.expect_value(t, fake.file_versions[path], 1)
+
+    lsp_manager_change_doc(&mgr, path, "package main\n")
+    testing.expect_value(t, fake.file_versions[path], 2)
+
+    lsp_manager_close_doc(&mgr, path)
+    testing.expect_value(t, len(mgr.docs), 1) // second ref remains
+    lsp_manager_close_doc(&mgr, path)
+    testing.expect_value(t, len(mgr.docs), 0)
+    testing.expect_value(t, len(fake.file_versions), 0)
+    testing.expect_value(t, len(fake.file_texts), 0)
+
+    fmt.println("  ✓ [LSP Unit] manager refcounts didOpen/didChange/didClose")
+}
+
+@(test)
+test_lsp_manager_retarget_moves_documents :: proc(t: ^testing.T) {
+    root1 := "/tmp/odin_editor_tests/lsp_retarget_one"
+    root2 := "/tmp/odin_editor_tests/lsp_retarget_two"
+    _ = os.remove_all(root1)
+    _ = os.remove_all(root2)
+    testing.expect(t, os.make_directory_all(root1) == nil)
+    testing.expect(t, os.make_directory_all(root2) == nil)
+    defer os.remove_all(root1)
+    defer os.remove_all(root2)
+
+    mgr: LspManager
+    lsp_manager_init(&mgr, root1)
+    mgr.spawn_enabled = false
+    defer lsp_manager_stop_all(&mgr)
+
+    fake1 := make_fake_lsp_client(.Odin, root1)
+    append(&mgr.clients, fake1)
+    path := fmt.tprintf("%s/main.odin", root1)
+    lsp_manager_open_doc(&mgr, path, "package main")
+    lsp_manager_poll(&mgr)
+    testing.expect_value(t, fake1.file_versions[path], 1)
+
+    // Re-root: the old client is closed and pruned, the document waits for a
+    // client under the new root.
+    lsp_manager_set_project_root(&mgr, root2)
+    lsp_manager_poll(&mgr)
+    testing.expect_value(t, len(fake1.file_versions), 0)
+    testing.expect_value(t, len(mgr.clients), 0)
+    testing.expect_value(t, len(mgr.docs), 1)
+
+    fake2 := make_fake_lsp_client(.Odin, root2)
+    append(&mgr.clients, fake2)
+    lsp_manager_poll(&mgr)
+    testing.expect_value(t, fake2.file_versions[path], 1)
+
+    fmt.println("  ✓ [LSP Unit] re-root closes old docs and reopens under the new root")
+}
+
+@(test)
+test_lsp_stop_is_bounded :: proc(t: ^testing.T) {
+    client: LspClient
+    ok := lsp_start(&client, "cat", "/tmp")
+    testing.expect_value(t, ok, true)
+    if !ok do return
+
+    start := time.now()
+    stopped := lsp_stop(&client)
+    elapsed := time.since(start)
+    testing.expect_value(t, stopped, true)
+    testing.expect(t, elapsed < 3 * time.Second, "lsp_stop took too long")
+    testing.expect_value(t, client.writer_thread == nil, true)
+    testing.expect_value(t, client.reader_thread == nil, true)
+    fmt.println("  ✓ [LSP Unit] shutdown joins writer/reader with bounded waits")
+}
+
+@(test)
+test_lsp_manager_multi_root_clients :: proc(t: ^testing.T) {
+    root1 := "/tmp/odin_editor_tests/lsp_multi_one"
+    root2 := "/tmp/odin_editor_tests/lsp_multi_two"
+    _ = os.remove_all(root1)
+    _ = os.remove_all(root2)
+    testing.expect(t, os.make_directory_all(fmt.tprintf("%s/.git", root2)) == nil)
+    defer os.remove_all(root1)
+    defer os.remove_all(root2)
+    testing.expect(t, os.make_directory_all(root1) == nil)
+
+    mgr: LspManager
+    lsp_manager_init(&mgr, root1)
+    mgr.spawn_enabled = false
+    defer lsp_manager_stop_all(&mgr)
+
+    fake1 := make_fake_lsp_client(.Odin, root1)
+    fake2 := make_fake_lsp_client(.Odin, root2)
+    append(&mgr.clients, fake1)
+    append(&mgr.clients, fake2)
+
+    inside := fmt.tprintf("%s/a.odin", root1)
+    outside := fmt.tprintf("%s/b.odin", root2)
+    lsp_manager_open_doc(&mgr, inside, "package a")
+    lsp_manager_open_doc(&mgr, outside, "package b")
+    lsp_manager_poll(&mgr)
+
+    testing.expect_value(t, fake1.file_versions[inside], 1)
+    testing.expect_value(t, fake2.file_versions[outside], 1)
+    testing.expect_value(t, fake1.file_versions[outside], 0)
+    testing.expect_value(t, fake2.file_versions[inside], 0)
+    fmt.println("  ✓ [LSP Unit] files outside the project root use their own client")
+}
+
+@(test)
+test_lsp_request_encodes_utf16_character :: proc(t: ^testing.T) {
+    client: LspClient
+    defer lsp_test_cleanup(&client)
+    lsp_set_running(&client, true)
+    client.initialized = true
+    client.position_encoding = .UTF16
+    client.writer_queue = make([dynamic]Lsp_Out_Message, 0, 4)
+    defer {
+        for &m in client.writer_queue do lsp_destroy_out_message(&m)
+        delete(client.writer_queue)
+    }
+    r, w, pipe_err := os.pipe()
+    testing.expect_value(t, pipe_err, nil)
+    defer os.close(r)
+    defer os.close(w)
+    client.stdin_file = w
+
+    path := "/tmp/odin_utf16_request.odin"
+    client.file_texts[strings.clone(path, context.allocator)] = strings.clone("é日😀x", context.allocator)
+
+    // Byte column 5 is the start of the emoji, UTF-16 character 2.
+    lsp_request_completion(&client, path, 0, 5)
+    testing.expect_value(t, len(client.writer_queue), 1)
+    if len(client.writer_queue) == 1 {
+        testing.expect(t, strings.contains(client.writer_queue[0].raw, `"character":2`))
+    }
+    fmt.println("  ✓ [LSP Unit] outgoing requests encode UTF-16 character offsets")
 }

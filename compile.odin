@@ -7,6 +7,7 @@ import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import "core:sys/posix"
 import "core:text/regex"
 import "core:thread"
 import "core:time"
@@ -24,16 +25,27 @@ CompilationLine :: struct {
 // A running build. The worker owns everything except the fields protected by
 // mutex; the main thread polls `done` and takes the results.
 Compilation_Job :: struct {
-    thread:      ^thread.Thread,
-    mutex:       sync.Mutex,
-    command:     string,
-    working_dir: string,
-    output:      string,
-    exit_code:   int,
-    failed:      bool,
-    error_text:  string,
-    done:        bool,
+    thread:          ^thread.Thread,
+    mutex:           sync.Mutex,
+    command:         string,
+    working_dir:     string,
+    output:          string,
+    exit_code:       int,
+    failed:          bool,
+    cancelled:       bool,
+    error_text:      string,
+    done:            bool,
+    // Process cancellation state; guarded by mutex, `cancel` is atomic.
+    process:         os.Process,
+    process_started: bool,
+    process_reaped:  bool,
+    cancel:          bool,
 }
+
+// Jobs whose Compilation owner is gone. They are only joined after the worker
+// thread has finished, so cancel/close never blocks on a running build.
+compilation_orphans: [dynamic]^Compilation_Job
+compilation_orphan_mutex: sync.Mutex
 
 Compilation :: struct {
     command     : string,
@@ -74,26 +86,59 @@ compilation_init :: proc(c: ^Compilation) {
     }
 }
 
-compilation_destroy :: proc(c: ^Compilation) {
-    if c.job != nil {
-        job := c.job
-        done := false
-        sync.mutex_lock(&job.mutex)
-        done = job.done
-        sync.mutex_unlock(&job.mutex)
-        if done {
-            thread.join(job.thread)
-            thread.destroy(job.thread)
-            if job.output != "" do delete(job.output, runtime.default_allocator())
-            if job.error_text != "" do delete(job.error_text, runtime.default_allocator())
-            if job.command != "" do delete(job.command)
-            if job.working_dir != "" do delete(job.working_dir)
-            free(job)
+compilation_job_done :: proc(job: ^Compilation_Job) -> bool {
+    return sync.atomic_load(&job.done)
+}
+
+compilation_free_job :: proc(job: ^Compilation_Job) {
+    if job == nil do return
+    if job.output != "" do delete(job.output, runtime.default_allocator())
+    if job.error_text != "" do delete(job.error_text, runtime.default_allocator())
+    if job.command != "" do delete(job.command, runtime.default_allocator())
+    if job.working_dir != "" do delete(job.working_dir, runtime.default_allocator())
+    free(job, runtime.default_allocator())
+}
+
+// Cancel a build and detach it. If the worker is already done it is joined
+// immediately; otherwise the orphan reaper owns it until it finishes.
+compilation_abandon_job :: proc(c: ^Compilation) {
+    job := c.job
+    if job == nil do return
+    c.job = nil
+    compilation_set_cancelled(job)
+    if compilation_job_done(job) {
+        compilation_free_job(job)
+    } else {
+        if compilation_orphans.allocator.procedure == nil {
+            compilation_orphans.allocator = runtime.default_allocator()
         }
-        // If the build is still running the worker owns the job; it finishes
-        // independently and the OS reclaims the memory at process exit.
-        c.job = nil
+        sync.mutex_lock(&compilation_orphan_mutex)
+        append(&compilation_orphans, job)
+        sync.mutex_unlock(&compilation_orphan_mutex)
     }
+}
+
+compilation_poll_orphans :: proc() {
+    sync.mutex_lock(&compilation_orphan_mutex)
+    defer sync.mutex_unlock(&compilation_orphan_mutex)
+    i := 0
+    for i < len(compilation_orphans) {
+        job := compilation_orphans[i]
+        if compilation_job_done(job) {
+            ordered_remove(&compilation_orphans, i)
+            compilation_free_job(job)
+        } else {
+            i += 1
+        }
+    }
+}
+
+compilation_cancel :: proc(c: ^Compilation) {
+    if c.job != nil do compilation_set_cancelled(c.job)
+}
+
+compilation_destroy :: proc(c: ^Compilation) {
+    compilation_abandon_job(c)
     if c.has_regex {
         regex.destroy(c.error_regex)
         c.has_regex = false
@@ -172,55 +217,180 @@ compilation_parse_line :: proc(c: ^Compilation, line: string) -> CompilationLine
     return result
 }
 
-// Runs the build off the main thread. Only the mutex-protected fields are
-// shared; everything else in Compilation stays main-thread-owned.
+// Kill the build's process group when it is a session leader, then the direct
+// child. Safe to call before the process starts or after it is reaped.
+compilation_kill_job :: proc(job: ^Compilation_Job) {
+    sync.mutex_lock(&job.mutex)
+    p := job.process
+    started := job.process_started
+    reaped := job.process_reaped
+    sync.mutex_unlock(&job.mutex)
+    if !started || reaped || p.pid == 0 do return
+
+    if posix.getpgid(posix.pid_t(p.pid)) == posix.pid_t(p.pid) {
+        _ = posix.kill(-posix.pid_t(p.pid), .SIGKILL)
+    }
+    _ = os.process_kill(p)
+}
+
+compilation_set_cancelled :: proc(job: ^Compilation_Job) {
+    sync.atomic_store(&job.cancel, true)
+    compilation_kill_job(job)
+}
+
+// Runs the build off the main thread. The worker owns the process handle until
+// it publishes `done`; the main thread may kill the process concurrently.
 compilation_worker :: proc(data: rawptr) {
     job := (^Compilation_Job)(data)
-    // Results cross threads, so use a stable allocator rather than whatever
-    // context the worker or the test harness happens to use.
     alloc := runtime.default_allocator()
-    desc := os.Process_Desc{command = []string{"sh", "-c", job.command}}
-    if job.working_dir != "" do desc.working_dir = job.working_dir
-    state, stdout, stderr, err := os.process_exec(desc, alloc)
+
+    if sync.atomic_load(&job.cancel) {
+        sync.mutex_lock(&job.mutex)
+        job.cancelled = true
+        sync.mutex_unlock(&job.mutex)
+        sync.atomic_store(&job.done, true)
+        return
+    }
+
+    // Pipe creation, spawning, and closing the parent's write end must be
+    // serialized: process_start changes descriptor inheritance process-wide.
+    read_end: ^os.File
+    process: os.Process
+    start_err: os.Error
+    pipe_err: os.Error
+    sync.mutex_lock(&process_spawn_mutex)
+    {
+        write_end: ^os.File
+        read_end, write_end, pipe_err = os.pipe()
+        if pipe_err != nil {
+            sync.mutex_unlock(&process_spawn_mutex)
+            sync.mutex_lock(&job.mutex)
+            job.failed = true
+            job.exit_code = -1
+            job.error_text = fmt.aprintf("pipe: %v", pipe_err, allocator = alloc)
+            sync.mutex_unlock(&job.mutex)
+            sync.atomic_store(&job.done, true)
+            return
+        }
+
+        desc := os.Process_Desc{command = []string{"setsid", "sh", "-c", job.command}}
+        if job.working_dir != "" do desc.working_dir = job.working_dir
+        desc.stdout = write_end
+        desc.stderr = write_end
+
+        process, start_err = os.process_start(desc)
+        if start_err != nil {
+            // `setsid` is optional; fall back to a direct shell.
+            os.close(write_end)
+            read_end, write_end, pipe_err = os.pipe()
+            if pipe_err != nil {
+                os.close(read_end)
+                sync.mutex_unlock(&process_spawn_mutex)
+                sync.mutex_lock(&job.mutex)
+                job.failed = true
+                job.exit_code = -1
+                job.error_text = fmt.aprintf("pipe: %v", pipe_err, allocator = alloc)
+                sync.mutex_unlock(&job.mutex)
+                sync.atomic_store(&job.done, true)
+                return
+            }
+            desc = os.Process_Desc{command = []string{"sh", "-c", job.command}}
+            if job.working_dir != "" do desc.working_dir = job.working_dir
+            desc.stdout = write_end
+            desc.stderr = write_end
+            process, start_err = os.process_start(desc)
+        }
+
+        if start_err == nil {
+            os.close(write_end)
+        } else {
+            os.close(read_end)
+            os.close(write_end)
+        }
+    }
+    sync.mutex_unlock(&process_spawn_mutex)
+
+    if start_err != nil {
+        sync.mutex_lock(&job.mutex)
+        job.failed = true
+        job.exit_code = -1
+        job.error_text = fmt.aprintf("%v", start_err, allocator = alloc)
+        sync.mutex_unlock(&job.mutex)
+        sync.atomic_store(&job.done, true)
+        return
+    }
+
+    sync.mutex_lock(&job.mutex)
+    job.process = process
+    job.process_started = true
+    should_cancel := sync.atomic_load(&job.cancel)
+    sync.mutex_unlock(&job.mutex)
+    if should_cancel do compilation_kill_job(job)
 
     combined: strings.Builder
     strings.builder_init(&combined, alloc)
+    read_buf: [8192]u8
+    kill_attempted := false
+    for {
+        n, read_err := os.read(read_end, read_buf[:])
+        if n > 0 do strings.write_bytes(&combined, read_buf[:n])
+        if sync.atomic_load(&job.cancel) && !kill_attempted {
+            compilation_kill_job(job)
+            kill_attempted = true
+        }
+        if read_err != nil || n <= 0 do break
+    }
+    os.close(read_end)
+
+    // The pipe is at EOF. Wait for the child, but never forever: a command
+    // that closed its output and daemonized would otherwise wedge the worker.
+    state, wait_err := os.process_wait(process, 5 * time.Second)
+    if wait_err != nil {
+        compilation_kill_job(job)
+        state, wait_err = os.process_wait(process, 2 * time.Second)
+    }
+
+    sync.mutex_lock(&job.mutex)
+    job.process_reaped = true
+    sync.mutex_unlock(&job.mutex)
+
     exit_code := 0
     failed := false
     error_text := ""
-
-    if err != nil {
+    if wait_err != nil {
         failed = true
         exit_code = -1
-        error_text = fmt.aprintf("%v", err, allocator = alloc)
+        error_text = fmt.aprintf("%v", wait_err, allocator = alloc)
     } else {
         exit_code = state.exit_code
-        if len(stdout) > 0 do strings.write_bytes(&combined, stdout)
-        if len(stderr) > 0 {
-            if len(stdout) > 0 && stdout[len(stdout) - 1] != '\n' {
-                strings.write_byte(&combined, '\n')
-            }
-            strings.write_bytes(&combined, stderr)
-        }
     }
-    delete(stdout, alloc)
-    delete(stderr, alloc)
 
-    out := strings.to_string(combined) // ownership moves to the main thread
-
+    out := strings.to_string(combined)
+    cancelled := sync.atomic_load(&job.cancel)
     sync.mutex_lock(&job.mutex)
     job.output = out
     job.exit_code = exit_code
     job.failed = failed
+    job.cancelled = cancelled
     job.error_text = error_text
-    job.done = true
     sync.mutex_unlock(&job.mutex)
+    sync.atomic_store(&job.done, true)
 }
 
-compilation_finish :: proc(c: ^Compilation, output: string, exit_code: int, failed: bool, error_text: string) {
+compilation_finish :: proc(c: ^Compilation, output: string, exit_code: int, failed, cancelled: bool, error_text: string) {
     alloc := runtime.default_allocator()
     defer if output != "" do delete(output, alloc)
     defer if error_text != "" do delete(error_text, alloc)
+
+    if cancelled {
+        c.exit_code = exit_code
+        c.finished = true
+        if c.status != "" do delete(c.status)
+        c.status = strings.clone("Cancelled")
+        append(&c.lines, CompilationLine{text = strings.clone("Compilation cancelled.")})
+        c.last_action = time.now()
+        return
+    }
 
     if failed {
         c.exit_code = -1
@@ -298,15 +468,17 @@ compilation_poll :: proc(c: ^Compilation) {
     output: string
     exit_code := 0
     failed := false
+    cancelled := false
     error_text := ""
 
+    done = sync.atomic_load(&job.done)
     sync.mutex_lock(&job.mutex)
-    done = job.done
     if done {
         output = job.output
         job.output = ""
         exit_code = job.exit_code
         failed = job.failed
+        cancelled = job.cancelled
         error_text = job.error_text
         job.error_text = ""
     }
@@ -314,30 +486,25 @@ compilation_poll :: proc(c: ^Compilation) {
 
     if !done do return
 
-    thread.join(job.thread)
-    thread.destroy(job.thread)
     c.job = nil
-    compilation_finish(c, output, exit_code, failed, error_text)
-    if job.command != "" do delete(job.command)
-    if job.working_dir != "" do delete(job.working_dir)
-    free(job)
+    compilation_free_job(job)
+    compilation_finish(c, output, exit_code, failed, cancelled, error_text)
 }
 
 // Blocking wait used by tests and any caller that needs the final state.
 compilation_wait :: proc(c: ^Compilation) {
     for c.job != nil {
         compilation_poll(c)
+        compilation_poll_orphans()
         if c.job != nil do time.sleep(1 * time.Millisecond)
     }
+    compilation_poll_orphans()
 }
 
 compilation_run_command :: proc(c: ^Compilation, cmd_str: string, working_dir := "") {
     compilation_poll(c)
-    if c.job != nil {
-        if c.status != "" do delete(c.status)
-        c.status = strings.clone("Compilation already running")
-        return
-    }
+    // A new command cancels the previous build instead of refusing to start.
+    if c.job != nil do compilation_abandon_job(c)
 
     // cmd_str may alias c.command (recompile passes it), so own the copy
     // before releasing the old one.
@@ -376,10 +543,10 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string, working_dir :=
     if c.status != "" do delete(c.status)
     c.status = strings.clone("Running...")
 
-    job := new(Compilation_Job)
-    job.command = strings.clone(new_command)
-    if working_dir != "" do job.working_dir = strings.clone(working_dir)
-    job.thread = thread.create_and_start_with_data(rawptr(job), compilation_worker)
+    job := new(Compilation_Job, runtime.default_allocator())
+    job.command = strings.clone(new_command, runtime.default_allocator())
+    if working_dir != "" do job.working_dir = strings.clone(working_dir, runtime.default_allocator())
+    background_thread_detached(rawptr(job), compilation_worker)
     c.job = job
 }
 

@@ -1,5 +1,6 @@
 package main
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
@@ -15,15 +16,22 @@ EditorMode :: enum {
     Command,
 }
 
+Line_Ending :: enum {
+    LF,
+    CRLF,
+}
+
 // Highlight results are cached per visible slot, keyed by row + content hash +
 // file/theme. This keeps per-frame cost to a cheap hash for unchanged lines.
 SYNTAX_CACHE_SLOTS :: 256
 
 Syntax_Cache_Entry :: struct {
-    valid:  bool,
-    row:    int,
-    hash:   u64,
-    colors: [dynamic]sdl.FColor,
+    valid:      bool,
+    row:        int,
+    hash:       u64,
+    state_hash: u64,
+    state_out:  Syntax_State,
+    colors:     [dynamic]sdl.FColor,
 }
 
 syntax_cache_hash :: proc(line: string, seed: u64) -> u64 {
@@ -66,7 +74,12 @@ Editor :: struct {
     last_edit_time     : time.Time,
     completion         : CompletionState,
     read_only          : bool,
+    lsp_doc_open       : bool,
+    line_ending        : Line_Ending,
     syntax_cache       : [SYNTAX_CACHE_SLOTS]Syntax_Cache_Entry,
+    // state after line i; len == number of lines whose outgoing state is known.
+    syntax_states      : [dynamic]Syntax_State,
+    syntax_scratch     : [dynamic]sdl.FColor,
 }
 
 // Odin's fmt zero-pads width-formatted numbers by default; the gutter needs
@@ -82,6 +95,7 @@ editor_set_status_message :: proc(e: ^Editor, msg: string) {
 }
 
 editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := "") {
+    e.line_ending = .CRLF if strings.contains(initial_text, "\r\n") else .LF
     pt_init(&e.table, initial_text)
     set_undo_grouping(&e.table, true)
     e.char_advance = font_cell_width(font)
@@ -101,12 +115,15 @@ editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := ""
     e.pending_cmd = 0
     e.file_path = strings.clone(file_path)
     e.syntax_cache = {}
+    e.syntax_states = make([dynamic]Syntax_State, 0, 64)
+    e.syntax_scratch = make([dynamic]sdl.FColor, 0, 256)
     e.dirty = false
     e.command_buffer = make([dynamic]u8, context.allocator)
     editor_set_status_message(e, "")
     e.needs_lsp_sync = false
     e.last_edit_time = time.now()
     e.read_only = false
+    e.lsp_doc_open = false
     e.completion.active = false
     e.completion.items = make([dynamic]LspCompletionItem, 0, 32)
     e.completion.all_items = make([dynamic]LspCompletionItem, 0, 64)
@@ -118,6 +135,8 @@ editor_destroy :: proc(e: ^Editor) {
         delete(entry.colors)
     }
     e.syntax_cache = {}
+    delete(e.syntax_states)
+    delete(e.syntax_scratch)
     pt_destroy(&e.table)
     delete(e.command_buffer)
     for c in e.completion.items {
@@ -141,11 +160,94 @@ editor_destroy :: proc(e: ^Editor) {
     }
 }
 
+editor_eol :: proc(e: ^Editor) -> string {
+    return "\r\n" if e.line_ending == .CRLF else "\n"
+}
+
+// Normalize inserted text (paste, completion, LSP edits) to the buffer's line
+// ending so a CRLF file never gains bare LF bytes.
+editor_normalize_newlines :: proc(
+    e: ^Editor,
+    text: string,
+    allocator: runtime.Allocator = context.temp_allocator,
+) -> string {
+    eol := editor_eol(e)
+    b: strings.Builder
+    strings.builder_init(&b, 0, len(text) + 16, allocator)
+    i := 0
+    for i < len(text) {
+        c := text[i]
+        if c == '\r' {
+            strings.write_string(&b, eol)
+            i += 1
+            if i < len(text) && text[i] == '\n' do i += 1
+            continue
+        }
+        if c == '\n' {
+            strings.write_string(&b, eol)
+            i += 1
+            continue
+        }
+        strings.write_byte(&b, c)
+        i += 1
+    }
+    return strings.to_string(b)
+}
+
 // Every buffer mutation must mark the buffer dirty and schedule an LSP sync.
-editor_mark_dirty :: proc(e: ^Editor) {
+editor_mark_dirty :: proc(e: ^Editor, from_row := -1) {
     e.dirty = true
     e.needs_lsp_sync = true
     e.last_edit_time = time.now()
+    row := from_row if from_row >= 0 else e.cursor.row
+    editor_invalidate_syntax(e, row)
+}
+
+// Invalidate cached line-continuation states at/after `from_row`. States for
+// earlier lines are unaffected because lexing only flows downward.
+editor_invalidate_syntax :: proc(e: ^Editor, from_row: int) {
+    row := max(0, from_row)
+    if row < len(e.syntax_states) {
+        resize(&e.syntax_states, row)
+    }
+}
+
+// State entering `row`, computing any missing predecessor states.
+editor_ensure_syntax_state :: proc(e: ^Editor, row: int, theme: ^Theme) -> Syntax_State {
+    if row <= 0 do return {}
+    total_lines := pt_get_line_count(&e.table) + 1
+    target := min(row, total_lines)
+    for len(e.syntax_states) < target {
+        idx := len(e.syntax_states)
+        line, ok := pt_line_text(&e.table, idx)
+        if !ok do break
+        resize(&e.syntax_scratch, len(line))
+        state_in: Syntax_State
+        if idx > 0 do state_in = e.syntax_states[idx - 1]
+        state_out := syntax_highlight_line_state(e.file_path, line, theme, e.syntax_scratch[:], state_in)
+        append(&e.syntax_states, state_out)
+        delete(line)
+    }
+    if row - 1 < len(e.syntax_states) do return e.syntax_states[row - 1]
+    return {}
+}
+
+editor_record_syntax_state :: proc(e: ^Editor, row: int, state: Syntax_State) {
+    if row == len(e.syntax_states) {
+        append(&e.syntax_states, state)
+    } else if row < len(e.syntax_states) {
+        e.syntax_states[row] = state
+    }
+}
+
+// Compound edits (line moves, multi-edit formatting, paste-over-selection) are
+// recorded as a single undo step.
+editor_begin_undo_transaction :: proc(e: ^Editor) {
+    pt_begin_undo_transaction(&e.table)
+}
+
+editor_end_undo_transaction :: proc(e: ^Editor) {
+    pt_end_undo_transaction(&e.table)
 }
 
 editor_get_line_len :: proc(e: ^Editor, row: int) -> int {
@@ -184,10 +286,17 @@ TAB_WIDTH :: 4
 editor_visual_col :: proc(e: ^Editor, row, byte_col: int) -> int {
     line_len := editor_get_line_len(e, row)
     col := clamp(byte_col, 0, line_len)
-    start := pt_line_to_offset(&e.table, row)
     visual := 0
-    for i in 0 ..< col {
-        visual += TAB_WIDTH if pt_byte_at(&e.table, start + i) == '\t' else 1
+    i := 0
+    for i < col {
+        r, size := editor_rune_at(e, row, i)
+        if size <= 0 do break
+        if r == '\t' {
+            visual += TAB_WIDTH
+        } else {
+            visual += rune_display_width(r)
+        }
+        i += size
     }
     // Columns past EOL are virtual and count one cell each.
     if byte_col > line_len do visual += byte_col - line_len
@@ -199,13 +308,17 @@ editor_visual_col :: proc(e: ^Editor, row, byte_col: int) -> int {
 editor_byte_col_for_visual :: proc(e: ^Editor, row, visual_col: int) -> int {
     if visual_col <= 0 do return 0
     line_len := editor_get_line_len(e, row)
-    start := pt_line_to_offset(&e.table, row)
     visual := 0
-    for i in 0 ..< line_len {
-        width := TAB_WIDTH if pt_byte_at(&e.table, start + i) == '\t' else 1
+    i := 0
+    for i < line_len {
+        r, size := editor_rune_at(e, row, i)
+        if size <= 0 do break
+        width := TAB_WIDTH if r == '\t' else rune_display_width(r)
+        // A position inside a wide glyph or expanded tab snaps to its start.
         if visual + width > visual_col do return i
         visual += width
-        if visual == visual_col do return i + 1
+        if visual == visual_col do return i + size
+        i += size
     }
     // Preserve virtual columns past EOL.
     if visual_col > visual do return line_len + (visual_col - visual)
@@ -225,7 +338,7 @@ editor_col_for_vertical_move :: proc(e: ^Editor, row: int) -> int {
 editor_get_cursor_offset :: proc(e: ^Editor) -> int {
     start_off := pt_line_to_offset(&e.table, e.cursor.row)
     line_len := editor_get_line_len(e, e.cursor.row)
-    col := clamp(e.cursor.col, 0, line_len)
+    col := editor_clamp_col_to_rune(e, e.cursor.row, clamp(e.cursor.col, 0, line_len))
     return start_off + col
 }
 
@@ -247,6 +360,11 @@ editor_clamp_cursor :: proc(e: ^Editor) {
     total_lines := pt_get_line_count(&e.table) + 1
     e.cursor.row = clamp(e.cursor.row, 0, max(0, total_lines - 1))
     e.cursor.col = max(0, e.cursor.col)
+    // Never leave the cursor inside a multi-byte rune.
+    line_len := editor_get_line_len(e, e.cursor.row)
+    if e.cursor.col <= line_len {
+        e.cursor.col = editor_clamp_col_to_rune(e, e.cursor.row, e.cursor.col)
+    }
 }
 
 // Clamp after an operation that may have shortened or removed the current
@@ -254,6 +372,7 @@ editor_clamp_cursor :: proc(e: ^Editor) {
 editor_snap_cursor :: proc(e: ^Editor) {
     editor_clamp_cursor(e)
     e.cursor.col = min(e.cursor.col, editor_get_line_len(e, e.cursor.row))
+    e.cursor.col = editor_clamp_col_to_rune(e, e.cursor.row, e.cursor.col)
     e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
 }
 
@@ -306,12 +425,12 @@ editor_save_file :: proc(e: ^Editor, app: ^App = nil) -> bool {
     if err == nil {
         e.dirty = false
         editor_set_status_message(e, "File saved successfully.")
+        if e.needs_lsp_sync {
+            e.needs_lsp_sync = false
+            app_lsp_doc_change(app, e.file_path, full)
+        }
         lsp := app_get_lsp_for_file(app, e.file_path)
         if lsp != nil && lsp_is_running(lsp) {
-            if e.needs_lsp_sync {
-                e.needs_lsp_sync = false
-                lsp_did_change(lsp, e.file_path, full)
-            }
             lsp_did_save(lsp, e.file_path)
         }
         return true
@@ -320,18 +439,15 @@ editor_save_file :: proc(e: ^Editor, app: ^App = nil) -> bool {
     return false
 }
 
-// Word movement helpers
-is_word_char :: proc(b: byte) -> bool {
-    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
-}
-
+// Word movement helpers (rune-aware; UTF-8 continuation bytes are never
+// treated as standalone characters).
 editor_skip_whitespace_forward :: proc(e: ^Editor) {
     line_len := editor_get_line_len(e, e.cursor.row)
-    start_off := pt_line_to_offset(&e.table, e.cursor.row)
     for e.cursor.col < line_len {
-        b := pt_byte_at(&e.table, start_off + e.cursor.col)
-        if b != ' ' && b != '\t' do break
-        e.cursor.col += 1
+        r, size := editor_rune_at(e, e.cursor.row, e.cursor.col)
+        if size <= 0 do break
+        if r != ' ' && r != '\t' do break
+        e.cursor.col += size
     }
 }
 
@@ -348,26 +464,27 @@ editor_motion_word_forward :: proc(e: ^Editor) {
         return
     }
 
-    start_off := pt_line_to_offset(&e.table, e.cursor.row)
-    cur_byte := pt_byte_at(&e.table, start_off + e.cursor.col)
+    cur_rune, _ := editor_rune_at(e, e.cursor.row, e.cursor.col)
 
-    if is_word_char(cur_byte) {
-        for e.cursor.col < line_len && is_word_char(pt_byte_at(&e.table, start_off + e.cursor.col)) {
-            e.cursor.col += 1
-        }
-    } else if cur_byte != ' ' && cur_byte != '\t' {
+    if is_word_rune(cur_rune) {
         for e.cursor.col < line_len {
-            b := pt_byte_at(&e.table, start_off + e.cursor.col)
-            if is_word_char(b) || b == ' ' || b == '\t' do break
-            e.cursor.col += 1
+            r, size := editor_rune_at(e, e.cursor.row, e.cursor.col)
+            if size <= 0 || !is_word_rune(r) do break
+            e.cursor.col += size
+        }
+    } else if cur_rune != ' ' && cur_rune != '\t' {
+        for e.cursor.col < line_len {
+            r, size := editor_rune_at(e, e.cursor.row, e.cursor.col)
+            if size <= 0 || is_word_rune(r) || r == ' ' || r == '\t' do break
+            e.cursor.col += size
         }
     }
 
     // Skip whitespace
     for e.cursor.col < line_len {
-        b := pt_byte_at(&e.table, start_off + e.cursor.col)
-        if b != ' ' && b != '\t' do break
-        e.cursor.col += 1
+        r, size := editor_rune_at(e, e.cursor.row, e.cursor.col)
+        if size <= 0 || (r != ' ' && r != '\t') do break
+        e.cursor.col += size
     }
 
     if e.cursor.col >= line_len && e.cursor.row + 1 < total_lines {
@@ -389,27 +506,31 @@ editor_motion_word_backward :: proc(e: ^Editor) {
         }
     }
 
-    start_off := pt_line_to_offset(&e.table, e.cursor.row)
-
     // Skip whitespace backward
     for e.cursor.col > 0 {
-        b := pt_byte_at(&e.table, start_off + e.cursor.col - 1)
-        if b != ' ' && b != '\t' do break
-        e.cursor.col -= 1
+        start := editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
+        r, _ := editor_rune_at(e, e.cursor.row, start)
+        if r != ' ' && r != '\t' do break
+        e.cursor.col = start
     }
 
     if e.cursor.col == 0 do return
 
-    prev_byte := pt_byte_at(&e.table, start_off + e.cursor.col - 1)
-    if is_word_char(prev_byte) {
-        for e.cursor.col > 0 && is_word_char(pt_byte_at(&e.table, start_off + e.cursor.col - 1)) {
-            e.cursor.col -= 1
+    prev_start := editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
+    prev_rune, _ := editor_rune_at(e, e.cursor.row, prev_start)
+    if is_word_rune(prev_rune) {
+        for e.cursor.col > 0 {
+            start := editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
+            r, _ := editor_rune_at(e, e.cursor.row, start)
+            if !is_word_rune(r) do break
+            e.cursor.col = start
         }
     } else {
         for e.cursor.col > 0 {
-            b := pt_byte_at(&e.table, start_off + e.cursor.col - 1)
-            if is_word_char(b) || b == ' ' || b == '\t' do break
-            e.cursor.col -= 1
+            start := editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
+            r, _ := editor_rune_at(e, e.cursor.row, start)
+            if is_word_rune(r) || r == ' ' || r == '\t' do break
+            e.cursor.col = start
         }
     }
 
@@ -661,7 +782,10 @@ editor_selection_offsets :: proc(e: ^Editor) -> (start_off, end_off: int) {
 
     end_line_len := editor_get_line_len(e, end_sel.row)
     is_full_line := (start_sel.col == 0 && end_sel.col >= end_line_len)
-    end_col := min(end_sel.col + 1, end_line_len)
+    end_col := end_line_len
+    if end_sel.col < end_line_len {
+        end_col = editor_next_rune_end(e, end_sel.row, end_sel.col)
+    }
     end_off = pt_line_to_offset(&e.table, end_sel.row) + end_col
 
     if is_full_line {
@@ -691,7 +815,7 @@ editor_delete_selection :: proc(e: ^Editor) {
 
     if end_off > start_off {
         pt_delete_range(&e.table, start_off, end_off - start_off)
-        editor_mark_dirty(e)
+        editor_mark_dirty(e, start_sel.row)
     }
 
     e.cursor = start_sel
@@ -747,6 +871,9 @@ editor_insert_text_at_cursor :: proc(e: ^Editor, text: string) {
     if len(text) == 0 do return
 
     e.completion.active = false
+    editor_begin_undo_transaction(e)
+    defer editor_end_undo_transaction(e)
+
     if e.mode == .Visual {
         editor_delete_selection(e)
     }
@@ -758,7 +885,7 @@ editor_insert_text_at_cursor :: proc(e: ^Editor, text: string) {
     pt_insert(&e.table, offset, text)
 
     editor_advance_after_insert(e, start_row, start_col, text)
-    editor_mark_dirty(e)
+    editor_mark_dirty(e, start_row)
 }
 
 editor_paste :: proc(e: ^Editor) {
@@ -770,7 +897,8 @@ editor_paste :: proc(e: ^Editor) {
     clip := string(cstring(clip_raw))
     if len(clip) == 0 do return
 
-    editor_insert_text_at_cursor(e, clip)
+    normalized := editor_normalize_newlines(e, clip)
+    editor_insert_text_at_cursor(e, normalized)
 }
 
 editor_move_lines :: proc(e: ^Editor, dir: int) {
@@ -781,6 +909,9 @@ editor_move_lines :: proc(e: ^Editor, dir: int) {
     break_undo_group(&e.table)
     total_lines := pt_get_line_count(&e.table) + 1
     if total_lines <= 1 do return
+
+    editor_begin_undo_transaction(e)
+    defer editor_end_undo_transaction(e)
 
     r_start := e.cursor.row
     r_end := e.cursor.row
@@ -795,7 +926,7 @@ editor_move_lines :: proc(e: ^Editor, dir: int) {
         // Ensure file ends with newline before moving into bottom-most position
         total_len := pt_get_length(&e.table)
         if total_len > 0 && pt_byte_at(&e.table, total_len - 1) != '\n' {
-            pt_insert(&e.table, total_len, "\n")
+            pt_insert(&e.table, total_len, editor_eol(e))
             total_lines = pt_get_line_count(&e.table) + 1
         }
 
@@ -818,7 +949,7 @@ editor_move_lines :: proc(e: ^Editor, dir: int) {
         e.cursor.row += 1
         e.selection_anchor.row += 1
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-        editor_mark_dirty(e)
+        editor_mark_dirty(e, r_start)
 
     } else if dir < 0 { // Move Up
         if r_start <= 0 do return
@@ -826,7 +957,7 @@ editor_move_lines :: proc(e: ^Editor, dir: int) {
         // Ensure file ends with newline
         total_len := pt_get_length(&e.table)
         if total_len > 0 && pt_byte_at(&e.table, total_len - 1) != '\n' {
-            pt_insert(&e.table, total_len, "\n")
+            pt_insert(&e.table, total_len, editor_eol(e))
             total_lines = pt_get_line_count(&e.table) + 1
         }
 
@@ -848,7 +979,7 @@ editor_move_lines :: proc(e: ^Editor, dir: int) {
         e.cursor.row -= 1
         e.selection_anchor.row -= 1
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-        editor_mark_dirty(e)
+        editor_mark_dirty(e, max(0, r_start - 1))
     }
 }
 
@@ -950,6 +1081,7 @@ editor_apply_completion :: proc(e: ^Editor) {
     item := e.completion.items[e.completion.selected]
     insert_str := item.insert_text if item.insert_text != "" else item.label
     if len(insert_str) == 0 do return
+    insert_str = editor_normalize_newlines(e, insert_str)
 
     // Only replace the typed prefix when the cursor is still on the line where
     // completion was triggered. If the buffer moved (paste, multi-line edit),
@@ -1030,19 +1162,22 @@ editor_open_completion_doc :: proc(e: ^Editor, app: ^App) {
 
 // Queue the current document snapshot before an LSP request so the server
 // resolves positions against the text the cursor coordinates came from.
-editor_flush_lsp_change :: proc(e: ^Editor, lsp: ^LspClient) {
-    if lsp == nil || !lsp_is_running(lsp) || e.file_path == "" do return
+editor_flush_lsp_change :: proc(e: ^Editor, app: ^App) {
+    if app == nil || e.file_path == "" do return
     if !e.needs_lsp_sync do return
 
     e.needs_lsp_sync = false
     full_text := pt_full_text(&e.table)
     defer delete(full_text)
-    lsp_did_change(lsp, e.file_path, full_text)
+    app_lsp_doc_change(app, e.file_path, full_text)
 }
 
 editor_apply_lsp_edits :: proc(e: ^Editor, edits: []LspTextEdit) {
     break_undo_group(&e.table)
     if len(edits) == 0 do return
+
+    editor_begin_undo_transaction(e)
+    defer editor_end_undo_transaction(e)
 
     // Sort edits descending (bottom to top)
     sorted_edits := slice.clone(edits, context.temp_allocator)
@@ -1053,6 +1188,7 @@ editor_apply_lsp_edits :: proc(e: ^Editor, edits: []LspTextEdit) {
 
     total_len := pt_get_length(&e.table)
     line_count := pt_get_line_count(&e.table)
+    min_row := sorted_edits[len(sorted_edits) - 1].start_row
 
     for ed in sorted_edits {
         s_off: int
@@ -1079,13 +1215,14 @@ editor_apply_lsp_edits :: proc(e: ^Editor, edits: []LspTextEdit) {
 
         del_len := e_off - s_off
         if del_len > 0 || len(ed.new_text) > 0 {
-            pt_replace(&e.table, s_off, del_len, ed.new_text)
+            normalized := editor_normalize_newlines(e, ed.new_text)
+            pt_replace(&e.table, s_off, del_len, normalized)
         }
         total_len = pt_get_length(&e.table)
         line_count = pt_get_line_count(&e.table)
     }
 
-    editor_mark_dirty(e)
+    editor_mark_dirty(e, min_row)
     editor_snap_cursor(e)
 }
 
@@ -1126,11 +1263,11 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     // Ctrl+Space: explicit autocomplete trigger
     if is_ctrl && key == KEY_COMPLETION_TRIGGER {
         trigger_col := e.cursor.col
-        line_start := pt_line_to_offset(&e.table, e.cursor.row)
         for trigger_col > 0 {
-            prev_char := pt_byte_at(&e.table, line_start + trigger_col - 1)
-            if (prev_char >= 'a' && prev_char <= 'z') || (prev_char >= 'A' && prev_char <= 'Z') || (prev_char >= '0' && prev_char <= '9') || prev_char == '_' {
-                trigger_col -= 1
+            start := editor_prev_rune_start(e, e.cursor.row, trigger_col)
+            r, _ := editor_rune_at(e, e.cursor.row, start)
+            if is_word_rune(r) {
+                trigger_col = start
             } else {
                 break
             }
@@ -1139,7 +1276,7 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         e.completion.trigger_col = trigger_col
         lsp := app_get_lsp_for_file(app, e.file_path)
         if lsp != nil && lsp_is_running(lsp) && e.file_path != "" {
-            editor_flush_lsp_change(e, lsp)
+            editor_flush_lsp_change(e, app)
             lsp_request_completion(lsp, e.file_path, e.cursor.row, e.cursor.col)
         }
         return true
@@ -1167,6 +1304,9 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             }
         }
         e.completion.active = false
+        insert_row := e.cursor.row
+        editor_begin_undo_transaction(e)
+        defer editor_end_undo_transaction(e)
         editor_realize_virtual_spaces(e)
         offset := editor_get_cursor_offset(e)
 
@@ -1197,25 +1337,24 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         }
         base_indent := cur_line_text[:indent_len] if indent_len > 0 else ""
 
+        eol := editor_eol(e)
         if is_between_pair {
             // Expand with new line + extra indent + new line + base indent
-            to_insert := fmt.tprintf("\n%s    \n%s", base_indent, base_indent)
+            to_insert := fmt.tprintf("%s%s    %s%s", eol, base_indent, eol, base_indent)
             pt_insert(&e.table, offset, to_insert)
             e.cursor.row += 1
             e.cursor.col = len(base_indent) + 4
             e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         } else {
             // Normal enter: preserve current line's leading indentation
-            to_insert := fmt.tprintf("\n%s", base_indent) if len(base_indent) > 0 else "\n"
+            to_insert := fmt.tprintf("%s%s", eol, base_indent)
             pt_insert(&e.table, offset, to_insert)
             e.cursor.row += 1
             e.cursor.col = len(base_indent)
             e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         }
 
-        e.dirty = true
-        e.needs_lsp_sync = true
-        e.last_edit_time = time.now()
+        editor_mark_dirty(e, insert_row)
         return true
 
     case sdl.K_TAB:
@@ -1227,14 +1366,14 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             }
             return true
         }
+        editor_begin_undo_transaction(e)
+        defer editor_end_undo_transaction(e)
         editor_realize_virtual_spaces(e)
         offset := editor_get_cursor_offset(e)
         pt_insert(&e.table, offset, "    ")
         e.cursor.col += 4
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-        e.dirty = true
-        e.needs_lsp_sync = true
-        e.last_edit_time = time.now()
+        editor_mark_dirty(e)
         return true
 
     case sdl.K_SPACE:
@@ -1248,7 +1387,9 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         } else if e.cursor.col > 0 {
             offset := editor_get_cursor_offset(e)
-            del_len := 1
+            prev_start := editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
+            del_len := e.cursor.col - prev_start
+            new_col := prev_start
             if offset > 0 && offset < pt_get_length(&e.table) {
                 prev := pt_byte_at(&e.table, offset - 1)
                 next := pt_byte_at(&e.table, offset)
@@ -1259,14 +1400,13 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
                    (prev == '\'' && next == '\'') ||
                    (prev == '`' && next == '`') {
                     del_len = 2
+                    new_col = max(0, prev_start)
                 }
             }
-            pt_delete_range(&e.table, offset - 1, del_len)
-            e.cursor.col -= 1
+            pt_delete_range(&e.table, offset - del_len, del_len)
+            e.cursor.col = new_col
             e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-            e.dirty = true
-            e.needs_lsp_sync = true
-            e.last_edit_time = time.now()
+            editor_mark_dirty(e)
         } else if e.cursor.row > 0 {
             prev_len := editor_get_line_len(e, e.cursor.row - 1)
             offset := pt_line_to_offset(&e.table, e.cursor.row)
@@ -1280,9 +1420,7 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             e.cursor.row -= 1
             e.cursor.col = prev_len
             e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-            e.dirty = true
-            e.needs_lsp_sync = true
-            e.last_edit_time = time.now()
+            editor_mark_dirty(e)
         }
         if e.completion.active {
             if e.cursor.col < e.completion.trigger_col || e.cursor.row != e.completion.trigger_row {
@@ -1297,21 +1435,28 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         offset := editor_get_cursor_offset(e)
         if offset < pt_get_length(&e.table) {
             del_len := 1
-            if pt_byte_at(&e.table, offset) == '\r' &&
+            line_len := editor_get_line_len(e, e.cursor.row)
+            if e.cursor.col < line_len {
+                _, size := editor_rune_at(e, e.cursor.row, e.cursor.col)
+                if size > 0 do del_len = size
+            } else if pt_byte_at(&e.table, offset) == '\r' &&
                offset + 1 < pt_get_length(&e.table) &&
                pt_byte_at(&e.table, offset + 1) == '\n' {
                 del_len = 2
             }
             pt_delete_range(&e.table, offset, del_len)
-            e.dirty = true
-            e.needs_lsp_sync = true
-            e.last_edit_time = time.now()
+            editor_mark_dirty(e)
         }
         return true
 
     case sdl.K_LEFT:
         break_undo_group(&e.table)
-        e.cursor.col = max(0, e.cursor.col - 1)
+        line_len := editor_get_line_len(e, e.cursor.row)
+        if e.cursor.col > line_len {
+            e.cursor.col -= 1
+        } else {
+            e.cursor.col = editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
+        }
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         if e.completion.active && e.cursor.col < e.completion.trigger_col {
             e.completion.active = false
@@ -1320,7 +1465,12 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
 
     case sdl.K_RIGHT:
         break_undo_group(&e.table)
-        e.cursor.col += 1
+        line_len := editor_get_line_len(e, e.cursor.row)
+        if e.cursor.col < line_len {
+            e.cursor.col = editor_next_rune_end(e, e.cursor.row, e.cursor.col)
+        } else {
+            e.cursor.col += 1
+        }
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
 
@@ -1374,24 +1524,12 @@ editor_handle_command_key :: proc(e: ^Editor, key: sdl.Keycode, window: ^sdl.Win
         editor_set_mode(e, .Normal, window)
         clear(&e.command_buffer)
 
-        if cmd == "w" {
-            editor_save_file(e, app)
-        } else if cmd == "q" {
-            app.running = false
-        } else if cmd == "wq" || cmd == "x" {
-            editor_save_file(e, app)
-            app.running = false
-        } else if cmd == "dired" || cmd == "d" || cmd == "e ." {
-            dir := filepath.dir(e.file_path)
-            if dir == "" do dir = "."
-            app_open_dired(app, dir)
-        } else if strings.has_prefix(cmd, "e ") {
-            target := strings.trim_space(cmd[2:])
-            if os.is_dir(target) {
-                app_open_dired(app, target)
-            } else {
-                app_open_file(app, target)
-            }
+        // Use the global command dispatcher so :wq/:x, wdired, relative
+        // paths, and error reporting behave identically in every mode.
+        if app != nil {
+            app_execute_command(app, cmd)
+        } else if cmd == "w" {
+            editor_save_file(e, nil)
         } else if cmd != "" {
             e.status_message = fmt.tprintf("Unknown command: :%s", cmd)
         }
@@ -1426,7 +1564,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             // gd: Go to definition
             lsp := app_get_lsp_for_file(app, e.file_path)
             if lsp != nil && lsp_is_running(lsp) && e.file_path != "" {
-                editor_flush_lsp_change(e, lsp)
+                editor_flush_lsp_change(e, app)
                 lsp_request_definition(lsp, e.file_path, e.cursor.row, e.cursor.col)
                 app_set_message(app, "LSP: Requesting definition...")
             }
@@ -1440,7 +1578,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             // ==: Format current line
             lsp := app_get_lsp_for_file(app, e.file_path)
             if lsp != nil && lsp_is_running(lsp) && e.file_path != "" {
-                editor_flush_lsp_change(e, lsp)
+                editor_flush_lsp_change(e, app)
                 lsp_request_range_formatting(lsp, e.file_path, e.cursor.row, e.cursor.row)
                 app_set_message(app, fmt.tprintf("LSP: Formatting line %d...", e.cursor.row + 1))
             }
@@ -1509,7 +1647,11 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
     if key == KEY_MOVE_LEFT {
-        e.cursor.col = max(0, e.cursor.col - 1)
+        if e.cursor.col > line_len {
+            e.cursor.col -= 1
+        } else {
+            e.cursor.col = editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
+        }
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
     }
@@ -1521,7 +1663,11 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
     if key == KEY_MOVE_RIGHT {
-        e.cursor.col += 1
+        if e.cursor.col < line_len {
+            e.cursor.col = editor_next_rune_end(e, e.cursor.row, e.cursor.col)
+        } else {
+            e.cursor.col += 1
+        }
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
     }
@@ -1539,7 +1685,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     if is_shift && key == KEY_HOVER {
         lsp := app_get_lsp_for_file(app, e.file_path)
         if lsp != nil && lsp_is_running(lsp) && e.file_path != "" {
-            editor_flush_lsp_change(e, lsp)
+            editor_flush_lsp_change(e, app)
             lsp_request_hover(lsp, e.file_path, e.cursor.row, e.cursor.col)
             app_set_message(app, "LSP: Requesting hover...")
         }
@@ -1559,7 +1705,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         end_row := max(e.cursor.row, e.selection_anchor.row)
         lsp := app_get_lsp_for_file(app, e.file_path)
         if lsp != nil && lsp_is_running(lsp) && e.file_path != "" {
-            editor_flush_lsp_change(e, lsp)
+            editor_flush_lsp_change(e, app)
             lsp_request_range_formatting(lsp, e.file_path, start_row, end_row)
             app_set_message(app, fmt.tprintf("LSP: Formatting lines %d-%d...", start_row + 1, end_row + 1))
         }
@@ -1572,13 +1718,21 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     }
 
     if key == sdl.K_LEFT {
-        e.cursor.col = max(0, e.cursor.col - 1)
+        if e.cursor.col > line_len {
+            e.cursor.col -= 1
+        } else {
+            e.cursor.col = editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
+        }
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
     }
 
     if key == sdl.K_RIGHT {
-        e.cursor.col += 1
+        if e.cursor.col < line_len {
+            e.cursor.col = editor_next_rune_end(e, e.cursor.row, e.cursor.col)
+        } else {
+            e.cursor.col += 1
+        }
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
     }
@@ -1645,8 +1799,12 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
     if e.mode != .Visual && key == KEY_APPEND {
-        // Do not step past EOL; Esc can leave the cursor at line_len already.
-        e.cursor.col = min(e.cursor.col + 1, line_len)
+        // Step over one full rune, but do not go past EOL.
+        if e.cursor.col < line_len {
+            e.cursor.col = editor_next_rune_end(e, e.cursor.row, e.cursor.col)
+        } else {
+            e.cursor.col = line_len
+        }
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         editor_set_mode(e, .Insert, window)
         return true
@@ -1655,7 +1813,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     // New lines (O above, o / Enter below)
     if e.mode != .Visual && is_shift && key == KEY_OPEN_ABOVE {
         start_off := pt_line_to_offset(&e.table, e.cursor.row)
-        pt_insert(&e.table, start_off, "\n")
+        pt_insert(&e.table, start_off, editor_eol(e))
         e.cursor.col = 0
         e.desired_col = 0
         editor_mark_dirty(e)
@@ -1663,13 +1821,14 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
     if e.mode != .Visual && (key == KEY_OPEN_BELOW || key == sdl.K_RETURN || key == sdl.K_KP_ENTER) {
+        open_row := e.cursor.row
         start_off := pt_line_to_offset(&e.table, e.cursor.row)
         insert_pos := start_off + line_len
-        pt_insert(&e.table, insert_pos, "\n")
+        pt_insert(&e.table, insert_pos, editor_eol(e))
         e.cursor.row += 1
         e.cursor.col = 0
         e.desired_col = 0
-        editor_mark_dirty(e)
+        editor_mark_dirty(e, open_row)
         editor_set_mode(e, .Insert, window)
         return true
     }
@@ -1700,7 +1859,9 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     if e.mode != .Visual && key == KEY_DELETE_CHAR {
         if line_len > 0 && e.cursor.col < line_len {
             offset := pt_line_to_offset(&e.table, e.cursor.row) + e.cursor.col
-            pt_delete_range(&e.table, offset, 1)
+            _, size := editor_rune_at(e, e.cursor.row, e.cursor.col)
+            if size <= 0 do size = 1
+            pt_delete_range(&e.table, offset, size)
             editor_mark_dirty(e)
         } else if e.cursor.row + 1 < total_lines {
             offset := pt_line_to_offset(&e.table, e.cursor.row) + line_len
@@ -1736,6 +1897,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     // Undo / Redo
     if key == KEY_UNDO {
         if pt_undo(&e.table) {
+            editor_invalidate_syntax(e, 0)
             editor_mark_dirty(e)
             editor_snap_cursor(e)
         }
@@ -1825,14 +1987,14 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                 }
 
                 if paired_str != "" {
+                    editor_begin_undo_transaction(e)
+                    defer editor_end_undo_transaction(e)
                     editor_realize_virtual_spaces(e)
                     offset = editor_get_cursor_offset(e)
                     pt_insert(&e.table, offset, paired_str)
                     e.cursor.col += 1
                     e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-                    e.dirty = true
-                    e.needs_lsp_sync = true
-                    e.last_edit_time = time.now()
+                    editor_mark_dirty(e)
                     e.last_action = time.now()
                     e.completion.active = false
                     return true
@@ -1840,31 +2002,31 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
             }
 
             if len(text_str) > 0 {
+                typed_row := e.cursor.row
                 editor_realize_virtual_spaces(e)
                 offset := editor_get_cursor_offset(e)
                 pt_insert(&e.table, offset, text_str)
                 e.cursor.col += len(text_str)
                 e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-                e.dirty = true
-                e.needs_lsp_sync = true
-                e.last_edit_time = time.now()
+                editor_mark_dirty(e, typed_row)
                 e.last_action = time.now()
 
                 // Trigger or update completion when typing identifier or dot
                 lsp := app_get_lsp_for_file(app, e.file_path)
                 if lsp != nil && lsp_is_running(lsp) && e.file_path != "" {
-                    ch := text_str[len(text_str) - 1]
-                    if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' {
-                        if ch == '.' || !e.completion.active || e.cursor.row != e.completion.trigger_row {
+                    typed_rune: rune
+                    for r in text_str do typed_rune = r
+                    if is_word_rune(typed_rune) || typed_rune == '.' {
+                        if typed_rune == '.' || !e.completion.active || e.cursor.row != e.completion.trigger_row {
                             trigger_col := e.cursor.col
-                            if ch == '.' {
+                            if typed_rune == '.' {
                                 trigger_col = e.cursor.col
                             } else {
-                                line_start := pt_line_to_offset(&e.table, e.cursor.row)
                                 for trigger_col > 0 {
-                                    prev_char := pt_byte_at(&e.table, line_start + trigger_col - 1)
-                                    if (prev_char >= 'a' && prev_char <= 'z') || (prev_char >= 'A' && prev_char <= 'Z') || (prev_char >= '0' && prev_char <= '9') || prev_char == '_' {
-                                        trigger_col -= 1
+                                    start := editor_prev_rune_start(e, e.cursor.row, trigger_col)
+                                    r, _ := editor_rune_at(e, e.cursor.row, start)
+                                    if is_word_rune(r) {
+                                        trigger_col = start
                                     } else {
                                         break
                                     }
@@ -1875,7 +2037,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                         }
 
                         // Immediate didChange sync so server has exact current buffer
-                        editor_flush_lsp_change(e, lsp)
+                        editor_flush_lsp_change(e, app)
 
                         // Immediate local filter on existing all_items for zero-latency keystrokes
                         if len(e.completion.all_items) > 0 {
@@ -1961,6 +2123,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
 
         if is_ctrl && key == KEY_UNDO_ALT {
             if pt_undo(&e.table) {
+                editor_invalidate_syntax(e, 0)
                 editor_mark_dirty(e)
                 editor_snap_cursor(e)
             }
@@ -1969,6 +2132,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
 
         if is_ctrl && key == KEY_REDO {
             if pt_redo(&e.table) {
+                editor_invalidate_syntax(e, 0)
                 editor_mark_dirty(e)
                 editor_snap_cursor(e)
             }
@@ -2082,15 +2246,20 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
             c0 := 0
             c1 := line_len
 
+            end_sel_len := editor_get_line_len(e, end_sel.row)
+            end_rune := end_sel.col
+            if end_sel.col < end_sel_len {
+                end_rune = editor_next_rune_end(e, end_sel.row, end_sel.col)
+            }
             if line_idx == start_sel.row && line_idx == end_sel.row {
                 c0 = start_sel.col
-                c1 = end_sel.col + 1
+                c1 = end_rune
             } else if line_idx == start_sel.row {
                 c0 = start_sel.col
                 c1 = max(line_len + 1, start_sel.col + 1)
             } else if line_idx == end_sel.row {
                 c0 = 0
-                c1 = end_sel.col + 1
+                c1 = end_rune
             } else {
                 c0 = 0
                 c1 = line_len + 1
@@ -2181,6 +2350,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
         push_line(font, line_num_str, Vec2{rect.x + char_w * 0.5, y_pos}, ln_color, e.font_scale)
 
         // Line text
+        state_in := editor_ensure_syntax_state(e, line_idx, theme)
         line_str, ok := pt_line_text(&e.table, line_idx)
         if ok {
             defer delete(line_str)
@@ -2195,14 +2365,18 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
                 }
 
                 line_hash := syntax_cache_hash(line_str, cache_seed)
+                state_hash := syntax_state_hash(state_in)
                 cache := &e.syntax_cache[line_idx % SYNTAX_CACHE_SLOTS]
-                if !cache.valid || cache.row != line_idx || cache.hash != line_hash || len(cache.colors) != len(line_str) {
+                if !cache.valid || cache.row != line_idx || cache.hash != line_hash ||
+                   cache.state_hash != state_hash || len(cache.colors) != len(line_str) {
                     resize(&cache.colors, len(line_str))
-                    syntax_highlight_line(e.file_path, line_str, theme, cache.colors[:])
+                    cache.state_out = syntax_highlight_line_state(e.file_path, line_str, theme, cache.colors[:], state_in)
                     cache.valid = true
                     cache.row = line_idx
                     cache.hash = line_hash
+                    cache.state_hash = state_hash
                 }
+                editor_record_syntax_state(e, line_idx, cache.state_out)
                 visible_colors := cache.colors[byte_start:]
 
                 push_editor_line(

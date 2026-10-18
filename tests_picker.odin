@@ -152,11 +152,11 @@ test_picker_scan_defers_results :: proc(t: ^testing.T) {
     file_picker_open(&fp, dir, nil)
     // The walk is owned by a background thread; nothing is published until
     // the main thread polls for completion.
-    testing.expect(t, fp.scan_thread != nil)
+    testing.expect(t, file_picker_scan_running(&fp))
     testing.expect_value(t, len(fp.items), 0)
 
     file_picker_wait(&fp)
-    testing.expect(t, fp.scan_thread == nil)
+    testing.expect(t, file_picker_scan_running(&fp) == false)
     testing.expect_value(t, len(fp.items), 2)
 
     file_picker_close(&fp, nil)
@@ -185,4 +185,29 @@ test_picker_query_utf8_truncation :: proc(t: ^testing.T) {
     testing.expect_value(t, fp.query_len, 3)
     testing.expect_value(t, string(fp.query_buffer[:fp.query_len]), "éx")
     fmt.println("  ✓ [Picker] query buffer never splits UTF-8 sequences")
+}
+
+@(test)
+test_picker_scan_cap_and_truncation :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/picker_cap"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    names := []string{"a.txt", "b.txt", "c.txt", "d.txt"}
+    for name in names {
+        path := fmt.tprintf("%s/%s", dir, name)
+        testing.expect(t, os.write_entire_file_from_string(path, "x") == nil)
+    }
+
+    fp: FilePicker
+    file_picker_init(&fp)
+    defer file_picker_destroy(&fp)
+
+    file_picker_open(&fp, dir, nil, max_items = 2)
+    file_picker_wait(&fp)
+    testing.expect_value(t, len(fp.items), 2)
+    testing.expect_value(t, fp.items_truncated, true)
+
+    fmt.println("  ✓ [Picker] scan cap marks the listing as truncated")
 }

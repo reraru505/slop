@@ -34,6 +34,11 @@ EDITOR_NAME :: "slop"
 // be a string literal, which is an Odin #load requirement).
 FONT_FILE :: #load("assets/CaskaydiaCoveNerdFont-Regular.ttf")
 
+// Optional fallback fonts for runes the bundled font does not contain. Paths
+// are loaded at runtime; missing files are ignored. Example:
+//     FALLBACK_FONT_PATHS :: []string{"/usr/share/fonts/noto/NotoSansMono-Regular.ttf"}
+FALLBACK_FONT_PATHS :: []string{}
+
 // Logical pixels at 100% zoom (before display density is applied).
 BASE_FONT_SIZE :: 20.0
 
@@ -49,10 +54,36 @@ WINDOW_TITLE  :: EDITOR_NAME
 WINDOW_WIDTH  :: 1024
 WINDOW_HEIGHT :: 768
 
-// Root directory used by the file picker (Space f / :files). Empty means:
-// infer from the file or directory passed on the command line, otherwise use
-// the process working directory. Change it at runtime with :root <dir>.
+// Project root used by the picker, compilation, relative paths, and LSP.
+// Empty means: infer from the file or directory passed on the command line,
+// otherwise use the process working directory. Change it at runtime with
+// :root <dir> or :root here.
 DEFAULT_ROOT_DIRECTORY :: ""
+
+// Maximum files collected by one picker scan. The scan is background work; a
+// cap keeps a huge tree from consuming unbounded memory. The UI shows when the
+// listing was truncated.
+FILE_PICKER_MAX_ITEMS :: 20_000
+
+// ============================================================================
+// Language servers
+// ============================================================================
+//
+// Commands may be a bare name resolved through PATH or an absolute path. Set a
+// command to "" to disable that server entirely. LSP_EXTRA_PATHS is prepended
+// to the inherited PATH for server processes (colon-separated).
+
+LSP_ODIN_COMMAND         :: "ols"
+LSP_ZIG_COMMAND          :: "zls"
+LSP_CLANGD_COMMAND       :: "clangd"
+LSP_RUST_COMMAND         :: "rust-analyzer"
+LSP_GO_COMMAND           :: "gopls"
+LSP_C3_COMMAND           :: "c3lsp"
+
+LSP_EXTRA_PATHS :: "/home/fnln/opt:/home/fnln/.cargo/bin:/home/fnln/.local/share/nvim/mason/bin:/usr/local/bin:/usr/bin:/bin"
+
+// Override OLS's builtin folder. Empty means auto-detect the usual locations.
+LSP_OLS_BUILTIN_FOLDER :: ""
 
 // ============================================================================
 // Keybindings

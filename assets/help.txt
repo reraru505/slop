@@ -66,8 +66,8 @@ COMMANDS  (type '{cmd_prompt}' in Normal mode)
   :cfirst               jump to the first compiler error
   :theme [name]         cycle themes or set one by name
   :sort [name|size|time|rev]  sort the current dired listing
-  :cd <dir>  :pwd       change / show the working directory
-  :root [dir|here]      show / set the file-picker root (here = current directory)
+  :cd <dir>  :pwd       change / show the session working directory
+  :root [dir|here]      show / set the project root (here = current buffer/dired dir)
   :zoom <0.5-2.5>       UI scale ({zoom_in} / {zoom_out} / {zoom_reset})
   :linespace <1.0-2.0>  line-height multiplier (default {line_spacing_default} = font metrics)
   :help                 this screen
@@ -84,7 +84,7 @@ DIRED  (directory browser)
   Enter or {dired_open} ........... open a file or enter a directory
   {dired_parent} or {dired_parent_alt} ............... go to the parent directory
   {dired_edit} or Esc ............. edit the listing (wdired)
-                         :w applies changes, :q cancels
+                         :w applies, :wq/:x applies and closes, :q cancels
   {dired_sort} / {dired_sort_reverse} ................ cycle sort order / reverse it
   {dired_quit} .................... return to the previous buffer or close the pane
 

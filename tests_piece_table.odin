@@ -705,3 +705,62 @@ test_pt_edge_cases :: proc(t: ^testing.T) {
     testing.expect_value(t, text_clamped, "samp")
     fmt.println("  ✓ [PieceTable] Out-of-bounds & zero-length operations verified")
 }
+
+@(test)
+test_pt_undo_transaction_groups_disjoint_edits :: proc(t: ^testing.T) {
+    pt: PieceTable
+    init(&pt, "abcdef")
+    defer destroy(&pt)
+
+    begin_undo_transaction(&pt)
+    insert(&pt, 0, "<")
+    delete_range(&pt, 6, 1) // remove the trailing 'f' (after inserting '<')
+    end_undo_transaction(&pt)
+
+    text := full_text(&pt)
+    defer delete(text)
+    testing.expect_value(t, text, "<abcde")
+
+    testing.expect_value(t, undo(&pt), true)
+    after_undo := full_text(&pt)
+    defer delete(after_undo)
+    testing.expect_value(t, after_undo, "abcdef")
+
+    testing.expect_value(t, redo(&pt), true)
+    after_redo := full_text(&pt)
+    defer delete(after_redo)
+    testing.expect_value(t, after_redo, "<abcde")
+
+    fmt.println("  ✓ [PieceTable] explicit transactions undo/redo disjoint edits as one step")
+}
+
+@(test)
+test_pt_undo_transaction_nested_and_boundaries :: proc(t: ^testing.T) {
+    pt: PieceTable
+    init(&pt, "abc")
+    defer destroy(&pt)
+
+    begin_undo_transaction(&pt)
+    insert(&pt, 0, "1")
+    begin_undo_transaction(&pt)
+    insert(&pt, 4, "2")
+    end_undo_transaction(&pt)
+    end_undo_transaction(&pt)
+
+    text := full_text(&pt)
+    defer delete(text)
+    testing.expect_value(t, text, "1abc2")
+
+    testing.expect_value(t, undo(&pt), true)
+    after_undo := full_text(&pt)
+    defer delete(after_undo)
+    testing.expect_value(t, after_undo, "abc")
+
+    // The next ordinary edit is its own step.
+    insert(&pt, 3, "Z")
+    testing.expect_value(t, undo(&pt), true)
+    after_typing_undo := full_text(&pt)
+    defer delete(after_typing_undo)
+    testing.expect_value(t, after_typing_undo, "abc")
+    fmt.println("  ✓ [PieceTable] nested transactions and post-transaction grouping")
+}

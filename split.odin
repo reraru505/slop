@@ -45,6 +45,7 @@ pane_create :: proc(app: ^App, kind: PaneKind) -> ^Pane {
 }
 
 pane_destroy :: proc(app: ^App, p: ^Pane) {
+    app_lsp_doc_close(app, &p.editor)
     editor_destroy(&p.editor)
     dired_destroy(&p.dired)
     compilation_destroy(&p.compilation)
@@ -143,8 +144,11 @@ app_split_pane :: proc(app: ^App, target: ^Pane, dir: SplitDir) {
         new_pane.editor.scroll_col = target.editor.scroll_col
         new_pane.editor.desired_col = target.editor.desired_col
         new_pane.editor.read_only = target.editor.read_only
+        full := pt_full_text(&new_pane.editor.table)
+        defer delete(full)
+        app_lsp_doc_open(app, &new_pane.editor, full)
     } else if target.kind == .Dired {
-        dired_load_path(&new_pane.dired, target.dired.path)
+        dired_request_load(&new_pane.dired, target.dired.path, target.dired.sort_by, target.dired.sort_order)
         new_pane.dired.cursor = target.dired.cursor
         new_pane.dired.scroll = target.dired.scroll
     } else if target.kind == .Compilation {

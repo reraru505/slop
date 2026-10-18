@@ -3,6 +3,109 @@ package main
 import "core:strings"
 import sdl "vendor:sdl3"
 
+// Lexer state carried from one line to the next. `Normal` is the zero value.
+Syntax_State_Kind :: enum u8 {
+    Normal,
+    Block_Comment,
+    Raw_String,
+    Quoted_String,
+    Long_String,
+    Here_Doc,
+}
+
+Syntax_State :: struct {
+    kind:             Syntax_State_Kind,
+    depth:            int,  // nested block-comment depth
+    hashes:           int,  // Rust raw-string '#' count
+    bracket_level:    int,  // Lua long-bracket '=' count
+    quote:            u8,   // active quote character
+    heredoc_tag:      u64,  // hash of the Bash heredoc terminator
+    heredoc_strip_tabs: bool,
+}
+
+syntax_state_hash :: proc(state: Syntax_State) -> u64 {
+    h: u64 = 1469598103934665603
+    h = (h ~ u64(state.kind)) * 1099511628211
+    h = (h ~ u64(state.depth + 1)) * 1099511628211
+    h = (h ~ u64(state.hashes + 1)) * 1099511628211
+    h = (h ~ u64(state.bracket_level + 1)) * 1099511628211
+    h = (h ~ u64(state.quote)) * 1099511628211
+    h = (h ~ state.heredoc_tag) * 1099511628211
+    h = (h ~ u64(1 if state.heredoc_strip_tabs else 0)) * 1099511628211
+    return h
+}
+
+string_hash :: proc(s: string) -> u64 {
+    h: u64 = 1469598103934665603
+    for b in s do h = (h ~ u64(b)) * 1099511628211
+    return h
+}
+
+syntax_color_range :: proc(colors: []sdl.FColor, start, end: int, color: sdl.FColor) {
+    lo := clamp(start, 0, len(colors))
+    hi := clamp(end, lo, len(colors))
+    for i in lo ..< hi do colors[i] = color
+}
+
+// Lua long bracket: `[`, zero or more `=`, then `[`.
+syntax_lua_long_open :: proc(line: string, pos: int) -> (level: int, after: int, ok: bool) {
+    if pos >= len(line) || line[pos] != '[' do return 0, pos, false
+    j := pos + 1
+    for j < len(line) && line[j] == '=' do j += 1
+    if j < len(line) && line[j] == '[' do return j - pos - 1, j + 1, true
+    return 0, pos, false
+}
+
+syntax_lua_long_close :: proc(line: string, start: int, level: int) -> (end: int, closed: bool) {
+    j := start
+    for j < len(line) {
+        if line[j] == ']' {
+            match := true
+            for k in 0 ..< level {
+                if j + 1 + k >= len(line) || line[j + 1 + k] != '=' {
+                    match = false
+                    break
+                }
+            }
+            if match && j + 1 + level < len(line) && line[j + 1 + level] == ']' {
+                return j + 2 + level, true
+            }
+        }
+        j += 1
+    }
+    return len(line), false
+}
+
+// Consume a block comment starting at `start`. `depth` is the incoming depth
+// (1 for a fresh comment). Returns the byte after the closing delimiter, the
+// remaining depth, and whether it closed on this line.
+syntax_scan_block_comment :: proc(
+    line: string,
+    start: int,
+    open: string,
+    close: string,
+    depth: int,
+    nested: bool,
+) -> (end: int, remaining: int, closed: bool) {
+    remaining = max(1, depth)
+    j := start
+    for j < len(line) {
+        if nested && j + len(open) <= len(line) && line[j:j + len(open)] == open {
+            remaining += 1
+            j += len(open)
+            continue
+        }
+        if j + len(close) <= len(line) && line[j:j + len(close)] == close {
+            remaining -= 1
+            j += len(close)
+            if remaining == 0 do return j, 0, true
+            continue
+        }
+        j += 1
+    }
+    return len(line), remaining, false
+}
+
 is_ident_char_start :: proc(b: u8) -> bool {
     return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_'
 }
@@ -50,11 +153,38 @@ is_odin_constant :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_odin_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_odin_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
 
     i := 0
+    if state.kind == .Block_Comment {
+        end, remaining, closed := syntax_scan_block_comment(line, 0, "/*", "*/", state.depth, true)
+        syntax_color_range(colors, 0, end, theme.comment)
+        if !closed {
+            state.depth = remaining
+            return state
+        }
+        state = {}
+        i = end
+    } else if state.kind == .Raw_String {
+        j := 0
+        closed := false
+        for j < n {
+            if line[j] == '`' {
+                j += 1
+                closed = true
+                break
+            }
+            j += 1
+        }
+        syntax_color_range(colors, 0, j, theme.string_lit)
+        if !closed do return state
+        state = {}
+        i = j
+    }
+
     for i < n {
         c := line[i]
 
@@ -64,19 +194,10 @@ syntax_highlight_odin_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
                 for j in i ..< n do colors[j] = theme.comment
                 break
             } else if line[i + 1] == '*' {
-                j := i + 2
-                closed := false
-                for j + 1 < n {
-                    if line[j] == '*' && line[j + 1] == '/' {
-                        j += 2
-                        closed = true
-                        break
-                    }
-                    j += 1
-                }
-                if !closed do j = n
-                for k in i ..< j do colors[k] = theme.comment
-                i = j
+                end, remaining, closed := syntax_scan_block_comment(line, i + 2, "/*", "*/", 1, true)
+                syntax_color_range(colors, i, end, theme.comment)
+                if !closed do return Syntax_State{kind = .Block_Comment, depth = remaining}
+                i = end
                 continue
             }
         }
@@ -104,14 +225,17 @@ syntax_highlight_odin_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
         if c == '`' {
             start := i
             i += 1
+            closed := false
             for i < n {
                 if line[i] == '`' {
                     i += 1
+                    closed = true
                     break
                 }
                 i += 1
             }
             for k in start ..< i do colors[k] = theme.string_lit
+            if !closed do return Syntax_State{kind = .Raw_String}
             continue
         }
 
@@ -209,6 +333,7 @@ syntax_highlight_odin_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
@@ -250,9 +375,10 @@ is_zig_constant :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_zig_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_zig_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
+    state := state_in
     n := len(line)
-    if n == 0 do return
+    if n == 0 do return state
 
     // Multiline string literal \\...
     trimmed := strings.trim_left_space(line)
@@ -260,7 +386,7 @@ syntax_highlight_zig_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCo
         idx := strings.index(line, "\\\\")
         if idx >= 0 {
             for j in idx ..< n do colors[j] = theme.string_lit
-            return
+            return state
         }
     }
 
@@ -373,6 +499,7 @@ syntax_highlight_zig_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCo
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
@@ -417,11 +544,43 @@ is_c_constant :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_c_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_c_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
 
     i := 0
+    if state.kind == .Block_Comment {
+        end, remaining, closed := syntax_scan_block_comment(line, 0, "/*", "*/", state.depth, false)
+        syntax_color_range(colors, 0, end, theme.comment)
+        if !closed {
+            state.depth = remaining
+            return state
+        }
+        state = {}
+        i = end
+    } else if state.kind == .Quoted_String {
+        start := 0
+        j := 0
+        closed := false
+        for j < n {
+            if line[j] == '\\' && j + 1 < n {
+                j += 2
+                continue
+            }
+            if line[j] == '"' {
+                j += 1
+                closed = true
+                break
+            }
+            j += 1
+        }
+        syntax_color_range(colors, start, j, theme.string_lit)
+        if !closed do return state
+        state = {}
+        i = j
+    }
+
     for i < n {
         c := line[i]
 
@@ -431,19 +590,10 @@ syntax_highlight_c_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColo
                 for j in i ..< n do colors[j] = theme.comment
                 break
             } else if line[i + 1] == '*' {
-                j := i + 2
-                closed := false
-                for j + 1 < n {
-                    if line[j] == '*' && line[j + 1] == '/' {
-                        j += 2
-                        closed = true
-                        break
-                    }
-                    j += 1
-                }
-                if !closed do j = n
-                for k in i ..< j do colors[k] = theme.comment
-                i = j
+                end, remaining, closed := syntax_scan_block_comment(line, i + 2, "/*", "*/", 1, false)
+                syntax_color_range(colors, i, end, theme.comment)
+                if !closed do return Syntax_State{kind = .Block_Comment, depth = remaining}
+                i = end
                 continue
             }
         }
@@ -470,6 +620,7 @@ syntax_highlight_c_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColo
         if c == '"' {
             start := i
             i += 1
+            closed := false
             for i < n {
                 if line[i] == '\\' && i + 1 < n {
                     i += 2
@@ -477,11 +628,16 @@ syntax_highlight_c_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColo
                 }
                 if line[i] == '"' {
                     i += 1
+                    closed = true
                     break
                 }
                 i += 1
             }
             for k in start ..< i do colors[k] = theme.string_lit
+            // A trailing backslash escapes the newline; carry the string.
+            if !closed && i > start && line[i - 1] == '\\' {
+                return Syntax_State{kind = .Quoted_String, quote = '"'}
+            }
             continue
         }
 
@@ -556,6 +712,7 @@ syntax_highlight_c_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColo
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
@@ -593,11 +750,66 @@ is_rust_constant :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_rust_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_rust_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
 
     i := 0
+    if state.kind == .Block_Comment {
+        end, remaining, closed := syntax_scan_block_comment(line, 0, "/*", "*/", state.depth, true)
+        syntax_color_range(colors, 0, end, theme.comment)
+        if !closed {
+            state.depth = remaining
+            return state
+        }
+        state = {}
+        i = end
+    } else if state.kind == .Raw_String {
+        j := 0
+        closed := false
+        for j < n {
+            if line[j] == '"' {
+                match := true
+                for h in 0 ..< state.hashes {
+                    if j + 1 + h >= n || line[j + 1 + h] != '#' {
+                        match = false
+                        break
+                    }
+                }
+                if match {
+                    j += 1 + state.hashes
+                    closed = true
+                    break
+                }
+            }
+            j += 1
+        }
+        syntax_color_range(colors, 0, j, theme.string_lit)
+        if !closed do return state
+        state = {}
+        i = j
+    } else if state.kind == .Quoted_String {
+        j := 0
+        closed := false
+        for j < n {
+            if line[j] == '\\' && j + 1 < n {
+                j += 2
+                continue
+            }
+            if line[j] == '"' {
+                j += 1
+                closed = true
+                break
+            }
+            j += 1
+        }
+        syntax_color_range(colors, 0, j, theme.string_lit)
+        if !closed do return state
+        state = {}
+        i = j
+    }
+
     for i < n {
         c := line[i]
 
@@ -607,19 +819,10 @@ syntax_highlight_rust_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
                 for j in i ..< n do colors[j] = theme.comment
                 break
             } else if line[i + 1] == '*' {
-                j := i + 2
-                closed := false
-                for j + 1 < n {
-                    if line[j] == '*' && line[j + 1] == '/' {
-                        j += 2
-                        closed = true
-                        break
-                    }
-                    j += 1
-                }
-                if !closed do j = n
-                for k in i ..< j do colors[k] = theme.comment
-                i = j
+                end, remaining, closed := syntax_scan_block_comment(line, i + 2, "/*", "*/", 1, true)
+                syntax_color_range(colors, i, end, theme.comment)
+                if !closed do return Syntax_State{kind = .Block_Comment, depth = remaining}
+                i = end
                 continue
             }
         }
@@ -650,6 +853,7 @@ syntax_highlight_rust_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
             }
             if i < n && line[i] == '"' {
                 i += 1
+                closed := false
                 for i < n {
                     if line[i] == '"' {
                         match := true
@@ -661,12 +865,14 @@ syntax_highlight_rust_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
                         }
                         if match {
                             i += 1 + hashes
+                            closed = true
                             break
                         }
                     }
                     i += 1
                 }
                 for k in start ..< i do colors[k] = theme.string_lit
+                if !closed do return Syntax_State{kind = .Raw_String, hashes = hashes}
                 continue
             }
             i = start
@@ -676,6 +882,7 @@ syntax_highlight_rust_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
         if c == '"' {
             start := i
             i += 1
+            closed := false
             for i < n {
                 if line[i] == '\\' && i + 1 < n {
                     i += 2
@@ -683,11 +890,13 @@ syntax_highlight_rust_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
                 }
                 if line[i] == '"' {
                     i += 1
+                    closed = true
                     break
                 }
                 i += 1
             }
             for k in start ..< i do colors[k] = theme.string_lit
+            if !closed do return Syntax_State{kind = .Quoted_String, quote = '"'}
             continue
         }
 
@@ -768,6 +977,7 @@ syntax_highlight_rust_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
@@ -812,11 +1022,38 @@ is_go_constant :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_go_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_go_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
 
     i := 0
+    if state.kind == .Block_Comment {
+        end, remaining, closed := syntax_scan_block_comment(line, 0, "/*", "*/", state.depth, false)
+        syntax_color_range(colors, 0, end, theme.comment)
+        if !closed {
+            state.depth = remaining
+            return state
+        }
+        state = {}
+        i = end
+    } else if state.kind == .Raw_String {
+        j := 0
+        closed := false
+        for j < n {
+            if line[j] == '`' {
+                j += 1
+                closed = true
+                break
+            }
+            j += 1
+        }
+        syntax_color_range(colors, 0, j, theme.string_lit)
+        if !closed do return state
+        state = {}
+        i = j
+    }
+
     for i < n {
         c := line[i]
 
@@ -826,19 +1063,10 @@ syntax_highlight_go_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCol
                 for j in i ..< n do colors[j] = theme.comment
                 break
             } else if line[i + 1] == '*' {
-                j := i + 2
-                closed := false
-                for j + 1 < n {
-                    if line[j] == '*' && line[j + 1] == '/' {
-                        j += 2
-                        closed = true
-                        break
-                    }
-                    j += 1
-                }
-                if !closed do j = n
-                for k in i ..< j do colors[k] = theme.comment
-                i = j
+                end, remaining, closed := syntax_scan_block_comment(line, i + 2, "/*", "*/", 1, false)
+                syntax_color_range(colors, i, end, theme.comment)
+                if !closed do return Syntax_State{kind = .Block_Comment, depth = remaining}
+                i = end
                 continue
             }
         }
@@ -866,14 +1094,17 @@ syntax_highlight_go_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCol
         if c == '`' {
             start := i
             i += 1
+            closed := false
             for i < n {
                 if line[i] == '`' {
                     i += 1
+                    closed = true
                     break
                 }
                 i += 1
             }
             for k in start ..< i do colors[k] = theme.string_lit
+            if !closed do return Syntax_State{kind = .Raw_String}
             continue
         }
 
@@ -950,6 +1181,7 @@ syntax_highlight_go_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCol
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
@@ -978,11 +1210,23 @@ is_c3_type :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_c3_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_c3_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
 
     i := 0
+    if state.kind == .Block_Comment {
+        end, remaining, closed := syntax_scan_block_comment(line, 0, "/*", "*/", state.depth, true)
+        syntax_color_range(colors, 0, end, theme.comment)
+        if !closed {
+            state.depth = remaining
+            return state
+        }
+        state = {}
+        i = end
+    }
+
     for i < n {
         c := line[i]
 
@@ -992,19 +1236,10 @@ syntax_highlight_c3_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCol
                 for j in i ..< n do colors[j] = theme.comment
                 break
             } else if line[i + 1] == '*' {
-                j := i + 2
-                closed := false
-                for j + 1 < n {
-                    if line[j] == '*' && line[j + 1] == '/' {
-                        j += 2
-                        closed = true
-                        break
-                    }
-                    j += 1
-                }
-                if !closed do j = n
-                for k in i ..< j do colors[k] = theme.comment
-                i = j
+                end, remaining, closed := syntax_scan_block_comment(line, i + 2, "/*", "*/", 1, true)
+                syntax_color_range(colors, i, end, theme.comment)
+                if !closed do return Syntax_State{kind = .Block_Comment, depth = remaining}
+                i = end
                 continue
             }
         }
@@ -1108,6 +1343,7 @@ syntax_highlight_c3_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCol
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
@@ -1135,11 +1371,29 @@ is_hare_type :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_hare_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_hare_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
 
     i := 0
+    if state.kind == .Raw_String {
+        j := 0
+        closed := false
+        for j < n {
+            if line[j] == '`' {
+                j += 1
+                closed = true
+                break
+            }
+            j += 1
+        }
+        syntax_color_range(colors, 0, j, theme.string_lit)
+        if !closed do return state
+        state = {}
+        i = j
+    }
+
     for i < n {
         c := line[i]
 
@@ -1172,14 +1426,17 @@ syntax_highlight_hare_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
         if c == '`' {
             start := i
             i += 1
+            closed := false
             for i < n {
                 if line[i] == '`' {
                     i += 1
+                    closed = true
                     break
                 }
                 i += 1
             }
             for k in start ..< i do colors[k] = theme.string_lit
+            if !closed do return Syntax_State{kind = .Raw_String}
             continue
         }
 
@@ -1252,6 +1509,7 @@ syntax_highlight_hare_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
@@ -1276,11 +1534,23 @@ is_rela_type :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_rela_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_rela_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
 
     i := 0
+    if state.kind == .Block_Comment {
+        end, remaining, closed := syntax_scan_block_comment(line, 0, "/*", "*/", state.depth, false)
+        syntax_color_range(colors, 0, end, theme.comment)
+        if !closed {
+            state.depth = remaining
+            return state
+        }
+        state = {}
+        i = end
+    }
+
     for i < n {
         c := line[i]
 
@@ -1290,19 +1560,10 @@ syntax_highlight_rela_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
                 for j in i ..< n do colors[j] = theme.comment
                 break
             } else if line[i + 1] == '*' {
-                j := i + 2
-                closed := false
-                for j + 1 < n {
-                    if line[j] == '*' && line[j + 1] == '/' {
-                        j += 2
-                        closed = true
-                        break
-                    }
-                    j += 1
-                }
-                if !closed do j = n
-                for k in i ..< j do colors[k] = theme.comment
-                i = j
+                end, remaining, closed := syntax_scan_block_comment(line, i + 2, "/*", "*/", 1, false)
+                syntax_color_range(colors, i, end, theme.comment)
+                if !closed do return Syntax_State{kind = .Block_Comment, depth = remaining}
+                i = end
                 continue
             }
         }
@@ -1395,6 +1656,7 @@ syntax_highlight_rela_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
@@ -1422,19 +1684,96 @@ is_bash_builtin :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_bash_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_heredoc_line_matches :: proc(line: string, state: Syntax_State) -> bool {
+    candidate := strings.trim_right(line, "\r")
+    if state.heredoc_strip_tabs do candidate = strings.trim_left(candidate, "\t")
+    return string_hash(candidate) == state.heredoc_tag
+}
+
+syntax_highlight_bash_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 {
+        if state.kind == .Here_Doc {
+            return state
+        }
+        return state
+    }
+
+    if state.kind == .Here_Doc {
+        if syntax_heredoc_line_matches(line, state) {
+            syntax_color_range(colors, 0, n, theme.string_lit)
+            return Syntax_State{}
+        }
+        syntax_color_range(colors, 0, n, theme.string_lit)
+        return state
+    }
 
     // Shebang #!...
     if strings.has_prefix(line, "#!") {
         for j in 0 ..< n do colors[j] = theme.directive
-        return
+        return state
     }
 
     i := 0
+    if state.kind == .Quoted_String {
+        quote := state.quote
+        j := 0
+        closed := false
+        for j < n {
+            if quote == '"' && line[j] == '\\' && j + 1 < n {
+                j += 2
+                continue
+            }
+            if line[j] == quote {
+                j += 1
+                closed = true
+                break
+            }
+            j += 1
+        }
+        syntax_color_range(colors, 0, j, theme.string_lit)
+        if !closed do return state
+        state = {}
+        i = j
+    }
+
+    pending_heredoc: Syntax_State
     for i < n {
         c := line[i]
+
+        // Heredoc operator: <<TAG or <<-TAG (body starts on the next line).
+        if c == '<' && i + 1 < n && line[i + 1] == '<' {
+            j := i + 2
+            strip_tabs := false
+            if j < n && line[j] == '-' {
+                strip_tabs = true
+                j += 1
+            }
+            for j < n && (line[j] == ' ' || line[j] == '\t') do j += 1
+            delim := ""
+            if j < n && (line[j] == '\'' || line[j] == '"') {
+                quote := line[j]
+                j += 1
+                start := j
+                for j < n && line[j] != quote do j += 1
+                delim = line[start:j]
+                if j < n do j += 1
+            } else {
+                start := j
+                for j < n && (is_ident_char_continue(line[j]) || line[j] == '-' || line[j] == '.') do j += 1
+                delim = line[start:j]
+            }
+            if delim != "" {
+                pending_heredoc = Syntax_State{
+                    kind = .Here_Doc,
+                    heredoc_tag = string_hash(delim),
+                    heredoc_strip_tabs = strip_tabs,
+                }
+            }
+            i = j
+            continue
+        }
 
         // Comments #
         if c == '#' {
@@ -1463,6 +1802,7 @@ syntax_highlight_bash_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
         if c == '"' {
             start := i
             i += 1
+            closed := false
             for i < n {
                 if line[i] == '\\' && i + 1 < n {
                     i += 2
@@ -1488,11 +1828,13 @@ syntax_highlight_bash_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
                 }
                 if line[i] == '"' {
                     i += 1
+                    closed = true
                     break
                 }
                 i += 1
             }
             for k in start ..< i do colors[k] = theme.string_lit
+            if !closed do return Syntax_State{kind = .Quoted_String, quote = '"'}
             continue
         }
 
@@ -1500,9 +1842,14 @@ syntax_highlight_bash_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
         if c == '\'' {
             start := i
             i += 1
+            closed := false
             for i < n && line[i] != '\'' do i += 1
-            if i < n && line[i] == '\'' do i += 1
+            if i < n && line[i] == '\'' {
+                i += 1
+                closed = true
+            }
             for k in start ..< i do colors[k] = theme.string_lit
+            if !closed do return Syntax_State{kind = .Quoted_String, quote = '\''}
             continue
         }
 
@@ -1544,6 +1891,9 @@ syntax_highlight_bash_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
 
         i += 1
     }
+    // A heredoc block begins on the following line.
+    if pending_heredoc.kind == .Here_Doc do state = pending_heredoc
+    return state
 }
 
 // ============================================================================
@@ -1571,30 +1921,56 @@ is_lua_builtin :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_lua_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_lua_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
 
     i := 0
+    if state.kind == .Block_Comment {
+        end, closed := syntax_lua_long_close(line, 0, state.bracket_level)
+        syntax_color_range(colors, 0, end, theme.comment)
+        if !closed do return state
+        state = {}
+        i = end
+    } else if state.kind == .Long_String {
+        end, closed := syntax_lua_long_close(line, 0, state.bracket_level)
+        syntax_color_range(colors, 0, end, theme.string_lit)
+        if !closed do return state
+        state = {}
+        i = end
+    } else if state.kind == .Quoted_String {
+        quote := state.quote
+        j := 0
+        closed := false
+        for j < n {
+            if line[j] == '\\' && j + 1 < n {
+                j += 2
+                continue
+            }
+            if line[j] == quote {
+                j += 1
+                closed = true
+                break
+            }
+            j += 1
+        }
+        syntax_color_range(colors, 0, j, theme.string_lit)
+        if !closed do return state
+        state = {}
+        i = j
+    }
+
     for i < n {
         c := line[i]
 
-        // Comments -- and --[[ ... ]]
+        // Comments -- and --[=[ ... ]=]
         if c == '-' && i + 1 < n && line[i + 1] == '-' {
-            if i + 3 < n && line[i + 2] == '[' && line[i + 3] == '[' {
-                j := i + 4
-                closed := false
-                for j + 1 < n {
-                    if line[j] == ']' && line[j + 1] == ']' {
-                        j += 2
-                        closed = true
-                        break
-                    }
-                    j += 1
-                }
-                if !closed do j = n
-                for k in i ..< j do colors[k] = theme.comment
-                i = j
+            if level, after, ok := syntax_lua_long_open(line, i + 2); ok {
+                end, closed := syntax_lua_long_close(line, after, level)
+                syntax_color_range(colors, i, end, theme.comment)
+                if !closed do return Syntax_State{kind = .Block_Comment, bracket_level = level}
+                i = end
                 continue
             } else {
                 for j in i ..< n do colors[j] = theme.comment
@@ -1602,19 +1978,15 @@ syntax_highlight_lua_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCo
             }
         }
 
-        // Multiline strings [[...]]
-        if c == '[' && i + 1 < n && line[i + 1] == '[' {
-            start := i
-            i += 2
-            for i + 1 < n {
-                if line[i] == ']' && line[i + 1] == ']' {
-                    i += 2
-                    break
-                }
-                i += 1
+        // Multiline strings [[...]] and [=[...]=]
+        if c == '[' {
+            if level, after, ok := syntax_lua_long_open(line, i); ok {
+                end, closed := syntax_lua_long_close(line, after, level)
+                syntax_color_range(colors, i, end, theme.string_lit)
+                if !closed do return Syntax_State{kind = .Long_String, bracket_level = level}
+                i = end
+                continue
             }
-            for k in start ..< i do colors[k] = theme.string_lit
-            continue
         }
 
         // Strings "..." and '...'
@@ -1622,6 +1994,7 @@ syntax_highlight_lua_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCo
             quote := c
             start := i
             i += 1
+            closed := false
             for i < n {
                 if line[i] == '\\' && i + 1 < n {
                     i += 2
@@ -1629,11 +2002,15 @@ syntax_highlight_lua_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCo
                 }
                 if line[i] == quote {
                     i += 1
+                    closed = true
                     break
                 }
                 i += 1
             }
             for k in start ..< i do colors[k] = theme.string_lit
+            if !closed && i > start && line[i - 1] == '\\' {
+                return Syntax_State{kind = .Quoted_String, quote = quote}
+            }
             continue
         }
 
@@ -1687,15 +2064,46 @@ syntax_highlight_lua_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCo
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
 // TOML
 // ============================================================================
 
-syntax_highlight_toml_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_toml_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
+
+    i := 0
+    if state.kind == .Quoted_String || state.kind == .Raw_String {
+        quote := state.quote
+        j := 0
+        closed := false
+        for j + 2 < n {
+            if quote == '"' && line[j] == '\\' {
+                j += 1
+                if j < n do j += 1
+                continue
+            }
+            if line[j] == quote && line[j + 1] == quote && line[j + 2] == quote {
+                j += 3
+                closed = true
+                break
+            }
+            j += 1
+        }
+        if !closed {
+            syntax_color_range(colors, 0, n, theme.string_lit)
+            return state
+        }
+        // The closing run may be at the very end; color through it.
+        end := min(n, j)
+        syntax_color_range(colors, 0, end, theme.string_lit)
+        state = {}
+        i = end
+    }
 
     trimmed := strings.trim_left_space(line)
     // Table headers [section] or [[array_section]]
@@ -1712,12 +2120,11 @@ syntax_highlight_toml_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
                 if comment_idx >= 0 {
                     for k in comment_idx ..< n do colors[k] = theme.comment
                 }
-                return
+                return state
             }
         }
     }
 
-    i := 0
     has_seen_eq := false
     for i < n {
         c := line[i]
@@ -1728,10 +2135,34 @@ syntax_highlight_toml_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
             break
         }
 
-        // Strings "..." or '...'
+        // Strings "...", '...', and triple-quoted multi-line strings.
         if c == '"' || c == '\'' {
             quote := c
             start := i
+            if i + 2 < n && line[i + 1] == quote && line[i + 2] == quote {
+                i += 3
+                closed := false
+                for i + 2 < n {
+                    if quote == '"' && line[i] == '\\' {
+                        i += 1
+                        if i < n do i += 1
+                        continue
+                    }
+                    if line[i] == quote && line[i + 1] == quote && line[i + 2] == quote {
+                        i += 3
+                        closed = true
+                        break
+                    }
+                    i += 1
+                }
+                for k in start ..< i do colors[k] = theme.string_lit
+                if !closed {
+                    state.kind = .Quoted_String if quote == '"' else .Raw_String
+                    state.quote = quote
+                    return state
+                }
+                continue
+            }
             i += 1
             for i < n {
                 if line[i] == '\\' && i + 1 < n {
@@ -1790,17 +2221,29 @@ syntax_highlight_toml_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
 // KDL
 // ============================================================================
 
-syntax_highlight_kdl_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_kdl_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    state := state_in
+    if n == 0 do return state
 
     i := 0
+    if state.kind == .Block_Comment {
+        end, remaining, closed := syntax_scan_block_comment(line, 0, "/*", "*/", state.depth, false)
+        syntax_color_range(colors, 0, end, theme.comment)
+        if !closed {
+            state.depth = remaining
+            return state
+        }
+        state = {}
+        i = end
+    }
     first_ident := true
     for i < n {
         c := line[i]
@@ -1811,19 +2254,10 @@ syntax_highlight_kdl_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCo
                 for j in i ..< n do colors[j] = theme.comment
                 break
             } else if line[i + 1] == '*' {
-                j := i + 2
-                closed := false
-                for j + 1 < n {
-                    if line[j] == '*' && line[j + 1] == '/' {
-                        j += 2
-                        closed = true
-                        break
-                    }
-                    j += 1
-                }
-                if !closed do j = n
-                for k in i ..< j do colors[k] = theme.comment
-                i = j
+                end, remaining, closed := syntax_scan_block_comment(line, i + 2, "/*", "*/", 1, false)
+                syntax_color_range(colors, i, end, theme.comment)
+                if !closed do return Syntax_State{kind = .Block_Comment, depth = remaining}
+                i = end
                 continue
             }
         }
@@ -1900,6 +2334,7 @@ syntax_highlight_kdl_line :: proc(line: string, theme: ^Theme, colors: []sdl.FCo
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
@@ -1916,9 +2351,10 @@ is_makefile_directive :: proc(word: string) -> bool {
     return false
 }
 
-syntax_highlight_makefile_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_makefile_line :: proc(line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
+    state := state_in
     n := len(line)
-    if n == 0 do return
+    if n == 0 do return state
 
     i := 0
     // Skip leading whitespace or tab
@@ -2001,15 +2437,16 @@ syntax_highlight_makefile_line :: proc(line: string, theme: ^Theme, colors: []sd
 
         i += 1
     }
+    return state
 }
 
 // ============================================================================
 // MAIN DISPATCHER
 // ============================================================================
 
-syntax_highlight_line :: proc(file_path: string, line: string, theme: ^Theme, colors: []sdl.FColor) {
+syntax_highlight_line_state :: proc(file_path: string, line: string, theme: ^Theme, colors: []sdl.FColor, state_in: Syntax_State) -> Syntax_State {
     n := len(line)
-    if n == 0 do return
+    if n == 0 do return state_in
 
     // Default to plain foreground text
     for i in 0 ..< n {
@@ -2018,19 +2455,26 @@ syntax_highlight_line :: proc(file_path: string, line: string, theme: ^Theme, co
 
     lang := language_from_file_path(file_path)
     switch lang {
-    case .Odin:     syntax_highlight_odin_line(line, theme, colors)
-    case .Zig:      syntax_highlight_zig_line(line, theme, colors)
-    case .C, .Cpp:  syntax_highlight_c_line(line, theme, colors)
-    case .Rust:     syntax_highlight_rust_line(line, theme, colors)
-    case .Go:       syntax_highlight_go_line(line, theme, colors)
-    case .C3:       syntax_highlight_c3_line(line, theme, colors)
-    case .Hare:     syntax_highlight_hare_line(line, theme, colors)
-    case .Rela:     syntax_highlight_rela_line(line, theme, colors)
-    case .Bash:     syntax_highlight_bash_line(line, theme, colors)
-    case .Lua:      syntax_highlight_lua_line(line, theme, colors)
-    case .Toml:     syntax_highlight_toml_line(line, theme, colors)
-    case .Kdl:      syntax_highlight_kdl_line(line, theme, colors)
-    case .Makefile: syntax_highlight_makefile_line(line, theme, colors)
-    case .Plaintext: // default fg already assigned
+    case .Odin:     return syntax_highlight_odin_line(line, theme, colors, state_in)
+    case .Zig:      return syntax_highlight_zig_line(line, theme, colors, state_in)
+    case .C, .Cpp:  return syntax_highlight_c_line(line, theme, colors, state_in)
+    case .Rust:     return syntax_highlight_rust_line(line, theme, colors, state_in)
+    case .Go:       return syntax_highlight_go_line(line, theme, colors, state_in)
+    case .C3:       return syntax_highlight_c3_line(line, theme, colors, state_in)
+    case .Hare:     return syntax_highlight_hare_line(line, theme, colors, state_in)
+    case .Rela:     return syntax_highlight_rela_line(line, theme, colors, state_in)
+    case .Bash:     return syntax_highlight_bash_line(line, theme, colors, state_in)
+    case .Lua:      return syntax_highlight_lua_line(line, theme, colors, state_in)
+    case .Toml:     return syntax_highlight_toml_line(line, theme, colors, state_in)
+    case .Kdl:      return syntax_highlight_kdl_line(line, theme, colors, state_in)
+    case .Makefile: return syntax_highlight_makefile_line(line, theme, colors, state_in)
+    case .Plaintext:
+        return state_in
     }
+    return state_in
+}
+
+// Backwards-compatible single-line entry point (state starts Normal).
+syntax_highlight_line :: proc(file_path: string, line: string, theme: ^Theme, colors: []sdl.FColor) {
+    _ = syntax_highlight_line_state(file_path, line, theme, colors, Syntax_State{})
 }

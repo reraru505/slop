@@ -74,9 +74,13 @@ Node :: struct {
 // the piece list: `removed` are the spans that were deleted at `offset` (in
 // order) and `added` is the span that was inserted at `offset`.
 Edit :: struct {
-	offset:  int,
-	added:   Piece,            // length == 0 when nothing was inserted
-	removed: [dynamic]Piece,   // empty when nothing was deleted
+	offset:   int,
+	added:    Piece,            // length == 0 when nothing was inserted
+	removed:  [dynamic]Piece,   // empty when nothing was deleted
+	// Explicit transactions tag every edit they produce with the same id so
+	// undo/redo can treat disjoint changes as one step. 0 means an ordinary
+	// single edit or a typing-coalesced group.
+	group_id: u64,
 }
 
 // PieceTable is the main type. Zero value is not usable; call init first.
@@ -103,6 +107,11 @@ PieceTable :: struct {
 	group_undo:     bool,
 	group_broken:   bool,
 	last_edit_time: time.Time,
+
+	// Explicit compound-edit transactions (see begin_undo_transaction).
+	txn_depth:      int,
+	txn_id:         u64,
+	txn_edit_count: int,
 
 	rng: u64,
 
@@ -284,8 +293,40 @@ break_undo_group :: proc(pt: ^PieceTable) {
 	pt.group_broken = true
 }
 
+// begin_undo_transaction starts a compound edit. Every insert/delete/replace
+// until the matching end is undone and redone as one step, even when the
+// changes are disjoint. Transactions nest; only the outermost one allocates an
+// id and overrides typing coalescing.
+begin_undo_transaction :: proc(pt: ^PieceTable) {
+	if pt.txn_depth == 0 {
+		pt.txn_id += 1
+		if pt.txn_id == 0 do pt.txn_id = 1
+		pt.txn_edit_count = 0
+		pt.group_broken = true
+	}
+	pt.txn_depth += 1
+}
+
+// end_undo_transaction closes the innermost transaction. The next ordinary edit
+// starts a fresh undo step even if it is adjacent to the last one.
+end_undo_transaction :: proc(pt: ^PieceTable) {
+	if pt.txn_depth == 0 do return
+	pt.txn_depth -= 1
+	if pt.txn_depth == 0 {
+		pt.group_broken = true
+	}
+}
+
+// Abort is implemented by simply ending the transaction; the already-applied
+// edits remain in the buffer and in history as one step.
+cancel_undo_transaction :: proc(pt: ^PieceTable) {
+	pt.txn_depth = 0
+	pt.group_broken = true
+}
+
 // coalesce_insert folds an adjacent insertion into the previous undo step.
 coalesce_insert :: proc(pt: ^PieceTable, offset: int, added: Piece) -> bool {
+	if pt.txn_depth > 0 do return false
 	if !pt.group_undo || pt.group_broken || len(pt.undo_stack) == 0 do return false
 	if time.since(pt.last_edit_time) > UNDO_GROUP_TIMEOUT do return false
 
@@ -304,6 +345,7 @@ coalesce_insert :: proc(pt: ^PieceTable, offset: int, added: Piece) -> bool {
 // coalesce_delete folds an adjacent deletion (backspace or forward delete) into
 // the previous undo step.
 coalesce_delete :: proc(pt: ^PieceTable, offset: int, removed: ^[dynamic]Piece) -> bool {
+	if pt.txn_depth > 0 do return false
 	if !pt.group_undo || pt.group_broken || len(pt.undo_stack) == 0 do return false
 	if time.since(pt.last_edit_time) > UNDO_GROUP_TIMEOUT do return false
 
@@ -475,32 +517,16 @@ set_undo_enabled :: proc(pt: ^PieceTable, enabled: bool) {
 	pt.record_undo = enabled
 }
 
-// undo reverts the most recent recorded edit. Returns false if there is
-// nothing to undo.
-undo :: proc(pt: ^PieceTable) -> bool {
-	pt.group_broken = true
-	if len(pt.undo_stack) == 0 {
-		return false
-	}
-	e := pop(&pt.undo_stack)
+apply_undo_edit :: proc(pt: ^PieceTable, e: Edit) {
 	if e.added.length > 0 {
 		delete_impl(pt, e.offset, e.added.length, nil)
 	}
 	if len(e.removed) > 0 {
 		insert_spans_impl(pt, e.offset, e.removed[:])
 	}
-	append(&pt.redo_stack, e)
-	return true
 }
 
-// redo reapplies the most recently undone edit. Returns false if there is
-// nothing to redo.
-redo :: proc(pt: ^PieceTable) -> bool {
-	pt.group_broken = true
-	if len(pt.redo_stack) == 0 {
-		return false
-	}
-	e := pop(&pt.redo_stack)
+apply_redo_edit :: proc(pt: ^PieceTable, e: Edit) {
 	if len(e.removed) > 0 {
 		total := 0
 		for p in e.removed {
@@ -511,7 +537,62 @@ redo :: proc(pt: ^PieceTable) -> bool {
 	if e.added.length > 0 {
 		insert_spans_impl(pt, e.offset, []Piece{e.added})
 	}
-	append(&pt.undo_stack, e)
+}
+
+// undo reverts the most recent recorded edit (or transaction group). Returns
+// false if there is nothing to undo.
+undo :: proc(pt: ^PieceTable) -> bool {
+	pt.group_broken = true
+	if len(pt.undo_stack) == 0 {
+		return false
+	}
+
+	group := pt.undo_stack[len(pt.undo_stack) - 1].group_id
+	if group == 0 {
+		e := pop(&pt.undo_stack)
+		apply_undo_edit(pt, e)
+		append(&pt.redo_stack, e)
+		return true
+	}
+
+	// Pop the whole transaction. The stack order is chronological, so undo
+	// applies the last edit first.
+	edits: [dynamic]Edit
+	for len(pt.undo_stack) > 0 && pt.undo_stack[len(pt.undo_stack) - 1].group_id == group {
+		append(&edits, pop(&pt.undo_stack))
+	}
+	for e in edits do apply_undo_edit(pt, e)
+	// edits is reverse-chronological; appending it leaves the earliest edit on
+	// top of the redo stack so redo replays in forward order.
+	for e in edits do append(&pt.redo_stack, e)
+	delete(edits)
+	return true
+}
+
+// redo reapplies the most recently undone edit (or transaction group). Returns
+// false if there is nothing to redo.
+redo :: proc(pt: ^PieceTable) -> bool {
+	pt.group_broken = true
+	if len(pt.redo_stack) == 0 {
+		return false
+	}
+
+	group := pt.redo_stack[len(pt.redo_stack) - 1].group_id
+	if group == 0 {
+		e := pop(&pt.redo_stack)
+		apply_redo_edit(pt, e)
+		append(&pt.undo_stack, e)
+		return true
+	}
+
+	// Redo stack top is the earliest edit of the group.
+	edits: [dynamic]Edit
+	for len(pt.redo_stack) > 0 && pt.redo_stack[len(pt.redo_stack) - 1].group_id == group {
+		append(&edits, pop(&pt.redo_stack))
+	}
+	for e in edits do apply_redo_edit(pt, e)
+	for e in edits do append(&pt.undo_stack, e)
+	delete(edits)
 	return true
 }
 
@@ -615,7 +696,12 @@ insert_spans_impl :: proc(pt: ^PieceTable, offset: int, spans: []Piece) {
 // push_edit records an edit for undo and clears the redo stack.
 push_edit :: proc(pt: ^PieceTable, e: Edit) {
 	clear_redo(pt)
-	append(&pt.undo_stack, e)
+	edit := e
+	if pt.txn_depth > 0 {
+		edit.group_id = pt.txn_id
+		pt.txn_edit_count += 1
+	}
+	append(&pt.undo_stack, edit)
 	pt.group_broken = false
 	pt.last_edit_time = time.now()
 }
@@ -1079,3 +1165,5 @@ pt_undo            :: undo
 pt_redo            :: redo
 pt_set_undo_grouping :: set_undo_grouping
 pt_break_undo_group  :: break_undo_group
+pt_begin_undo_transaction :: begin_undo_transaction
+pt_end_undo_transaction   :: end_undo_transaction

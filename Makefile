@@ -23,7 +23,7 @@ test-unit: test
 
 # Spawns real language servers (ols, zls, clangd) if installed
 test-live:
-	odin test . -define:ODIN_TEST_LIVE_LSP=true -define:ODIN_TEST_NAMES=main.test_live_lsp_zig,main.test_live_lsp_clangd,main.test_live_lsp_odin
+	odin test . -define:ODIN_TEST_LIVE_LSP=true -define:ODIN_TEST_NAMES=main.test_live_lsp_zig,main.test_live_lsp_clangd,main.test_live_lsp_odin,main.test_live_lsp_manager_root_lifecycle
 
 clean:
 	rm -f $(BIN)

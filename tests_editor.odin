@@ -1602,3 +1602,171 @@ test_editor_visual_delete_clamps_virtual_start :: proc(t: ^testing.T) {
     testing.expect_value(t, text, "ab")
     fmt.println("  ✓ [Editor] visual delete clamps a virtual start column to its line")
 }
+
+@(test)
+test_editor_unicode_columns_and_motions :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "héllo 日本 é")
+    defer editor_destroy(&e)
+
+    // Byte columns: é starts at 1 (2 bytes), 日 at 7, 本 at 10, e at 14.
+    testing.expect_value(t, editor_visual_col(&e, 0, 0), 0)
+    testing.expect_value(t, editor_visual_col(&e, 0, 1), 1)
+    testing.expect_value(t, editor_visual_col(&e, 0, 3), 2) // é is one cell
+    testing.expect_value(t, editor_visual_col(&e, 0, 6), 5) // "héllo"
+    testing.expect_value(t, editor_visual_col(&e, 0, 7), 6) // first CJK rune
+    testing.expect_value(t, editor_visual_col(&e, 0, 10), 8) // second CJK rune
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 7), 7)
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 8), 10)
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 9), 10) // inside 本 snaps left
+    testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 10), 13)
+
+    // Combining mark contributes no cell: 12 cells over 17 bytes.
+    total := pt_get_length(&e.table)
+    testing.expect_value(t, editor_visual_col(&e, 0, total), 12)
+
+    // Right/Left move over whole runes.
+    e.cursor = Cursor{row = 0, col = 6}
+    send_key_event(&e, KEY_MOVE_RIGHT)
+    testing.expect_value(t, e.cursor.col, 7)
+    send_key_event(&e, KEY_MOVE_RIGHT)
+    testing.expect_value(t, e.cursor.col, 10)
+    send_key_event(&e, KEY_MOVE_LEFT)
+    testing.expect_value(t, e.cursor.col, 7)
+    testing.expect_value(t, e.desired_col, 6)
+
+    // Backspace deletes the whole preceding rune.
+    e.mode = .Insert
+    e.cursor.col = 10
+    send_key_event(&e, sdl.K_BACKSPACE)
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "héllo 本 é")
+    testing.expect_value(t, e.cursor.col, 7)
+
+    fmt.println("  ✓ [Editor] UTF-8 columns, wide runes, and rune-boundary motions")
+}
+
+@(test)
+test_editor_unicode_selection_and_word_motion :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "日a 世界")
+    defer editor_destroy(&e)
+
+    e.mode = .Visual
+    e.selection_anchor = Cursor{row = 0, col = 0}
+    e.cursor = Cursor{row = 0, col = 0}
+    start_off, end_off := editor_selection_offsets(&e)
+    testing.expect_value(t, start_off, 0)
+    testing.expect_value(t, end_off, 3)
+    e.mode = .Normal
+
+    e.cursor = Cursor{row = 0, col = 0}
+    editor_motion_word_forward(&e)
+    testing.expect_value(t, e.cursor.col, 5) // 日a is one word; skip the space
+    editor_motion_word_forward(&e)
+    testing.expect_value(t, e.cursor.col, 11) // 世界 is the next word
+    editor_motion_word_backward(&e)
+    testing.expect_value(t, e.cursor.col, 5) // back over 世界
+    editor_motion_word_backward(&e)
+    testing.expect_value(t, e.cursor.col, 0) // 日a are one contiguous word
+
+    fmt.println("  ✓ [Editor] UTF-8 selections and word motions stay on runes")
+}
+
+@(test)
+test_editor_line_move_is_single_undo :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "one\ntwo\nthree\n")
+    defer editor_destroy(&e)
+
+    e.cursor = Cursor{row = 1, col = 0}
+    editor_move_lines(&e, 1)
+    moved := pt_full_text(&e.table)
+    defer delete(moved)
+    testing.expect_value(t, moved, "one\nthree\ntwo\n")
+
+    testing.expect_value(t, pt_undo(&e.table), true)
+    restored := pt_full_text(&e.table)
+    defer delete(restored)
+    testing.expect_value(t, restored, "one\ntwo\nthree\n")
+    fmt.println("  ✓ [Editor] Alt+J/K line move is one undo step")
+}
+
+@(test)
+test_editor_multi_lsp_edit_is_single_undo :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "aaa\nbbb\nccc")
+    defer editor_destroy(&e)
+
+    edits := []LspTextEdit{
+        {start_row = 0, start_col = 0, end_row = 0, end_col = 3, new_text = "AAA"},
+        {start_row = 2, start_col = 0, end_row = 2, end_col = 3, new_text = "CCC"},
+    }
+    editor_apply_lsp_edits(&e, edits)
+    changed := pt_full_text(&e.table)
+    defer delete(changed)
+    testing.expect_value(t, changed, "AAA\nbbb\nCCC")
+
+    testing.expect_value(t, pt_undo(&e.table), true)
+    restored := pt_full_text(&e.table)
+    defer delete(restored)
+    testing.expect_value(t, restored, "aaa\nbbb\nccc")
+    fmt.println("  ✓ [Editor] multi-edit LSP formatting is one undo step")
+}
+
+@(test)
+test_editor_crlf_insertions_and_save :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "a\r\nb", "crlf.txt")
+    defer editor_destroy(&e)
+    testing.expect_value(t, e.line_ending, Line_Ending.CRLF)
+
+    e.mode = .Insert
+    e.cursor = Cursor{row = 0, col = 1}
+    e.desired_col = 1
+    send_key_event(&e, sdl.K_RETURN)
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "a\r\n\r\nb")
+
+    // o/O use the buffer's line ending too.
+    e.mode = .Normal
+    e.cursor = Cursor{row = 0, col = 0}
+    send_key_event(&e, KEY_OPEN_BELOW)
+    opened := pt_full_text(&e.table)
+    defer delete(opened)
+    testing.expect(t, strings.has_prefix(opened, "a\r\n\r\n"), opened)
+
+    // Normalization never produces a bare LF in a CRLF buffer.
+    normalized := editor_normalize_newlines(&e, "x\ny\r\nz")
+    testing.expect_value(t, normalized, "x\r\ny\r\nz")
+
+    // LSP edits and pasted text are normalized as well.
+    edits := []LspTextEdit{{start_row = 0, start_col = 0, end_row = 0, end_col = 1, new_text = "Q\nR"}}
+    editor_apply_lsp_edits(&e, edits)
+    edited := pt_full_text(&e.table)
+    defer delete(edited)
+    testing.expect(t, strings.contains(edited, "Q\r\nR"))
+    for i in 0 ..< len(edited) {
+        if edited[i] == '\n' {
+            testing.expect(t, i > 0 && edited[i - 1] == '\r', "bare LF in CRLF buffer")
+        }
+    }
+
+    // Saving preserves the CRLF bytes.
+    path := "/tmp/odin_editor_tests/crlf_save.txt"
+    _ = os.remove(path)
+    defer os.remove(path)
+    if e.file_path != "" do delete(e.file_path)
+    e.file_path = strings.clone(path, context.allocator)
+    testing.expect_value(t, editor_save_file(&e), true)
+    data, read_err := os.read_entire_file(path, context.temp_allocator)
+    testing.expect_value(t, read_err, nil)
+    for i in 0 ..< len(data) {
+        if data[i] == '\n' {
+            testing.expect(t, i > 0 && data[i - 1] == '\r', "saved bare LF")
+        }
+    }
+    fmt.println("  ✓ [Editor] CRLF buffers insert, normalize, and save CRLF only")
+}

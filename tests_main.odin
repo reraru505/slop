@@ -386,6 +386,7 @@ test_app_open_file_and_dired :: proc(t: ^testing.T) {
     // Opening a directory switches the pane to Dired
     app_pane_open_dired(&app, pane, dir)
     testing.expect_value(t, pane.kind, PaneKind.Dired)
+    dired_wait_load(&pane.dired)
     testing.expect_value(t, pane.dired.path, dir)
     testing.expect_value(t, app.active_pane, pane)
 
@@ -393,6 +394,7 @@ test_app_open_file_and_dired :: proc(t: ^testing.T) {
     app_pane_open_file(&app, pane, file_path)
     testing.expect(t, app_get_active_lsp(&app) == nil) // no file_path set on LSP manager/client
     app_pane_open_dired(&app, pane, dir)
+    dired_wait_load(&pane.dired)
     testing.expect(t, app_get_active_lsp(&app) == nil)
     fmt.println("  ✓ [App] file/dired pane opening and LSP lookup guards verified")
 }
@@ -501,6 +503,7 @@ test_app_open_completion_doc_split :: proc(t: ^testing.T) {
 test_app_root_command :: proc(t: ^testing.T) {
     app := make_test_app()
     defer destroy_test_app(&app)
+    app.working_dir = strings.clone("/tmp/odin_editor_tests/session_cwd", context.allocator)
 
     dir := "/tmp/odin_editor_tests/app_root"
     _ = os.remove_all(dir)
@@ -509,8 +512,8 @@ test_app_root_command :: proc(t: ^testing.T) {
 
     app_execute_command(&app, fmt.tprintf("root %s", dir))
     testing.expect_value(t, app.root_dir, dir)
-    testing.expect_value(t, app.working_dir, dir)
-    testing.expect_value(t, app.lsp_manager.working_dir, dir)
+    testing.expect_value(t, app.working_dir, "/tmp/odin_editor_tests/session_cwd")
+    testing.expect_value(t, app.lsp_manager.project_root, dir)
     testing.expect(t, strings.has_prefix(app.cmd_prompt.message, "Project root:"))
     testing.expect_value(t, app_picker_root(&app), dir)
     testing.expect_value(t, app_resolve_path(&app, "src/main.odin"), fmt.tprintf("%s/src/main.odin", dir))
@@ -654,4 +657,86 @@ test_app_open_file_guards_dirty_and_read_only :: proc(t: ^testing.T) {
     testing.expect_value(t, app_pane_open_file(&app, pane, a), true)
     testing.expect_value(t, pane.dired.is_editing, false)
     fmt.println("  ✓ [App] file retargeting guards dirty/read-only and clears wdired")
+}
+
+@(test)
+test_app_cd_separates_session_and_root :: proc(t: ^testing.T) {
+    base := "/tmp/odin_editor_tests/cd_semantics"
+    sub := "/tmp/odin_editor_tests/cd_semantics/sub"
+    _ = os.remove_all(base)
+    testing.expect(t, os.make_directory_all(sub) == nil)
+    defer os.remove_all(base)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    app.working_dir = strings.clone(sub, context.allocator)
+    app.root_dir = strings.clone(base, context.allocator)
+
+    cwd_before, cwd_err := os.get_working_directory(context.temp_allocator)
+    testing.expect_value(t, cwd_err, nil)
+
+    app_execute_command(&app, "cd ..")
+    testing.expect_value(t, app.working_dir, base)
+    testing.expect_value(t, app.root_dir, base)
+    cwd_after, cwd_err2 := os.get_working_directory(context.temp_allocator)
+    testing.expect_value(t, cwd_err2, nil)
+    testing.expect_value(t, cwd_after, cwd_before) // never chdir
+
+    fmt.println("  ✓ [App] :cd updates session/root without changing process cwd")
+}
+
+@(test)
+test_help_dot_leader_alignment :: proc(t: ^testing.T) {
+    short := help_align_line("  {x} ........ description")
+    desc_idx := strings.index(short, "description")
+    testing.expect_value(t, desc_idx, HELP_DESC_COLUMN)
+    defer delete(short)
+
+    long := help_align_line("this-label-is-far-too-long-for-the-column .... description")
+    testing.expect_value(t, long, "this-label-is-far-too-long-for-the-column description")
+    defer delete(long)
+
+    unchanged := help_align_line("plain prose stays exactly as it is")
+    testing.expect_value(t, unchanged, "plain prose stays exactly as it is")
+    defer delete(unchanged)
+    fmt.println("  ✓ [Help] dot leaders align and long labels degrade gracefully")
+}
+
+@(test)
+test_app_wq_wdired_applies_and_closes :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/wdired_wq"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+    pane.kind = .Dired
+    pane.dired.path = strings.clone(dir, context.allocator)
+    pane.dired.is_editing = true
+    set_editor_text(&pane.editor, "created.txt\n")
+
+    app.running = true
+    app_execute_command(&app, "wq")
+    testing.expect_value(t, os.exists(fmt.tprintf("%s/created.txt", dir)), true)
+    testing.expect_value(t, pane.dired.apply_ok, true)
+    // Closing the only pane quits the editor.
+    testing.expect_value(t, app.running, false)
+
+    // An invalid listing keeps the pane open.
+    app2 := make_test_app()
+    defer destroy_test_app(&app2)
+    p2 := app2.active_pane
+    p2.kind = .Dired
+    p2.dired.path = strings.clone(dir, context.allocator)
+    p2.dired.is_editing = true
+    set_editor_text(&p2.editor, "bad/name\n")
+    app2.running = true
+    app_execute_command(&app2, "x")
+    testing.expect_value(t, p2.dired.apply_ok, false)
+    testing.expect_value(t, app2.running, true)
+    testing.expect_value(t, p2.kind, PaneKind.Dired)
+
+    fmt.println("  ✓ [App] :wq/:x applies wdired then closes; failures stay open")
 }
