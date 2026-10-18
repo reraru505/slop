@@ -937,6 +937,7 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
         mod := event.key.mod
         is_shift := (mod & sdl.KMOD_SHIFT) != {}
         is_alt := (mod & sdl.KMOD_ALT) != {}
+        is_ctrl := (mod & sdl.KMOD_CTRL) != {}
 
         if key == KEY_CMD_PROMPT || (key == KEY_CMD_PROMPT_ALT && is_shift) {
             app_open_command_prompt(app)
@@ -949,7 +950,7 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
             return true
         }
 
-        if key == KEY_COMPILE_VISUAL {
+        if is_ctrl && key == KEY_COMPILE_VISUAL {
             if c.selecting {
                 c.selecting = false
             } else {
@@ -1198,7 +1199,7 @@ compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font
         key_label(KEY_COMPILE_YANK, {}, .Plain),
         key_label(KEY_COMPILE_YANK_ALT, sdl.KMOD_ALT, .Plain),
         key_label(KEY_COMPILE_YANK_ALL, sdl.KMOD_SHIFT, .Shift_Letter),
-        key_label(KEY_COMPILE_VISUAL, {}, .Plain),
+        key_label(KEY_COMPILE_VISUAL, sdl.KMOD_CTRL, .Plain),
     )
     status_color := sdl.FColor{0.45, 0.85, 0.55, 1.0} if (c.finished && c.exit_code == 0) else sdl.FColor{0.95, 0.5, 0.45, 1.0}
     push_line(font, status_info, Vec2{rect.x + 10.0, rect.y + rect.h - status_bar_h + 4.0}, status_color, .HALF)

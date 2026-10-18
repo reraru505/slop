@@ -496,10 +496,12 @@ test_compilation_selection_keys_and_mouse_mapping :: proc(t: ^testing.T) {
     ev.key.mod = {}
 
     ev.key.key = KEY_COMPILE_VISUAL
+    ev.key.mod = sdl.KMOD_CTRL
     testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
     testing.expect_value(t, c.selecting, true)
     testing.expect_value(t, c.anchor_row, 0)
 
+    ev.key.mod = {}
     ev.key.key = KEY_COMPILE_DOWN
     compilation_handle_event(&c, &ev, &app, pane)
     testing.expect_value(t, c.cursor, 1)

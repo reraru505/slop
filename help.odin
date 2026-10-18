@@ -260,7 +260,7 @@ help_token_value :: proc(name: string) -> (string, bool) {
     case "compile_yank":          return key_label(KEY_COMPILE_YANK, {}, .Plain), true
     case "compile_yank_alt":      return key_label(KEY_COMPILE_YANK_ALT, alt, .Plain), true
     case "compile_yank_all":      return key_label(KEY_COMPILE_YANK_ALL, shift, .Shift_Letter), true
-    case "compile_visual":        return key_label(KEY_COMPILE_VISUAL, {}, .Plain), true
+    case "compile_visual":        return key_label(KEY_COMPILE_VISUAL, ctrl, .Plain), true
     case "compile_quit":          return key_label(KEY_COMPILE_QUIT, {}, .Plain), true
     }
     return "", false

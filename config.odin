@@ -202,5 +202,5 @@ KEY_COMPILE_RECOMPILE_ALT :: sdl.K_G     // g
 KEY_COMPILE_YANK          :: sdl.K_Y     // y: copy current line / selection
 KEY_COMPILE_YANK_ALL      :: sdl.K_Y     // Shift+Y: copy whole buffer
 KEY_COMPILE_YANK_ALT      :: sdl.K_W     // Alt+W (M-w): copy current line / selection
-KEY_COMPILE_VISUAL        :: sdl.K_V     // v: start/stop character selection
+KEY_COMPILE_VISUAL        :: sdl.K_X     // Ctrl+X: start/stop character selection
 KEY_COMPILE_QUIT          :: sdl.K_Q     // q
