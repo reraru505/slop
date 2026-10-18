@@ -119,6 +119,9 @@ init :: proc(pt: ^PieceTable, initial: string = "") {
 	pt.root = node_new(pt, p)
 	pt.length = len(initial)
 	pt.line_count = p.lines
+	// The flat piece view has not been materialized yet; force pieces_slice
+	// to rebuild it instead of returning an empty slice.
+	pt.pieces_valid = false
 }
 
 // new_piece_table allocates and returns a ready-to-use table with optional
