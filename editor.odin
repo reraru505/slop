@@ -56,7 +56,11 @@ editor_set_status_message :: proc(e: ^Editor, msg: string) {
 
 editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := "") {
     pt_init(&e.table, initial_text)
-    e.char_advance = find_biggest_advance(font)
+    if font != nil {
+        e.char_advance = find_biggest_advance(font)
+    } else {
+        e.char_advance = 10.0
+    }
     e.font_scale = .HALF
     e.mode = .Normal
     e.cursor = Cursor{
@@ -194,12 +198,13 @@ editor_save_file :: proc(e: ^Editor, app: ^App = nil) -> bool {
     if err == nil {
         e.dirty = false
         editor_set_status_message(e, "File saved successfully.")
-        if app != nil && app.lsp_client.running {
+        lsp := app_get_lsp_for_file(app, e.file_path)
+        if lsp != nil && lsp.running {
             if e.needs_lsp_sync {
                 e.needs_lsp_sync = false
-                lsp_did_change(&app.lsp_client, e.file_path, full)
+                lsp_did_change(lsp, e.file_path, full)
             }
-            lsp_did_save(&app.lsp_client, e.file_path)
+            lsp_did_save(lsp, e.file_path)
         }
         return true
     }
@@ -367,6 +372,26 @@ editor_get_line_indent :: proc(e: ^Editor, row: int) -> (indent: int, first_char
         first_char_col = 0
     }
     return indent, first_char_col, is_blank
+}
+
+editor_count_char_on_current_line_before_cursor :: proc(e: ^Editor, quote_char: u8) -> int {
+    line_start := pt_line_to_offset(&e.table, e.cursor.row)
+    count := 0
+    for i := 0; i < e.cursor.col; i += 1 {
+        off := line_start + i
+        if off < pt_get_length(&e.table) && pt_byte_at(&e.table, off) == quote_char {
+            back_off := off - 1
+            slash_count := 0
+            for back_off >= line_start && pt_byte_at(&e.table, back_off) == '\\' {
+                slash_count += 1
+                back_off -= 1
+            }
+            if slash_count % 2 == 0 {
+                count += 1
+            }
+        }
+    }
+    return count
 }
 
 editor_is_line_blank :: proc(e: ^Editor, row: int) -> bool {
@@ -948,10 +973,50 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         e.completion.active = false
         editor_realize_virtual_spaces(e)
         offset := editor_get_cursor_offset(e)
-        pt_insert(&e.table, offset, "\n")
-        e.cursor.row += 1
-        e.cursor.col = 0
-        e.desired_col = 0
+
+        // Check if cursor is between matching braces {} or brackets [] or ()
+        is_between_pair := false
+        if offset > 0 && offset < pt_get_length(&e.table) {
+            prev := pt_byte_at(&e.table, offset - 1)
+            next := pt_byte_at(&e.table, offset)
+            if (prev == '{' && next == '}') ||
+               (prev == '(' && next == ')') ||
+               (prev == '[' && next == ']') {
+                is_between_pair = true
+            }
+        }
+
+        // Get leading whitespace of current line up to cursor
+        cur_line_text, line_ok := pt_line_text(&e.table, e.cursor.row)
+        defer if line_ok do delete(cur_line_text)
+        indent_len := 0
+        if line_ok {
+            for i := 0; i < min(len(cur_line_text), e.cursor.col); i += 1 {
+                if cur_line_text[i] == ' ' || cur_line_text[i] == '\t' {
+                    indent_len += 1
+                } else {
+                    break
+                }
+            }
+        }
+        base_indent := cur_line_text[:indent_len] if indent_len > 0 else ""
+
+        if is_between_pair {
+            // Expand with new line + extra indent + new line + base indent
+            to_insert := fmt.tprintf("\n%s    \n%s", base_indent, base_indent)
+            pt_insert(&e.table, offset, to_insert)
+            e.cursor.row += 1
+            e.cursor.col = len(base_indent) + 4
+            e.desired_col = e.cursor.col
+        } else {
+            // Normal enter: preserve current line's leading indentation
+            to_insert := fmt.tprintf("\n%s", base_indent) if len(base_indent) > 0 else "\n"
+            pt_insert(&e.table, offset, to_insert)
+            e.cursor.row += 1
+            e.cursor.col = len(base_indent)
+            e.desired_col = e.cursor.col
+        }
+
         e.dirty = true
         e.needs_lsp_sync = true
         e.last_edit_time = time.now()
@@ -991,27 +1056,20 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             }
             e.completion.trigger_row = e.cursor.row
             e.completion.trigger_col = trigger_col
-            if app != nil && app.lsp_client.running && e.file_path != "" {
+            lsp := app_get_lsp_for_file(app, e.file_path)
+            if lsp != nil && lsp.running && e.file_path != "" {
                 if e.needs_lsp_sync {
                     e.needs_lsp_sync = false
                     full_text := pt_full_text(&e.table)
                     defer delete(full_text)
-                    lsp_did_change(&app.lsp_client, e.file_path, full_text)
+                    lsp_did_change(lsp, e.file_path, full_text)
                 }
-                lsp_request_completion(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.col)
+                lsp_request_completion(lsp, e.file_path, e.cursor.row, e.cursor.col)
             }
             return true
         }
         e.completion.active = false
-        editor_realize_virtual_spaces(e)
-        offset := editor_get_cursor_offset(e)
-        pt_insert(&e.table, offset, " ")
-        e.cursor.col += 1
-        e.desired_col = e.cursor.col
-        e.dirty = true
-        e.needs_lsp_sync = true
-        e.last_edit_time = time.now()
-        return true
+        return false
 
     case sdl.K_BACKSPACE:
         line_len := editor_get_line_len(e, e.cursor.row)
@@ -1020,7 +1078,20 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             e.desired_col = e.cursor.col
         } else if e.cursor.col > 0 {
             offset := editor_get_cursor_offset(e)
-            pt_delete_range(&e.table, offset - 1, 1)
+            del_len := 1
+            if offset > 0 && offset < pt_get_length(&e.table) {
+                prev := pt_byte_at(&e.table, offset - 1)
+                next := pt_byte_at(&e.table, offset)
+                if (prev == '(' && next == ')') ||
+                   (prev == '[' && next == ']') ||
+                   (prev == '{' && next == '}') ||
+                   (prev == '"' && next == '"') ||
+                   (prev == '\'' && next == '\'') ||
+                   (prev == '`' && next == '`') {
+                    del_len = 2
+                }
+            }
+            pt_delete_range(&e.table, offset - 1, del_len)
             e.cursor.col -= 1
             e.desired_col = e.cursor.col
             e.dirty = true
@@ -1177,8 +1248,9 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         }
         if key == sdl.K_D {
             // gd: Go to definition
-            if app != nil && app.lsp_client.running && e.file_path != "" {
-                lsp_request_definition(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.col)
+            lsp := app_get_lsp_for_file(app, e.file_path)
+            if lsp != nil && lsp.running && e.file_path != "" {
+                lsp_request_definition(lsp, e.file_path, e.cursor.row, e.cursor.col)
                 app_set_message(app, "LSP: Requesting definition...")
             }
             return true
@@ -1189,8 +1261,9 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         e.pending_cmd = 0
         if key == sdl.K_EQUALS {
             // ==: Format current line
-            if app != nil && app.lsp_client.running && e.file_path != "" {
-                lsp_request_range_formatting(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.row)
+            lsp := app_get_lsp_for_file(app, e.file_path)
+            if lsp != nil && lsp.running && e.file_path != "" {
+                lsp_request_range_formatting(lsp, e.file_path, e.cursor.row, e.cursor.row)
                 app_set_message(app, fmt.tprintf("LSP: Formatting line %d...", e.cursor.row + 1))
             }
             return true
@@ -1284,8 +1357,9 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     case sdl.K_K, sdl.K_UP:
         if key == sdl.K_K && is_shift {
             // K: Hover
-            if app != nil && app.lsp_client.running && e.file_path != "" {
-                lsp_request_hover(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.col)
+            lsp := app_get_lsp_for_file(app, e.file_path)
+            if lsp != nil && lsp.running && e.file_path != "" {
+                lsp_request_hover(lsp, e.file_path, e.cursor.row, e.cursor.col)
                 app_set_message(app, "LSP: Requesting hover...")
             }
             return true
@@ -1300,8 +1374,9 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         if e.mode == .Visual {
             start_row := min(e.cursor.row, e.selection_anchor.row)
             end_row := max(e.cursor.row, e.selection_anchor.row)
-            if app != nil && app.lsp_client.running && e.file_path != "" {
-                lsp_request_range_formatting(&app.lsp_client, e.file_path, start_row, end_row)
+            lsp := app_get_lsp_for_file(app, e.file_path)
+            if lsp != nil && lsp.running && e.file_path != "" {
+                lsp_request_range_formatting(lsp, e.file_path, start_row, end_row)
                 app_set_message(app, fmt.tprintf("LSP: Formatting lines %d-%d...", start_row + 1, end_row + 1))
             }
             editor_set_mode(e, .Normal, window)
@@ -1470,6 +1545,92 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
     case .TEXT_INPUT:
         if e.mode == .Insert {
             text_str := string(event.text.text)
+            if len(text_str) == 1 {
+                ch := text_str[0]
+                offset := editor_get_cursor_offset(e)
+                total_len := pt_get_length(&e.table)
+
+                next_ch: u8 = 0
+                if offset < total_len {
+                    next_ch = pt_byte_at(&e.table, offset)
+                }
+                prev_ch: u8 = 0
+                if offset > 0 {
+                    prev_ch = pt_byte_at(&e.table, offset - 1)
+                }
+
+                // 1. Step-over (overtype closing bracket or quote)
+                if (ch == ')' && next_ch == ')') ||
+                   (ch == ']' && next_ch == ']') ||
+                   (ch == '}' && next_ch == '}') ||
+                   (ch == '"' && next_ch == '"') ||
+                   (ch == '\'' && next_ch == '\'') ||
+                   (ch == '`' && next_ch == '`') {
+                    e.cursor.col += 1
+                    e.desired_col = e.cursor.col
+                    e.dirty = true
+                    e.last_action = time.now()
+                    e.completion.active = false
+                    return true
+                }
+
+                // 2. Auto-pair brackets and quotes
+                is_next_alnum := (next_ch >= 'a' && next_ch <= 'z') ||
+                                 (next_ch >= 'A' && next_ch <= 'Z') ||
+                                 (next_ch >= '0' && next_ch <= '9')
+
+                paired_str := ""
+                if !is_next_alnum {
+                    switch ch {
+                    case '(':
+                        paired_str = "()"
+                    case '[':
+                        paired_str = "[]"
+                    case '{':
+                        paired_str = "{}"
+                    case '"':
+                        if prev_ch != '\\' {
+                            cnt := editor_count_char_on_current_line_before_cursor(e, '"')
+                            if cnt % 2 == 0 {
+                                paired_str = "\"\""
+                            }
+                        }
+                    case '\'':
+                        is_prev_ident := (prev_ch >= 'a' && prev_ch <= 'z') ||
+                                         (prev_ch >= 'A' && prev_ch <= 'Z') ||
+                                         (prev_ch >= '0' && prev_ch <= '9') ||
+                                         prev_ch == '_' || prev_ch == '\\'
+                        if !is_prev_ident {
+                            cnt := editor_count_char_on_current_line_before_cursor(e, '\'')
+                            if cnt % 2 == 0 {
+                                paired_str = "''"
+                            }
+                        }
+                    case '`':
+                        if prev_ch != '\\' {
+                            cnt := editor_count_char_on_current_line_before_cursor(e, '`')
+                            if cnt % 2 == 0 {
+                                paired_str = "``"
+                            }
+                        }
+                    }
+                }
+
+                if paired_str != "" {
+                    editor_realize_virtual_spaces(e)
+                    offset = editor_get_cursor_offset(e)
+                    pt_insert(&e.table, offset, paired_str)
+                    e.cursor.col += 1
+                    e.desired_col = e.cursor.col
+                    e.dirty = true
+                    e.needs_lsp_sync = true
+                    e.last_edit_time = time.now()
+                    e.last_action = time.now()
+                    e.completion.active = false
+                    return true
+                }
+            }
+
             if len(text_str) > 0 {
                 editor_realize_virtual_spaces(e)
                 offset := editor_get_cursor_offset(e)
@@ -1482,7 +1643,8 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                 e.last_action = time.now()
 
                 // Trigger or update completion when typing identifier or dot
-                if app != nil && app.lsp_client.running && e.file_path != "" {
+                lsp := app_get_lsp_for_file(app, e.file_path)
+                if lsp != nil && lsp.running && e.file_path != "" {
                     ch := text_str[len(text_str) - 1]
                     if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' {
                         if ch == '.' || !e.completion.active || e.cursor.row != e.completion.trigger_row {
@@ -1509,7 +1671,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                             e.needs_lsp_sync = false
                             full_text := pt_full_text(&e.table)
                             defer delete(full_text)
-                            lsp_did_change(&app.lsp_client, e.file_path, full_text)
+                            lsp_did_change(lsp, e.file_path, full_text)
                         }
 
                         // Immediate local filter on existing all_items for zero-latency keystrokes
@@ -1517,7 +1679,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                             editor_filter_completions(e)
                         }
 
-                        lsp_request_completion(&app.lsp_client, e.file_path, e.cursor.row, e.cursor.col)
+                        lsp_request_completion(lsp, e.file_path, e.cursor.row, e.cursor.col)
                     } else {
                         e.completion.active = false
                     }

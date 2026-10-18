@@ -207,11 +207,11 @@ dired_load_path :: proc(d: ^Dired, dir_path: string) -> bool {
 
 dired_format_size :: proc(size: i64) -> string {
     if size < 1024 {
-        return fmt.tprintf("%4d B", size)
+        return fmt.tprintf("% 4d B", size)
     } else if size < 1024 * 1024 {
-        return fmt.tprintf("%4.1f KB", f32(size) / 1024.0)
+        return fmt.tprintf("% 4.1f KB", f32(size) / 1024.0)
     } else {
-        return fmt.tprintf("%4.1f MB", f32(size) / (1024.0 * 1024.0))
+        return fmt.tprintf("% 4.1f MB", f32(size) / (1024.0 * 1024.0))
     }
 }
 

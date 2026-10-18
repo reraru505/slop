@@ -6,15 +6,29 @@ import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "core:sys/posix"
 import sdl "vendor:sdl3"
 
 TARGET :: 16_660 * time.Microsecond
 
 CommandPrompt :: struct {
-    active      : bool,
-    buffer      : [dynamic]u8,
-    message     : string,
-    message_buf : [512]u8,
+    active        : bool,
+    buffer        : [dynamic]u8,
+    message       : string,
+    message_buf   : [512]u8,
+    matches       : [dynamic]string,
+    match_index   : int,
+    in_completion : bool,
+}
+
+app_reset_command_completion :: proc(prompt: ^CommandPrompt) {
+    if prompt == nil do return
+    for m in prompt.matches {
+        delete(m)
+    }
+    clear(&prompt.matches)
+    prompt.match_index = -1
+    prompt.in_completion = false
 }
 
 app_set_message :: proc(app: ^App, msg: string) {
@@ -40,12 +54,24 @@ App :: struct {
     current_theme_id : ThemeId,
     theme            : Theme,
     running          : bool,
-    lsp_client       : LspClient,
+    lsp_manager      : LspManager,
+}
+
+app_get_lsp_for_file :: proc(app: ^App, file_path: string) -> ^LspClient {
+    if app == nil || file_path == "" do return nil
+    lang := language_from_file_path(file_path)
+    return lsp_manager_get_client(&app.lsp_manager, lang, file_path)
+}
+
+app_get_active_lsp :: proc(app: ^App) -> ^LspClient {
+    if app == nil || app.active_pane == nil || app.active_pane.kind != .Editor do return nil
+    return app_get_lsp_for_file(app, app.active_pane.editor.file_path)
 }
 
 app_open_command_prompt :: proc(app: ^App) {
     app.cmd_prompt.active = true
     clear(&app.cmd_prompt.buffer)
+    app_reset_command_completion(&app.cmd_prompt)
     app.cmd_prompt.message = ""
     _ = sdl.StartTextInput(app.window) 
 }
@@ -53,8 +79,106 @@ app_open_command_prompt :: proc(app: ^App) {
 app_close_command_prompt :: proc(app: ^App) {
     app.cmd_prompt.active = false
     clear(&app.cmd_prompt.buffer)
+    app_reset_command_completion(&app.cmd_prompt)
     if app.active_pane == nil || app.active_pane.kind != .Editor || app.active_pane.editor.mode != .Insert {
         _ = sdl.StopTextInput(app.window)
+    }
+}
+
+app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
+    p := &app.cmd_prompt
+    if !p.in_completion {
+        curr_str := string(p.buffer[:])
+        app_reset_command_completion(p)
+
+        // 1. Check if completing a subcommand / argument (contains space)
+        if first_space := strings.index_byte(curr_str, ' '); first_space >= 0 {
+            cmd_prefix := curr_str[:first_space]
+            arg_prefix := strings.trim_space(curr_str[first_space+1:])
+
+            switch cmd_prefix {
+            case "theme", "colorscheme":
+                themes := []string{"gruber-darker", "naysayer", "kanagawa", "hemisu"}
+                for th in themes {
+                    if strings.has_prefix(th, arg_prefix) {
+                        append(&p.matches, fmt.aprintf("%s %s", cmd_prefix, th))
+                    }
+                }
+            case "sort":
+                sorts := []string{"name", "size", "time", "rev", "reverse"}
+                for s in sorts {
+                    if strings.has_prefix(s, arg_prefix) {
+                        append(&p.matches, fmt.aprintf("%s %s", cmd_prefix, s))
+                    }
+                }
+            case "e", "edit", "sp", "split", "vs", "vsplit", "cd":
+                search_dir := "."
+                name_prefix := arg_prefix
+                if slash_idx := strings.last_index_byte(arg_prefix, '/'); slash_idx >= 0 {
+                    search_dir = arg_prefix[:slash_idx]
+                    if search_dir == "" do search_dir = "/"
+                    name_prefix = arg_prefix[slash_idx+1:]
+                }
+
+                handle, err := os.open(search_dir)
+                if err == nil {
+                    defer os.close(handle)
+                    files, ferr := os.read_dir(handle, -1, context.temp_allocator)
+                    if ferr == nil {
+                        for f in files {
+                            if strings.has_prefix(f.name, ".") && !strings.has_prefix(name_prefix, ".") {
+                                continue
+                            }
+                            if strings.has_prefix(f.name, name_prefix) {
+                                joined := f.name
+                                if slash_idx := strings.last_index_byte(arg_prefix, '/'); slash_idx >= 0 {
+                                    dir_part := arg_prefix[:slash_idx+1]
+                                    joined = fmt.tprintf("%s%s", dir_part, f.name)
+                                }
+                                if f.type == .Directory {
+                                    joined = fmt.tprintf("%s/", joined)
+                                }
+                                append(&p.matches, fmt.aprintf("%s %s", cmd_prefix, joined))
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // 2. Completing base command
+            ALL_COMMANDS := []string{
+                "w", "wq", "q", "qa", "q!", "x",
+                "split", "sp", "vsplit", "vs",
+                "dired", "edit", "e",
+                "compile", "recompile", "make",
+                "cnext", "cn", "cprev", "cp", "cfirst", "crewind",
+                "bnext", "bn",
+                "theme", "colorscheme",
+                "sort", "cd",
+            }
+            for cmd in ALL_COMMANDS {
+                if strings.has_prefix(cmd, curr_str) {
+                    append(&p.matches, strings.clone(cmd, context.allocator))
+                }
+            }
+        }
+
+        if len(p.matches) == 0 do return
+        p.in_completion = true
+        p.match_index = 0
+    } else {
+        if len(p.matches) == 0 do return
+        if reverse {
+            p.match_index = (p.match_index - 1 + len(p.matches)) % len(p.matches)
+        } else {
+            p.match_index = (p.match_index + 1) % len(p.matches)
+        }
+    }
+
+    selected := p.matches[p.match_index]
+    clear(&p.buffer)
+    for b in transmute([]u8)selected {
+        append(&p.buffer, b)
     }
 }
 
@@ -76,10 +200,12 @@ app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string) {
     pane.kind = .Editor
     app.active_pane = pane
 
-    if app.lsp_client.running && file_path != "" {
-        full_text := pt_full_text(&pane.editor.table)
-        defer delete(full_text)
-        lsp_did_open(&app.lsp_client, file_path, full_text)
+    if file_path != "" {
+        if lsp := app_get_lsp_for_file(app, file_path); lsp != nil && lsp.running {
+            full_text := pt_full_text(&pane.editor.table)
+            defer delete(full_text)
+            lsp_did_open(lsp, file_path, full_text)
+        }
     }
 }
 
@@ -349,6 +475,7 @@ load :: proc(app: ^App) {
     app.font = load_font(app.renderer)
     app.panes = make([dynamic]^Pane, context.allocator)
     app.cmd_prompt.buffer = make([dynamic]u8, context.allocator)
+    app.cmd_prompt.matches = make([dynamic]string, context.allocator)
     app.next_pane_id = 1
 
     // Initialize working directory
@@ -384,19 +511,19 @@ load :: proc(app: ^App) {
         }
     }
 
-    // Initialize LSP (ols)
-    if os.exists("/usr/bin/ols") || os.exists("/usr/local/bin/ols") {
-        lsp_start(&app.lsp_client, "ols", app.working_dir)
-    }
+    // Initialize LSP manager
+    lsp_manager_init(&app.lsp_manager, app.working_dir)
 
     app.active_pane = initial_pane
     app.root_split = split_create_leaf(initial_pane)
     app.running = true
 
-    if initial_pane.kind == .Editor && app.lsp_client.running && initial_pane.editor.file_path != "" {
-        full_text := pt_full_text(&initial_pane.editor.table)
-        defer delete(full_text)
-        lsp_did_open(&app.lsp_client, initial_pane.editor.file_path, full_text)
+    if initial_pane.kind == .Editor && initial_pane.editor.file_path != "" {
+        if lsp := app_get_lsp_for_file(app, initial_pane.editor.file_path); lsp != nil && lsp.running {
+            full_text := pt_full_text(&initial_pane.editor.table)
+            defer delete(full_text)
+            lsp_did_open(lsp, initial_pane.editor.file_path, full_text)
+        }
     }
 }
 
@@ -431,6 +558,9 @@ update :: proc(app: ^App) {
 
         case .TEXT_INPUT:
             if app.cmd_prompt.active {
+                if app.cmd_prompt.in_completion {
+                    app_reset_command_completion(&app.cmd_prompt)
+                }
                 text_str := string(event.text.text)
                 for b in transmute([]u8)text_str {
                     append(&app.cmd_prompt.buffer, b)
@@ -458,7 +588,13 @@ update :: proc(app: ^App) {
                 switch key {
                 case sdl.K_ESCAPE:
                     app_close_command_prompt(app)
+                case sdl.K_TAB:
+                    is_shift := (mod & sdl.KMOD_SHIFT) != {}
+                    app_command_prompt_tab(app, reverse = is_shift)
                 case sdl.K_BACKSPACE:
+                    if app.cmd_prompt.in_completion {
+                        app_reset_command_completion(&app.cmd_prompt)
+                    }
                     if len(app.cmd_prompt.buffer) > 0 {
                         pop(&app.cmd_prompt.buffer)
                     } else {
@@ -557,84 +693,94 @@ update :: proc(app: ^App) {
         }
     }
 
-    // LSP update and response dispatch
-    lsp_update(&app.lsp_client, app)
+    // LSP update and response dispatch for all running servers
+    for server_kind in LspServerKind {
+        client := app.lsp_manager.clients[server_kind]
+        if client != nil && client.running {
+            lsp_update(client, app)
+        }
+    }
 
-    // Handle completions transfer to active editor
-    if len(app.lsp_client.completions) > 0 {
-        if app.active_pane != nil && app.active_pane.kind == .Editor {
-            e := &app.active_pane.editor
-            if e.mode == .Insert {
-                for c in e.completion.all_items {
-                    delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+    active_lsp := app_get_active_lsp(app)
+    if active_lsp != nil {
+        // Handle completions transfer to active editor
+        if len(active_lsp.completions) > 0 {
+            if app.active_pane != nil && app.active_pane.kind == .Editor {
+                e := &app.active_pane.editor
+                if e.mode == .Insert {
+                    for c in e.completion.all_items {
+                        delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+                    }
+                    clear(&e.completion.all_items)
+                    for c in active_lsp.completions {
+                        append(&e.completion.all_items, LspCompletionItem{
+                            label         = strings.clone(c.label),
+                            detail        = strings.clone(c.detail),
+                            documentation = strings.clone(c.documentation),
+                            insert_text   = strings.clone(c.insert_text),
+                            kind          = c.kind,
+                        })
+                    }
+                    editor_filter_completions(e)
                 }
-                clear(&e.completion.all_items)
-                for c in app.lsp_client.completions {
-                    append(&e.completion.all_items, LspCompletionItem{
-                        label         = strings.clone(c.label),
-                        detail        = strings.clone(c.detail),
-                        documentation = strings.clone(c.documentation),
-                        insert_text   = strings.clone(c.insert_text),
-                        kind          = c.kind,
-                    })
+            }
+            for c in active_lsp.completions {
+                delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
+            }
+            clear(&active_lsp.completions)
+        }
+
+        // Handle Go to Definition result
+        if loc, ok := active_lsp.last_definition.?; ok {
+            active_lsp.last_definition = nil
+            if app.active_pane != nil && app.active_pane.kind == .Editor {
+                cur_abs, _ := filepath.abs(app.active_pane.editor.file_path, context.temp_allocator)
+                if cur_abs != loc.file_path {
+                    app_pane_open_file(app, app.active_pane, loc.file_path)
                 }
-                editor_filter_completions(e)
+                e := &app.active_pane.editor
+                e.cursor.row = loc.row
+                e.cursor.col = loc.col
+                e.desired_col = loc.col
+                editor_clamp_cursor(e)
+                app_set_message(app, fmt.tprintf("Definition: %s:%d:%d", filepath.base(loc.file_path), loc.row + 1, loc.col + 1))
             }
         }
-        for c in app.lsp_client.completions {
-            delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
-        }
-        clear(&app.lsp_client.completions)
-    }
 
-    // Handle Go to Definition result
-    if loc, ok := app.lsp_client.last_definition.?; ok {
-        app.lsp_client.last_definition = nil
-        if app.active_pane != nil && app.active_pane.kind == .Editor {
-            cur_abs, _ := filepath.abs(app.active_pane.editor.file_path, context.temp_allocator)
-            if cur_abs != loc.file_path {
-                app_pane_open_file(app, app.active_pane, loc.file_path)
+        // Handle Hover result
+        if active_lsp.last_hover != "" {
+            clean_hover := strings.trim_space(active_lsp.last_hover)
+            first_nl := strings.index(clean_hover, "\n")
+            display_line := clean_hover
+            if first_nl >= 0 do display_line = clean_hover[:first_nl]
+            app_set_message(app, fmt.tprintf("Hover: %s", display_line))
+            delete(active_lsp.last_hover)
+            active_lsp.last_hover = ""
+        }
+
+        // Handle Range Formatting edits
+        if len(active_lsp.last_edits) > 0 {
+            if app.active_pane != nil && app.active_pane.kind == .Editor {
+                e := &app.active_pane.editor
+                editor_apply_lsp_edits(e, active_lsp.last_edits[:])
+                app_set_message(app, fmt.tprintf("LSP: Formatted range (%d edits)", len(active_lsp.last_edits)))
             }
-            e := &app.active_pane.editor
-            e.cursor.row = loc.row
-            e.cursor.col = loc.col
-            e.desired_col = loc.col
-            editor_clamp_cursor(e)
-            app_set_message(app, fmt.tprintf("Definition: %s:%d:%d", filepath.base(loc.file_path), loc.row + 1, loc.col + 1))
+            for ed in active_lsp.last_edits do delete(ed.new_text)
+            clear(&active_lsp.last_edits)
         }
     }
 
-    // Handle Hover result
-    if app.lsp_client.last_hover != "" {
-        clean_hover := strings.trim_space(app.lsp_client.last_hover)
-        first_nl := strings.index(clean_hover, "\n")
-        display_line := clean_hover
-        if first_nl >= 0 do display_line = clean_hover[:first_nl]
-        app_set_message(app, fmt.tprintf("Hover: %s", display_line))
-        delete(app.lsp_client.last_hover)
-        app.lsp_client.last_hover = ""
-    }
-
-    // Handle Range Formatting edits
-    if len(app.lsp_client.last_edits) > 0 {
-        if app.active_pane != nil && app.active_pane.kind == .Editor {
-            e := &app.active_pane.editor
-            editor_apply_lsp_edits(e, app.lsp_client.last_edits[:])
-            app_set_message(app, fmt.tprintf("LSP: Formatted range (%d edits)", len(app.lsp_client.last_edits)))
-        }
-        for ed in app.lsp_client.last_edits do delete(ed.new_text)
-        clear(&app.lsp_client.last_edits)
-    }
-
-    // Debounced LSP textDocument/didChange
-    if app.active_pane != nil && app.active_pane.kind == .Editor {
-        e := &app.active_pane.editor
-        if e.needs_lsp_sync && time.since(e.last_edit_time) > 250 * time.Millisecond {
-            e.needs_lsp_sync = false
-            if app.lsp_client.running && e.file_path != "" {
-                full_text := pt_full_text(&e.table)
-                defer delete(full_text)
-                lsp_did_change(&app.lsp_client, e.file_path, full_text)
+    // Debounced LSP textDocument/didChange across open editor panes
+    for pane in app.panes {
+        if pane != nil && pane.kind == .Editor {
+            e := &pane.editor
+            if e.needs_lsp_sync && time.since(e.last_edit_time) > 250 * time.Millisecond {
+                e.needs_lsp_sync = false
+                if lsp := app_get_lsp_for_file(app, e.file_path); lsp != nil && lsp.running && e.file_path != "" {
+                    full_text := pt_full_text(&e.table)
+                    defer delete(full_text)
+                    lsp_did_change(lsp, e.file_path, full_text)
+                }
             }
         }
     }
@@ -660,10 +806,10 @@ draw :: proc(app: ^App) {
         is_focused := (p == app.active_pane)
         switch p.kind {
         case .Editor:
-            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, &app.lsp_client)
+            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.file_path))
         case .Dired:
             if p.dired.is_editing {
-                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, &app.lsp_client)
+                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.file_path))
             } else {
                 dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused, &app.theme)
             }
@@ -723,6 +869,32 @@ draw :: proc(app: ^App) {
         cur_rect := sdl.FRect{cur_x, main_area_h + 3.0, 2.0, get_line_height(.HALF)}
         sdl.SetRenderDrawColorFloat(app.renderer, app.theme.cursor.r, app.theme.cursor.g, app.theme.cursor.b, app.theme.cursor.a)
         sdl.RenderFillRect(app.renderer, &cur_rect)
+
+        // Render completion matches preview if in completion with candidates
+        if app.cmd_prompt.in_completion && len(app.cmd_prompt.matches) > 1 {
+            b := strings.builder_make(context.temp_allocator)
+            strings.write_string(&b, "  [")
+            max_shown := min(6, len(app.cmd_prompt.matches))
+            for i := 0; i < max_shown; i += 1 {
+                m := app.cmd_prompt.matches[i]
+                if i == app.cmd_prompt.match_index {
+                    strings.write_string(&b, "*")
+                    strings.write_string(&b, m)
+                    strings.write_string(&b, "*")
+                } else {
+                    strings.write_string(&b, m)
+                }
+                if i + 1 < max_shown {
+                    strings.write_string(&b, " ")
+                }
+            }
+            if len(app.cmd_prompt.matches) > max_shown {
+                strings.write_string(&b, " ...")
+            }
+            strings.write_string(&b, "]")
+            sugg_str := strings.to_string(b)
+            push_line(&app.font, sugg_str, Vec2{cur_x + 8.0, main_area_h + 3.0}, app.theme.comment, .HALF)
+        }
     } else if app.pending_w_cmd {
         push_line(
            &app.font, 
@@ -768,6 +940,8 @@ cleanup :: proc(app: ^App) {
     }
     delete(app.panes)
     delete(app.cmd_prompt.buffer)
+    app_reset_command_completion(&app.cmd_prompt)
+    delete(app.cmd_prompt.matches)
     if app.last_compile_cmd != "" {
         delete(app.last_compile_cmd)
         app.last_compile_cmd = ""
@@ -775,11 +949,12 @@ cleanup :: proc(app: ^App) {
 
     sdl.DestroyRenderer(app.renderer)
     sdl.DestroyWindow(app.window)
-    lsp_stop(&app.lsp_client)
+    lsp_manager_stop_all(&app.lsp_manager)
     sdl.Quit()
 }
 
 main :: proc() {
+    posix.sigignore(.SIGPIPE)
     app: App
     load(&app)
     defer cleanup(&app)
