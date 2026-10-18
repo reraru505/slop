@@ -56,13 +56,15 @@ Compilation :: struct {
     cursor_col  : int,
     desired_col : int,
     scroll      : int,
-    // Visual character selection (v or mouse drag).
+    // Visual selection: Ctrl+X selects whole lines; mouse drag selects chars.
     selecting   : bool,
+    linewise    : bool,
     anchor_row  : int,
     anchor_col  : int,
     dragging    : bool,
     drag_row    : int,
     drag_col    : int,
+    pending_g   : bool,
     status      : string,
     exit_code   : int,
     finished    : bool,
@@ -81,11 +83,13 @@ compilation_init :: proc(c: ^Compilation) {
     c.desired_col = 0
     c.scroll = 0
     c.selecting = false
+    c.linewise = false
     c.anchor_row = 0
     c.anchor_col = 0
     c.dragging = false
     c.drag_row = 0
     c.drag_col = 0
+    c.pending_g = false
     c.status = strings.clone("Idle")
     c.exit_code = 0
     c.finished = false
@@ -475,6 +479,7 @@ compilation_finish :: proc(c: ^Compilation, output: string, exit_code: int, fail
     }
 
     c.selecting = false
+    c.linewise = false
     compilation_set_cursor(c, first_error_idx if first_error_idx >= 0 else 0, 0)
     c.scroll = max(0, c.cursor - 5)
     c.last_action = time.now()
@@ -543,7 +548,9 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string, working_dir :=
     c.desired_col = 0
     c.scroll = 0
     c.selecting = false
+    c.linewise = false
     c.dragging = false
+    c.pending_g = false
 
     display_cwd := working_dir
     if display_cwd == "" {
@@ -556,10 +563,7 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string, working_dir :=
     c.working_dir = strings.clone(display_cwd, context.allocator)
 
     append(&c.lines, CompilationLine{
-        text = fmt.aprintf("-*- mode: compilation; default-directory: \"%s\" -*-", display_cwd),
-    })
-    append(&c.lines, CompilationLine{
-        text = fmt.aprintf("Compilation started: %s", new_command),
+        text = fmt.aprintf("Compilation started: %s  (in %s)", new_command, display_cwd),
     })
     append(&c.lines, CompilationLine{text = strings.clone("")})
 
@@ -660,6 +664,7 @@ compilation_first_error :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
     for i := 0; i < len(c.lines); i += 1 {
         if c.lines[i].file_path != "" && (c.lines[i].is_error || c.lines[i].is_warn) {
             c.selecting = false
+            c.linewise = false
             compilation_set_cursor(c, i, 0)
             compilation_jump_to_current(c, app, pane)
             return
@@ -672,6 +677,7 @@ compilation_next_error :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
     for i := c.cursor + 1; i < len(c.lines); i += 1 {
         if c.lines[i].file_path != "" && (c.lines[i].is_error || c.lines[i].is_warn) {
             c.selecting = false
+            c.linewise = false
             compilation_set_cursor(c, i, 0)
             compilation_jump_to_current(c, app, pane)
             return
@@ -684,6 +690,7 @@ compilation_prev_error :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
     for i := c.cursor - 1; i >= 0; i -= 1 {
         if c.lines[i].file_path != "" && (c.lines[i].is_error || c.lines[i].is_warn) {
             c.selecting = false
+            c.linewise = false
             compilation_set_cursor(c, i, 0)
             compilation_jump_to_current(c, app, pane)
             return
@@ -777,6 +784,14 @@ compilation_move_row :: proc(c: ^Compilation, delta: int) {
     compilation_clamp_cursor(c)
 }
 
+compilation_move_row_selecting :: proc(c: ^Compilation, delta: int) {
+    compilation_move_row(c, delta)
+    if c.linewise && len(c.lines) > 0 {
+        c.cursor_col = compilation_line_len(c, c.cursor)
+        c.desired_col = compilation_visual_col(c, c.cursor, c.cursor_col)
+    }
+}
+
 compilation_move_col :: proc(c: ^Compilation, delta: int) {
     if len(c.lines) == 0 do return
     line := c.lines[c.cursor].text
@@ -793,6 +808,15 @@ compilation_move_col :: proc(c: ^Compilation, delta: int) {
 // at the cursor end, matching the editor's Visual mode).
 compilation_selection_bounds :: proc(c: ^Compilation) -> (r0, c0, r1, c1: int) {
     if !c.selecting || len(c.lines) == 0 do return 0, 0, -1, 0
+
+    if c.linewise {
+        r0 = clamp(min(c.anchor_row, c.cursor), 0, len(c.lines) - 1)
+        r1 = clamp(max(c.anchor_row, c.cursor), 0, len(c.lines) - 1)
+        c0 = 0
+        c1 = compilation_line_len(c, r1)
+        return
+    }
+
     ar := clamp(c.anchor_row, 0, len(c.lines) - 1)
     ac := clamp(c.anchor_col, 0, compilation_line_len(c, ar))
     cr := clamp(c.cursor, 0, len(c.lines) - 1)
@@ -888,11 +912,13 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
     #partial switch event.type {
     case .MOUSE_BUTTON_DOWN:
         if event.button.button != sdl.BUTTON_LEFT do return false
+        c.pending_g = false
         row := compilation_line_at_y(c, pane.rect, event.button.y)
         if row < 0 do return true
         col := compilation_col_at_x(c, pane.rect, event.button.x, row)
         if event.button.clicks >= 2 {
             c.selecting = true
+            c.linewise = true
             c.anchor_row = row
             c.anchor_col = 0
             compilation_set_cursor(c, row, compilation_line_len(c, row))
@@ -903,11 +929,13 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
                 c.anchor_row = c.cursor
                 c.anchor_col = c.cursor_col
             }
+            c.linewise = false
             compilation_set_cursor(c, row, col)
             c.dragging = false
         } else {
             compilation_set_cursor(c, row, col)
             c.selecting = false
+            c.linewise = false
             c.dragging = true
             c.drag_row = row
             c.drag_col = col
@@ -921,6 +949,7 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
         col := compilation_col_at_x(c, pane.rect, event.motion.x, row)
         if row != c.drag_row || col != c.drag_col {
             c.selecting = true
+            c.linewise = false
             c.anchor_row = c.drag_row
             c.anchor_col = c.drag_col
         }
@@ -939,6 +968,27 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
         is_alt := (mod & sdl.KMOD_ALT) != {}
         is_ctrl := (mod & sdl.KMOD_CTRL) != {}
 
+        // g is a prefix, matching Normal mode: gg jumps to the top.
+        if c.pending_g {
+            c.pending_g = false
+            if key == KEY_COMPILE_TOP {
+                compilation_set_cursor(c, 0, compilation_line_len(c, 0) if c.linewise else 0)
+                c.scroll = 0
+                return true
+            }
+        }
+
+        if is_shift && key == KEY_COMPILE_BOTTOM {
+            row := max(0, len(c.lines) - 1)
+            compilation_set_cursor(c, row, compilation_line_len(c, row) if c.linewise else 0)
+            return true
+        }
+
+        if key == KEY_COMPILE_GOTO {
+            c.pending_g = true
+            return true
+        }
+
         if key == KEY_CMD_PROMPT || (key == KEY_CMD_PROMPT_ALT && is_shift) {
             app_open_command_prompt(app)
             return true
@@ -953,62 +1003,71 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
         if is_ctrl && key == KEY_COMPILE_VISUAL {
             if c.selecting {
                 c.selecting = false
+                c.linewise = false
             } else {
                 c.selecting = true
+                c.linewise = true
                 c.anchor_row = c.cursor
-                c.anchor_col = c.cursor_col
+                c.anchor_col = 0
+                compilation_set_cursor(c, c.cursor, compilation_line_len(c, c.cursor))
             }
             return true
         }
 
         if key == sdl.K_ESCAPE {
             c.selecting = false
+            c.linewise = false
             return true
         }
 
         if is_shift && !c.selecting {
             c.selecting = true
+            c.linewise = false
             c.anchor_row = c.cursor
             c.anchor_col = c.cursor_col
         }
 
         if key == KEY_COMPILE_DOWN || key == sdl.K_DOWN {
-            compilation_move_row(c, 1)
+            compilation_move_row_selecting(c, 1)
             return true
         }
 
         if key == KEY_COMPILE_UP || key == sdl.K_UP {
-            compilation_move_row(c, -1)
+            compilation_move_row_selecting(c, -1)
             return true
         }
 
         if key == sdl.K_LEFT {
+            c.linewise = false
             compilation_move_col(c, -1)
             return true
         }
 
         if key == sdl.K_RIGHT {
+            c.linewise = false
             compilation_move_col(c, 1)
             return true
         }
 
         if key == sdl.K_HOME {
+            c.linewise = false
             compilation_set_cursor(c, c.cursor, 0)
             return true
         }
 
         if key == sdl.K_END {
+            c.linewise = false
             compilation_set_cursor(c, c.cursor, compilation_line_len(c, c.cursor))
             return true
         }
 
         if key == sdl.K_PAGEUP {
-            compilation_move_row(c, -20)
+            compilation_move_row_selecting(c, -20)
             return true
         }
 
         if key == sdl.K_PAGEDOWN {
-            compilation_move_row(c, 20)
+            compilation_move_row_selecting(c, 20)
             return true
         }
 
@@ -1027,7 +1086,7 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
             return true
         }
 
-        if key == KEY_COMPILE_RECOMPILE || key == KEY_COMPILE_RECOMPILE_ALT {
+        if key == KEY_COMPILE_RECOMPILE {
             if c.command != "" {
                 workdir := c.working_dir
                 if workdir == "" do workdir = app_picker_root(app)
@@ -1187,7 +1246,7 @@ compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font
     sdl.RenderFillRect(renderer, &status_bar_rect)
 
     focus_badge := "[ACTIVE] " if is_focused else ""
-    visual_badge := " [VISUAL] " if c.selecting else ""
+    visual_badge := " [VISUAL LINE] " if (c.selecting && c.linewise) else (" [VISUAL] " if c.selecting else "")
     status_info := fmt.tprintf(
         "%s-- COMPILATION --%s [%s]  <Enter> jump, <%s/%s> next/prev, <%s> recompile, <%s>/<%s> copy, <%s> all, <%s> select",
         focus_badge,

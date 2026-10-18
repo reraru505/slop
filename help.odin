@@ -256,7 +256,9 @@ help_token_value :: proc(name: string) -> (string, bool) {
     case "compile_prev_error":    return key_label(KEY_COMPILE_PREV_ERROR, {}, .Plain), true
     case "compile_jump":          return key_label(KEY_COMPILE_JUMP, {}, .Upper), true
     case "compile_recompile":     return key_label(KEY_COMPILE_RECOMPILE, {}, .Plain), true
-    case "compile_recompile_alt": return key_label(KEY_COMPILE_RECOMPILE_ALT, {}, .Plain), true
+    case "compile_goto":          return key_label(KEY_COMPILE_GOTO, {}, .Plain), true
+    case "compile_top":           return key_label(KEY_COMPILE_TOP, {}, .Plain), true
+    case "compile_bottom":        return key_label(KEY_COMPILE_BOTTOM, {}, .Shift_Letter), true
     case "compile_yank":          return key_label(KEY_COMPILE_YANK, {}, .Plain), true
     case "compile_yank_alt":      return key_label(KEY_COMPILE_YANK_ALT, alt, .Plain), true
     case "compile_yank_all":      return key_label(KEY_COMPILE_YANK_ALL, shift, .Shift_Letter), true

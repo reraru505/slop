@@ -225,6 +225,7 @@ test_compilation_working_directory :: proc(t: ^testing.T) {
     for line in c.lines {
         if strings.trim_space(line.text) == "found" do found = true
         if strings.contains(line.text, dir) do banner = true
+        testing.expect(t, !strings.contains(line.text, "-*-"), "emacs mode banner leaked")
     }
     testing.expect_value(t, found, true)
     testing.expect_value(t, banner, true)
@@ -438,6 +439,34 @@ test_compilation_copy_sets_clipboard :: proc(t: ^testing.T) {
     }
     c.selecting = false
 
+    // End-to-end: Ctrl+X + vertical movement + M-w copies the selection.
+    c.selecting = false
+    c.cursor = 0
+    c.cursor_col = 0
+    c.desired_col = 0
+    pane: Pane
+    pane.rect = sdl.FRect{0, 0, 500, 300}
+    app.active_pane = &pane
+
+    key_ev: sdl.Event
+    key_ev.type = .KEY_DOWN
+    key_ev.key.mod = sdl.KMOD_CTRL
+    key_ev.key.key = KEY_COMPILE_VISUAL
+    compilation_handle_event(&c, &key_ev, &app, &pane)
+    key_ev.key.mod = {}
+    key_ev.key.key = KEY_COMPILE_DOWN
+    compilation_handle_event(&c, &key_ev, &app, &pane)
+    compilation_handle_event(&c, &key_ev, &app, &pane)
+    key_ev.key.mod = sdl.KMOD_ALT
+    key_ev.key.key = KEY_COMPILE_YANK_ALT
+    compilation_handle_event(&c, &key_ev, &app, &pane)
+    raw_multi := sdl.GetClipboardText()
+    testing.expect(t, raw_multi != nil)
+    if raw_multi != nil {
+        defer sdl.free(rawptr(raw_multi))
+        testing.expect_value(t, string(cstring(raw_multi)), "first line\nsecond line")
+    }
+
     compilation_copy(&c, &app, true)
     raw_all := sdl.GetClipboardText()
     testing.expect(t, raw_all != nil)
@@ -536,5 +565,53 @@ test_compilation_selection_keys_and_mouse_mapping :: proc(t: ^testing.T) {
     testing.expect_value(t, c.selecting, true)
     testing.expect_value(t, compilation_copy_text(&c, false), "lph")
 
-    fmt.println("  ✓ [Compilation] v/drag selection and mouse hit-testing")
+    // Multi-line drag: suffix + full middle line + prefix.
+    c.selecting = false
+    down.button.x = 12.0 + cell * 1.0
+    down.button.y = line_h * 1.5 + line_h * 0.5
+    compilation_handle_event(&c, &down, &app, pane)
+    motion.motion.x = 12.0 + cell * 3.0
+    motion.motion.y = line_h * 1.5 + line_h * 2.5
+    compilation_handle_event(&c, &motion, &app, pane)
+    testing.expect_value(t, compilation_copy_text(&c, false), "lpha\nbeta\ngamm")
+
+    fmt.println("  ✓ [Compilation] Ctrl+X/drag selection and mouse hit-testing")
+}
+
+@(test)
+test_compilation_g_prefix_top_bottom :: proc(t: ^testing.T) {
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+    for i in 0 ..< 5 {
+        append(&c.lines, CompilationLine{text = strings.clone(fmt.tprintf("line %d", i))})
+    }
+    compilation_set_cursor(&c, 2, 0)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+
+    ev: sdl.Event
+    ev.type = .KEY_DOWN
+
+    // Plain g arms the prefix and must not recompile.
+    ev.key.key = KEY_COMPILE_GOTO
+    ev.key.mod = {}
+    testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
+    testing.expect_value(t, c.pending_g, true)
+    testing.expect_value(t, c.cursor, 2)
+
+    // gg -> top.
+    testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
+    testing.expect_value(t, c.cursor, 0)
+    testing.expect_value(t, c.pending_g, false)
+
+    // Shift+G -> bottom.
+    ev.key.key = KEY_COMPILE_BOTTOM
+    ev.key.mod = sdl.KMOD_SHIFT
+    testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
+    testing.expect_value(t, c.cursor, 4)
+
+    fmt.println("  ✓ [Compilation] gg/G jump to top/bottom; g is not recompile")
 }
