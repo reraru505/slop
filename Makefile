@@ -1,9 +1,14 @@
-.PHONY: all build test test-verbose test-unit test-live clean
+.PHONY: all build release test test-verbose test-unit test-live clean
 
 all: build
 
 build:
 	odin build . -out:text-editor
+
+# Optimized binary for daily use. Bounds checks are off; asserts stay on so
+# problems still surface while dogfooding.
+release:
+	odin build . -o:speed -no-bounds-check -out:text-editor
 
 # Unit tests only (live LSP tests are opt-in below)
 test:
