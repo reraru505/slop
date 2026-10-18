@@ -40,20 +40,20 @@ test_editor_cursor_navigation :: proc(t: ^testing.T) {
     testing.expect_value(t, e.cursor.col, 0)
 
     // Move right via 'l'
-    editor_handle_normal_key(&e, sdl.K_L, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_RIGHT, {}, nil, nil)
     testing.expect_value(t, e.cursor.col, 1)
 
     // Move down via 'j'
-    editor_handle_normal_key(&e, sdl.K_J, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_DOWN, {}, nil, nil)
     testing.expect_value(t, e.cursor.row, 1)
     testing.expect_value(t, e.cursor.col, 1)
 
     // Move left via 'h'
-    editor_handle_normal_key(&e, sdl.K_H, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_LEFT, {}, nil, nil)
     testing.expect_value(t, e.cursor.col, 0)
 
     // Move up via 'k'
-    editor_handle_normal_key(&e, sdl.K_K, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_UP, {}, nil, nil)
     testing.expect_value(t, e.cursor.row, 0)
     testing.expect_value(t, e.cursor.col, 0)
 
@@ -531,11 +531,11 @@ test_editor_visual_columns_with_tabs :: proc(t: ^testing.T) {
     e.cursor.row = 0
     e.cursor.col = 2
     e.desired_col = editor_visual_col(&e, 0, e.cursor.col) // visual 5
-    editor_handle_normal_key(&e, sdl.K_J, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_DOWN, {}, nil, nil)
     testing.expect_value(t, e.cursor.row, 1)
     testing.expect_value(t, editor_visual_col(&e, 1, e.cursor.col), 5)
     testing.expect_value(t, e.cursor.col, 2)
-    editor_handle_normal_key(&e, sdl.K_K, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_UP, {}, nil, nil)
     testing.expect_value(t, e.cursor.row, 0)
     testing.expect_value(t, e.cursor.col, 2)
     fmt.println("  ✓ [Editor] byte<->visual columns map tabs and preserve desired column")
@@ -619,13 +619,13 @@ test_editor_visual_line_select_and_delete :: proc(t: ^testing.T) {
 
     e.cursor.row = 1
     e.cursor.col = 1
-    testing.expect_value(t, editor_handle_normal_key(&e, sdl.K_X, {}, nil, nil), true)
+    testing.expect_value(t, editor_handle_normal_key(&e, KEY_SELECT_LINE, {}, nil, nil), true)
     testing.expect_value(t, e.mode, EditorMode.Visual)
     testing.expect_value(t, e.selection_anchor.row, 1)
     testing.expect_value(t, e.selection_anchor.col, 0)
     testing.expect_value(t, e.cursor.col, 3)
 
-    testing.expect_value(t, editor_handle_normal_key(&e, sdl.K_D, {}, nil, nil), true)
+    testing.expect_value(t, editor_handle_normal_key(&e, KEY_DELETE_SELECTION, {}, nil, nil), true)
     text := pt_full_text(&e.table)
     defer delete(text)
     testing.expect_value(t, text, "aaa\nccc")
@@ -634,8 +634,8 @@ test_editor_visual_line_select_and_delete :: proc(t: ^testing.T) {
     // X extends line selection and D removes the final line
     e.cursor.row = 1
     e.cursor.col = 0
-    editor_handle_normal_key(&e, sdl.K_X, {}, nil, nil)
-    editor_handle_normal_key(&e, sdl.K_D, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_SELECT_LINE, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_DELETE_SELECTION, {}, nil, nil)
     text2 := pt_full_text(&e.table)
     defer delete(text2)
     testing.expect_value(t, text2, "aaa")
@@ -649,14 +649,14 @@ test_editor_delete_char_forward :: proc(t: ^testing.T) {
     defer editor_destroy(&e)
 
     // Mid-line d deletes the character under the cursor
-    testing.expect_value(t, editor_handle_normal_key(&e, sdl.K_D, {}, nil, nil), true)
+    testing.expect_value(t, editor_handle_normal_key(&e, KEY_DELETE_CHAR, {}, nil, nil), true)
     text := pt_full_text(&e.table)
     defer delete(text)
     testing.expect_value(t, text, "b\ncd")
 
     // At EOL d joins the next line
     e.cursor.col = 1
-    editor_handle_normal_key(&e, sdl.K_D, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_DELETE_CHAR, {}, nil, nil)
     text2 := pt_full_text(&e.table)
     defer delete(text2)
     testing.expect_value(t, text2, "bcd")
@@ -764,40 +764,40 @@ test_editor_normal_navigation :: proc(t: ^testing.T) {
     // desired_col survives travel over a shorter line
     e.cursor.col = 6
     e.desired_col = 6
-    editor_handle_normal_key(&e, sdl.K_J, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_DOWN, {}, nil, nil)
     testing.expect_value(t, e.cursor.row, 1)
     testing.expect_value(t, e.cursor.col, 6)
-    editor_handle_normal_key(&e, sdl.K_J, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_DOWN, {}, nil, nil)
     testing.expect_value(t, e.cursor.row, 2)
     testing.expect_value(t, e.cursor.col, 6)
-    editor_handle_normal_key(&e, sdl.K_K, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_UP, {}, nil, nil)
     testing.expect_value(t, e.cursor.row, 1)
     testing.expect_value(t, e.cursor.col, 6)
-    editor_handle_normal_key(&e, sdl.K_K, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_UP, {}, nil, nil)
     testing.expect_value(t, e.cursor.row, 0)
 
     // gg / G
-    editor_handle_normal_key(&e, sdl.K_G, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_GOTO, {}, nil, nil)
     testing.expect_value(t, e.pending_cmd, 'g')
-    editor_handle_normal_key(&e, sdl.K_G, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_GOTO, {}, nil, nil)
     testing.expect_value(t, e.cursor.row, 0)
     testing.expect_value(t, e.cursor.col, 0)
-    editor_handle_normal_key(&e, sdl.K_G, sdl.KMOD_SHIFT, nil, nil)
+    editor_handle_normal_key(&e, KEY_FILE_END, sdl.KMOD_SHIFT, nil, nil)
     testing.expect_value(t, e.cursor.row, 2)
     testing.expect_value(t, e.cursor.col, 0)
 
     // 0 / $ / H / L
-    editor_handle_normal_key(&e, sdl.K_4, sdl.KMOD_SHIFT, nil, nil)
+    editor_handle_normal_key(&e, KEY_LINE_END_DOLLAR, sdl.KMOD_SHIFT, nil, nil)
     testing.expect_value(t, e.cursor.col, 9)
-    editor_handle_normal_key(&e, sdl.K_0, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_LINE_START_ZERO, {}, nil, nil)
     testing.expect_value(t, e.cursor.col, 0)
-    editor_handle_normal_key(&e, sdl.K_H, sdl.KMOD_SHIFT, nil, nil)
+    editor_handle_normal_key(&e, KEY_LINE_START, sdl.KMOD_SHIFT, nil, nil)
     testing.expect_value(t, e.cursor.col, 0)
-    editor_handle_normal_key(&e, sdl.K_L, sdl.KMOD_SHIFT, nil, nil)
+    editor_handle_normal_key(&e, KEY_LINE_END, sdl.KMOD_SHIFT, nil, nil)
     testing.expect_value(t, e.cursor.col, 9)
-    editor_handle_normal_key(&e, sdl.K_H, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_LEFT, {}, nil, nil)
     testing.expect_value(t, e.cursor.col, 8)
-    editor_handle_normal_key(&e, sdl.K_L, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_MOVE_RIGHT, {}, nil, nil)
     testing.expect_value(t, e.cursor.col, 9)
     fmt.println("  ✓ [Editor] h/j/k/l, gg, G, 0, $, H, L navigation verified")
 }
@@ -809,25 +809,25 @@ test_editor_mode_entry_keys :: proc(t: ^testing.T) {
     defer editor_destroy(&e)
     e.cursor.col = 1
 
-    editor_handle_normal_key(&e, sdl.K_I, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_INSERT_BEFORE, {}, nil, nil)
     testing.expect_value(t, e.mode, EditorMode.Insert)
     testing.expect_value(t, e.cursor.col, 1)
 
     editor_set_mode(&e, .Normal, nil)
     e.cursor.col = 1
-    editor_handle_normal_key(&e, sdl.K_I, sdl.KMOD_SHIFT, nil, nil)
+    editor_handle_normal_key(&e, KEY_INSERT_LINE_START, sdl.KMOD_SHIFT, nil, nil)
     testing.expect_value(t, e.mode, EditorMode.Insert)
     testing.expect_value(t, e.cursor.col, 0)
 
     editor_set_mode(&e, .Normal, nil)
     e.cursor.col = 1
-    editor_handle_normal_key(&e, sdl.K_A, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_APPEND, {}, nil, nil)
     testing.expect_value(t, e.mode, EditorMode.Insert)
     testing.expect_value(t, e.cursor.col, 2)
 
     editor_set_mode(&e, .Normal, nil)
     e.cursor.col = 1
-    editor_handle_normal_key(&e, sdl.K_A, sdl.KMOD_SHIFT, nil, nil)
+    editor_handle_normal_key(&e, KEY_APPEND_LINE_END, sdl.KMOD_SHIFT, nil, nil)
     testing.expect_value(t, e.mode, EditorMode.Insert)
     testing.expect_value(t, e.cursor.col, 3)
     fmt.println("  ✓ [Editor] i/a/I/A mode entry and cursor placement verified")
@@ -840,7 +840,7 @@ test_editor_open_line_keys :: proc(t: ^testing.T) {
     editor_init(&e, nil, "abc")
     defer editor_destroy(&e)
     e.cursor.col = 1
-    editor_handle_normal_key(&e, sdl.K_O, {}, nil, nil)
+    editor_handle_normal_key(&e, KEY_OPEN_BELOW, {}, nil, nil)
     text := pt_full_text(&e.table)
     defer delete(text)
     testing.expect_value(t, text, "abc\n")
@@ -853,7 +853,7 @@ test_editor_open_line_keys :: proc(t: ^testing.T) {
     editor_init(&e2, nil, "abc")
     defer editor_destroy(&e2)
     e2.cursor.col = 1
-    editor_handle_normal_key(&e2, sdl.K_O, sdl.KMOD_SHIFT, nil, nil)
+    editor_handle_normal_key(&e2, KEY_OPEN_ABOVE, sdl.KMOD_SHIFT, nil, nil)
     text2 := pt_full_text(&e2.table)
     defer delete(text2)
     testing.expect_value(t, text2, "\nabc")
@@ -1036,17 +1036,17 @@ test_editor_undo_redo_keys :: proc(t: ^testing.T) {
     testing.expect_value(t, text, "hello")
 
     editor_set_mode(&e, .Normal, nil)
-    send_key_event(&e, sdl.K_U)
+    send_key_event(&e, KEY_UNDO)
     undone := pt_full_text(&e.table)
     defer delete(undone)
     testing.expect_value(t, undone, "")
 
-    send_key_event(&e, sdl.K_R, sdl.KMOD_CTRL)
+    send_key_event(&e, KEY_REDO, sdl.KMOD_CTRL)
     redone := pt_full_text(&e.table)
     defer delete(redone)
     testing.expect_value(t, redone, "hello")
 
-    send_key_event(&e, sdl.K_Z, sdl.KMOD_CTRL)
+    send_key_event(&e, KEY_UNDO_ALT, sdl.KMOD_CTRL)
     undone2 := pt_full_text(&e.table)
     defer delete(undone2)
     testing.expect_value(t, undone2, "")
@@ -1216,22 +1216,22 @@ test_editor_undo_grouping_typing_burst :: proc(t: ^testing.T) {
     testing.expect_value(t, text, "hello")
 
     editor_set_mode(&e, .Normal, nil)
-    send_key_event(&e, sdl.K_U)
+    send_key_event(&e, KEY_UNDO)
     undone := pt_full_text(&e.table)
     defer delete(undone)
     testing.expect_value(t, undone, "")
-    send_key_event(&e, sdl.K_0)
+    send_key_event(&e, KEY_LINE_START_ZERO)
 
     // A motion starts a new group: only the second burst is undone.
     editor_set_mode(&e, .Insert, nil)
     simulate_typing(&e, "ab")
     editor_set_mode(&e, .Normal, nil)
-    send_key_event(&e, sdl.K_H)
+    send_key_event(&e, KEY_MOVE_LEFT)
     editor_set_mode(&e, .Insert, nil)
     simulate_typing(&e, "cd")
     editor_set_mode(&e, .Normal, nil)
 
-    send_key_event(&e, sdl.K_U)
+    send_key_event(&e, KEY_UNDO)
     after_undo := pt_full_text(&e.table)
     defer delete(after_undo)
     testing.expect_value(t, after_undo, "ab")

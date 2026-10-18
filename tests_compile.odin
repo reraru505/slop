@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:strings"
 import "core:testing"
+import sdl "vendor:sdl3"
 
 destroy_parsed_line :: proc(line: ^CompilationLine) {
     if line.text != "" do delete(line.text)
@@ -160,4 +161,30 @@ test_compilation_run_command_failure_parses_errors :: proc(t: ^testing.T) {
     last := c.lines[len(c.lines) - 1]
     testing.expect_value(t, last.is_error, true)
     fmt.println("  ✓ [Compilation] failing command produces parsed diagnostics")
+}
+
+@(test)
+test_compilation_dispatch_uses_config_keys :: proc(t: ^testing.T) {
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+    for i in 0 ..< 3 {
+        append(&c.lines, CompilationLine{text = strings.clone(fmt.tprintf("line %d", i))})
+    }
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+
+    ev: sdl.Event
+    ev.type = .KEY_DOWN
+    ev.key.key = KEY_COMPILE_DOWN
+    ev.key.mod = {}
+    testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
+    testing.expect_value(t, c.cursor, 1)
+
+    ev.key.key = KEY_COMPILE_UP
+    testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
+    testing.expect_value(t, c.cursor, 0)
+    fmt.println("  ✓ [Compilation] dispatch follows configured key constants")
 }

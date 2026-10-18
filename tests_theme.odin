@@ -111,13 +111,13 @@ test_theme_from_name :: proc(t: ^testing.T) {
     testing.expect_value(t, ok, true)
     testing.expect_value(t, id, ThemeId.Hemisu)
 
-    // Unknown names fall back to the default theme but report failure
+    // Unknown names fall back to the configured default theme but report failure
     id, ok = theme_from_name("solarized")
     testing.expect_value(t, ok, false)
-    testing.expect_value(t, id, ThemeId.GruberDarker)
+    testing.expect_value(t, id, DEFAULT_THEME)
 
     id, ok = theme_from_name("")
     testing.expect_value(t, ok, false)
-    testing.expect_value(t, id, ThemeId.GruberDarker)
+    testing.expect_value(t, id, DEFAULT_THEME)
     fmt.println("  ✓ [Theme] case-insensitive name lookup and fallback verified")
 }

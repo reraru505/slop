@@ -386,7 +386,9 @@ app_open_help :: proc(app: ^App) {
     if help_pane == nil do return
     help_pane.kind = .Editor
     editor_destroy(&help_pane.editor)
-    editor_init(&help_pane.editor, &app.font, HELP_TEXT, HELP_FILE_PATH)
+    help_text := help_render(context.allocator)
+    defer delete(help_text)
+    editor_init(&help_pane.editor, &app.font, help_text, HELP_FILE_PATH)
     help_pane.editor.read_only = true
     help_pane.editor.dirty = false
 }
@@ -679,7 +681,7 @@ load :: proc(app: ^App) {
     // HIGH_PIXEL_DENSITY makes the backbuffer match the display scale; without
     // it SDL renders at 1x and the compositor upscales, blurring all text.
     flags := sdl.WINDOW_RESIZABLE | sdl.WINDOW_HIGH_PIXEL_DENSITY
-    if !sdl.CreateWindowAndRenderer("Odin Text Editor", 1024, 768, flags, &app.window, &app.renderer) {
+    if !sdl.CreateWindowAndRenderer(WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT, flags, &app.window, &app.renderer) {
         panic("Failed to create SDL window and renderer")
     }
 
@@ -842,22 +844,22 @@ update :: proc(app: ^App) {
             }
 
             // Zoom controls
-            if is_ctrl && (key == sdl.K_EQUALS || key == sdl.K_KP_PLUS) {
+            if is_ctrl && (key == KEY_ZOOM_IN || key == KEY_ZOOM_IN_ALT) {
                 global_ui_scale = min(2.5, global_ui_scale + 0.1)
                 app_reload_font(app)
                 app_set_message(app, fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0))
                 continue
             }
-            if is_ctrl && (key == sdl.K_MINUS || key == sdl.K_KP_MINUS) {
+            if is_ctrl && (key == KEY_ZOOM_OUT || key == KEY_ZOOM_OUT_ALT) {
                 global_ui_scale = max(0.5, global_ui_scale - 0.1)
                 app_reload_font(app)
                 app_set_message(app, fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0))
                 continue
             }
-            if is_ctrl && (key == sdl.K_0 || key == sdl.K_KP_0) {
-                global_ui_scale = 1.0
+            if is_ctrl && (key == KEY_ZOOM_RESET || key == KEY_ZOOM_RESET_ALT) {
+                global_ui_scale = DEFAULT_UI_SCALE
                 app_reload_font(app)
-                app_set_message(app, "Zoom reset (100%)")
+                app_set_message(app, fmt.tprintf("Zoom reset (%.0f%%)", global_ui_scale * 100.0))
                 continue
             }
 
@@ -865,7 +867,7 @@ update :: proc(app: ^App) {
             if app.pending_leader {
                 app.pending_leader = false
                 app.cmd_prompt.message = ""
-                if key == sdl.K_F {
+                if key == KEY_LEADER_FILES {
                     file_picker_open(&app.file_picker, app.working_dir, app.window)
                     continue
                 }
@@ -877,37 +879,40 @@ update :: proc(app: ^App) {
             // Handle pending Ctrl+w split navigation prefix
             if app.pending_w_cmd {
                 app.pending_w_cmd = false
-                switch key {
-                case sdl.K_H:
+                if key == KEY_WINDOW_LEFT {
                     app_focus_dir(app, .Left)
-                case sdl.K_J:
+                } else if key == KEY_WINDOW_DOWN {
                     app_focus_dir(app, .Down)
-                case sdl.K_K:
+                } else if key == KEY_WINDOW_UP {
                     app_focus_dir(app, .Up)
-                case sdl.K_L:
+                } else if key == KEY_WINDOW_RIGHT {
                     app_focus_dir(app, .Right)
-                case sdl.K_S:
+                } else if key == KEY_WINDOW_SPLIT_H {
                     app_split_pane(app, app.active_pane, .Horizontal)
-                case sdl.K_V:
+                } else if key == KEY_WINDOW_SPLIT_V {
                     app_split_pane(app, app.active_pane, .Vertical)
-                case sdl.K_W:
+                } else if key == KEY_WINDOW_CYCLE {
                     app_cycle_pane(app)
-                case sdl.K_Q, sdl.K_C:
+                } else if key == KEY_WINDOW_CLOSE || key == KEY_WINDOW_CLOSE_ALT {
                     app_close_pane(app, app.active_pane)
                 }
                 continue
             }
 
             // Check for Ctrl+w initiation (when not in Insert mode)
-            if !is_insert && is_ctrl && key == sdl.K_W {
+            if !is_insert && is_ctrl && key == KEY_WINDOW_PREFIX {
                 app.pending_w_cmd = true
                 continue
             }
 
             // Trigger leader key on Space when not in Insert mode
-            if !is_insert && !is_ctrl && !is_alt && key == sdl.K_SPACE {
+            if !is_insert && !is_ctrl && !is_alt && key == KEY_LEADER {
                 app.pending_leader = true
-                app_set_message(app, "Leader: <Space> (f: file picker)")
+                app_set_message(app, fmt.tprintf(
+                    "Leader: <%s> (%s: file picker)",
+                    key_label(KEY_LEADER, {}, .Plain),
+                    key_label(KEY_LEADER_FILES, {}, .Plain),
+                ))
                 continue
             }
         }
@@ -1133,11 +1138,23 @@ draw :: proc(app: ^App) {
             push_line(&app.font, sugg_str, Vec2{cur_x + 8.0, main_area_h + 3.0}, app.theme.comment, .HALF)
         }
     } else if app.pending_w_cmd {
+        pane_hint := fmt.tprintf(
+            "%s (%s: split, %s: vsplit, %s/%s/%s/%s: move, %s: cycle, %s: close)",
+            key_label(KEY_WINDOW_PREFIX, sdl.KMOD_CTRL, .Plain),
+            key_label(KEY_WINDOW_SPLIT_H, {}, .Plain),
+            key_label(KEY_WINDOW_SPLIT_V, {}, .Plain),
+            key_label(KEY_WINDOW_LEFT, {}, .Plain),
+            key_label(KEY_WINDOW_DOWN, {}, .Plain),
+            key_label(KEY_WINDOW_UP, {}, .Plain),
+            key_label(KEY_WINDOW_RIGHT, {}, .Plain),
+            key_label(KEY_WINDOW_CYCLE, {}, .Plain),
+            key_label(KEY_WINDOW_CLOSE, {}, .Plain),
+        )
         push_line(
-           &app.font, 
-           "Ctrl+W (s: split, v: vsplit, h/j/k/l: move, w: cycle, q: close)", 
-           Vec2{10.0, main_area_h + 3.0}, 
-           sdl.FColor{0.95, 0.6, 0.2, 1.0}, 
+           &app.font,
+           pane_hint,
+           Vec2{10.0, main_area_h + 3.0},
+           sdl.FColor{0.95, 0.6, 0.2, 1.0},
            .HALF ,
          )
     } else if app.cmd_prompt.message != "" {

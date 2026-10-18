@@ -4,61 +4,61 @@ Odin Text Editor - Help
 MODES
   Normal / Insert / Visual / Command
   Esc .......... Insert -> Normal, Visual -> Normal, Normal -> Insert
-  i, I ......... insert before cursor / at start of line
-  a, A ......... insert after cursor / at end of line
-  o, O ......... open a new line below / above
-  Ctrl+X ....... toggle Visual mode
-  X ............ select the current line (press again to extend)
+  {insert}, {insert_line_start} ......... insert before cursor / at start of line
+  {append}, {append_line_end} ......... insert after cursor / at end of line
+  {open_below}, {open_above} ......... open a new line below / above
+  {visual_toggle} ....... toggle Visual mode
+  {select_line} ............ select the current line (press again to extend)
 
 MOVEMENT
-  h j k l ...... left / down / up / right (arrow keys work too)
-  H, L ......... left / right one character
-  Shift+H ...... start of line
-  Shift+L ...... end of line
-  0, $ ......... start / end of line
-  gg, G ........ top / bottom of file
-  Ctrl+L ....... next word
-  Ctrl+H ....... previous word
-  Ctrl+J ....... next scope / paragraph
-  Ctrl+K ....... previous scope / paragraph
+  {left} {down} {up} {right} ...... left / down / up / right (arrow keys work too)
+  {left_upper}, {right_upper} ......... left / right one character
+  {line_start} ...... start of line
+  {line_end} ...... end of line
+  {zero}, {dollar} ......... start / end of line
+  {gg}, {G} ........ top / bottom of file
+  {word_forward} ....... next word
+  {word_backward} ....... previous word
+  {scope_down} ....... next scope / paragraph
+  {scope_up} ....... previous scope / paragraph
   Mouse wheel .. scroll the active pane
 
 EDITING
-  d ............ delete character; at end of line, join the next line
-  X then D ..... delete selected line(s)
-  Ctrl+Y ....... paste the clipboard
-  Visual D ..... delete selection
-  Visual C ..... change selection (delete, then Insert mode)
-  Visual Y ..... yank selection to the clipboard (also Alt+W)
-  u, Ctrl+Z .... undo
-  Ctrl+R ....... redo
-  Alt+J, Alt+K . move line or selection down / up
+  {delete_char} ............ delete character; at end of line, join the next line
+  {select_line} then {delete_selection} ..... delete selected line(s)
+  {paste} ....... paste the clipboard
+  Visual {delete_selection} ..... delete selection
+  Visual {change_selection} ..... change selection (delete, then Insert mode)
+  Visual {yank_selection} ..... yank selection to the clipboard (also {yank_alt})
+  {undo}, {undo_alt} .... undo
+  {redo} ....... redo
+  {move_line_down}, {move_line_up} . move line or selection down / up
   Tab .......... insert four spaces (Insert mode)
   Enter ........ keep indentation; inside () [] {} it expands the pair
   ( [ { ' " .... auto-pair; typing the closing character steps over it
   Backspace .... removes an empty pair; at column 0 it joins with above
 
 LSP (when a language server is available)
-  Ctrl+Space ... trigger completion
+  {completion_trigger} ... trigger completion
   Tab/Shift+Tab  cycle completion items
   Enter ........ accept completion
   Shift+Enter .. open documentation in a split
   Esc .......... dismiss completion
-  gd ........... go to definition
-  K ............ hover documentation
-  == ........... format the current line
-  Visual = ..... format the selected lines
+  {gd} ........... go to definition
+  {hover} ............ hover documentation
+  {format_line} ........... format the current line
+  Visual {format_selection} ..... format the selected lines
   Diagnostics are underlined; the message appears in the status bar
 
-COMMANDS  (type ':' in Normal mode)
+COMMANDS  (type '{cmd_prompt}' in Normal mode)
   :w  :q  :wq  :x       write / quit / write and quit
   :q!  :qa  :qa!        force-close buffer / quit all / force quit all
   :<n>  :goto <n>       jump to line n
   :e <path>             edit a file or directory
-  :sp [file]            horizontal split (also Ctrl+W s)
-  :vs [file]            vertical split (also Ctrl+W v)
+  :sp [file]            horizontal split (also {split_h})
+  :vs [file]            vertical split (also {split_v})
   :dired                open the directory browser
-  :files                open the file picker (also Space f)
+  :files                open the file picker (also {leader} {files})
   :compile [command]    run a build command
   :recompile            repeat the last build
   :cnext  :cprev        next / previous compiler error
@@ -66,32 +66,32 @@ COMMANDS  (type ':' in Normal mode)
   :theme [name]         cycle themes or set one by name
   :sort [name|size|time|rev]  sort the current dired listing
   :cd <dir>  :pwd       change / show the working directory
-  :zoom <0.5-2.5>       UI scale (Ctrl+= / Ctrl+- / Ctrl+0)
-  :linespace <1.0-2.0>  line-height multiplier (default 1.0 = font metrics)
+  :zoom <0.5-2.5>       UI scale ({zoom_in} / {zoom_out} / {zoom_reset})
+  :linespace <1.0-2.0>  line-height multiplier (default {line_spacing_default} = font metrics)
   :help                 this screen
   Tab / Shift+Tab ..... complete command names and arguments
 
 PANES
-  Ctrl+W h j k l ....... focus the pane left / down / up / right
-  Ctrl+W s / v ......... split horizontally / vertically
-  Ctrl+W w ............. cycle panes
-  Ctrl+W q / c ......... close the focused pane
+  {window_prefix} {pane_left} {pane_down} {pane_up} {pane_right} ....... focus the pane left / down / up / right
+  {split_h} / {split_v_key} ......... split horizontally / vertically
+  {pane_cycle} ............. cycle panes
+  {pane_close} / {pane_close_alt_key} ......... close the focused pane
 
 DIRED  (directory browser)
-  j k, Ctrl+J/K ........ move by one / five entries
-  Enter or L ........... open a file or enter a directory
-  h or - ............... go to the parent directory
-  i or Esc ............. edit the listing (wdired)
+  {dired_down} {dired_up}, {dired_pages} ........ move by one / five entries
+  Enter or {dired_open} ........... open a file or enter a directory
+  {dired_parent} or {dired_parent_alt} ............... go to the parent directory
+  {dired_edit} or Esc ............. edit the listing (wdired)
                          :w applies changes, :q cancels
-  s / S ................ cycle sort order / reverse it
-  q .................... return to the previous buffer or close the pane
+  {dired_sort} / {dired_sort_reverse} ................ cycle sort order / reverse it
+  {dired_quit} .................... return to the previous buffer or close the pane
 
 COMPILATION BUFFER
-  j k .................. move through output
-  n / p ................ next / previous error
-  Enter or L ........... jump to the error location
-  r or g ............... recompile
-  q .................... close the pane
+  {compile_down} {compile_up} .................. move through output
+  {compile_next_error} / {compile_prev_error} ................ next / previous error
+  Enter or {compile_jump} ........... jump to the error location
+  {compile_recompile} or {compile_recompile_alt} ............... recompile
+  {compile_quit} .................... close the pane
 
 Help buffers and LSP documentation splits are read-only; navigation and
 command mode still work. Close this buffer with :q

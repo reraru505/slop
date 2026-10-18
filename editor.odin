@@ -1035,6 +1035,33 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     is_shift := (mod & sdl.KMOD_SHIFT) != {}
     is_ctrl  := (mod & sdl.KMOD_CTRL) != {}
 
+    // Ctrl+Space: explicit autocomplete trigger
+    if is_ctrl && key == KEY_COMPLETION_TRIGGER {
+        trigger_col := e.cursor.col
+        line_start := pt_line_to_offset(&e.table, e.cursor.row)
+        for trigger_col > 0 {
+            prev_char := pt_byte_at(&e.table, line_start + trigger_col - 1)
+            if (prev_char >= 'a' && prev_char <= 'z') || (prev_char >= 'A' && prev_char <= 'Z') || (prev_char >= '0' && prev_char <= '9') || prev_char == '_' {
+                trigger_col -= 1
+            } else {
+                break
+            }
+        }
+        e.completion.trigger_row = e.cursor.row
+        e.completion.trigger_col = trigger_col
+        lsp := app_get_lsp_for_file(app, e.file_path)
+        if lsp != nil && lsp.running && e.file_path != "" {
+            if e.needs_lsp_sync {
+                e.needs_lsp_sync = false
+                full_text := pt_full_text(&e.table)
+                defer delete(full_text)
+                lsp_did_change(lsp, e.file_path, full_text)
+            }
+            lsp_request_completion(lsp, e.file_path, e.cursor.row, e.cursor.col)
+        }
+        return true
+    }
+
     switch key {
     case sdl.K_ESCAPE:
         if e.completion.active {
@@ -1128,32 +1155,6 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
 
     case sdl.K_SPACE:
-        if is_ctrl {
-            // Ctrl+Space: explicit autocomplete trigger
-            trigger_col := e.cursor.col
-            line_start := pt_line_to_offset(&e.table, e.cursor.row)
-            for trigger_col > 0 {
-                prev_char := pt_byte_at(&e.table, line_start + trigger_col - 1)
-                if (prev_char >= 'a' && prev_char <= 'z') || (prev_char >= 'A' && prev_char <= 'Z') || (prev_char >= '0' && prev_char <= '9') || prev_char == '_' {
-                    trigger_col -= 1
-                } else {
-                    break
-                }
-            }
-            e.completion.trigger_row = e.cursor.row
-            e.completion.trigger_col = trigger_col
-            lsp := app_get_lsp_for_file(app, e.file_path)
-            if lsp != nil && lsp.running && e.file_path != "" {
-                if e.needs_lsp_sync {
-                    e.needs_lsp_sync = false
-                    full_text := pt_full_text(&e.table)
-                    defer delete(full_text)
-                    lsp_did_change(lsp, e.file_path, full_text)
-                }
-                lsp_request_completion(lsp, e.file_path, e.cursor.row, e.cursor.col)
-            }
-            return true
-        }
         e.completion.active = false
         return false
 
@@ -1332,12 +1333,12 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     // Multi-key commands
     if e.pending_cmd == 'g' {
         e.pending_cmd = 0
-        if key == sdl.K_G {
+        if key == KEY_GOTO {
             e.cursor.row = 0
             e.cursor.col = 0
             return true
         }
-        if key == sdl.K_D {
+        if key == KEY_GOTO_DEFINITION {
             // gd: Go to definition
             lsp := app_get_lsp_for_file(app, e.file_path)
             if lsp != nil && lsp.running && e.file_path != "" {
@@ -1350,7 +1351,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
 
     if e.pending_cmd == '=' {
         e.pending_cmd = 0
-        if key == sdl.K_EQUALS {
+        if key == KEY_FORMAT_LINE {
             // ==: Format current line
             lsp := app_get_lsp_for_file(app, e.file_path)
             if lsp != nil && lsp.running && e.file_path != "" {
@@ -1362,33 +1363,33 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     }
 
     // Ctrl+l: word forward
-    if is_ctrl && key == sdl.K_L {
+    if is_ctrl && key == KEY_WORD_FORWARD {
         editor_motion_word_forward(e)
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
     }
 
     // Ctrl+h: word backward
-    if is_ctrl && key == sdl.K_H {
+    if is_ctrl && key == KEY_WORD_BACKWARD {
         editor_motion_word_backward(e)
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
     }
 
     // Ctrl+j: scope / paragraph jump down
-    if is_ctrl && key == sdl.K_J {
+    if is_ctrl && key == KEY_SCOPE_DOWN {
         editor_motion_scope_down(e)
         return true
     }
 
     // Ctrl+k: scope / paragraph jump up
-    if is_ctrl && key == sdl.K_K {
+    if is_ctrl && key == KEY_SCOPE_UP {
         editor_motion_scope_up(e)
         return true
     }
 
     // Ctrl+x: toggle visual mode selection
-    if is_ctrl && key == sdl.K_X {
+    if is_ctrl && key == KEY_VISUAL_TOGGLE {
         if e.mode == .Visual {
             editor_set_mode(e, .Normal, window)
         } else {
@@ -1400,177 +1401,191 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     }
 
     // Colon ':' opens global command prompt
-    if key == sdl.K_COLON || (key == sdl.K_SEMICOLON && is_shift) {
+    if key == KEY_CMD_PROMPT || (key == KEY_CMD_PROMPT_ALT && is_shift) {
         app_open_command_prompt(app)
         return true
     }
 
-    switch key {
     // ESC = Insert / Normal toggle
-    case sdl.K_ESCAPE:
+    if key == sdl.K_ESCAPE {
         if e.mode == .Visual {
             editor_set_mode(e, .Normal, window)
         } else {
             editor_set_mode(e, .Insert, window)
         }
         return true
+    }
 
-    // H: Jump to start of line
-    case sdl.K_H:
-        if is_shift {
-            e.cursor.col = 0
-            e.desired_col = 0
-            return true
-        }
+    // Shift+H: start of line; h: left
+    if is_shift && key == KEY_LINE_START {
+        e.cursor.col = 0
+        e.desired_col = 0
+        return true
+    }
+    if key == KEY_MOVE_LEFT {
         e.cursor.col = max(0, e.cursor.col - 1)
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
+    }
 
-    // L: Jump to end of line or right (virtual edit)
-    case sdl.K_L:
-        if is_shift {
-            e.cursor.col = line_len
-            e.desired_col = editor_visual_col(e, e.cursor.row, line_len)
-            return true
-        }
+    // Shift+L: end of line; l: right (virtual edit)
+    if is_shift && key == KEY_LINE_END {
+        e.cursor.col = line_len
+        e.desired_col = editor_visual_col(e, e.cursor.row, line_len)
+        return true
+    }
+    if key == KEY_MOVE_RIGHT {
         e.cursor.col += 1
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
+    }
 
-    // Navigation: j, k
-    case sdl.K_J, sdl.K_DOWN:
+    // Navigation: j, down
+    if key == KEY_MOVE_DOWN || key == sdl.K_DOWN {
         if e.cursor.row + 1 < total_lines {
             e.cursor.row += 1
             e.cursor.col = editor_byte_col_for_visual(e, e.cursor.row, e.desired_col)
         }
         return true
+    }
 
-    case sdl.K_K, sdl.K_UP:
-        if key == sdl.K_K && is_shift {
-            // K: Hover
-            lsp := app_get_lsp_for_file(app, e.file_path)
-            if lsp != nil && lsp.running && e.file_path != "" {
-                lsp_request_hover(lsp, e.file_path, e.cursor.row, e.cursor.col)
-                app_set_message(app, "LSP: Requesting hover...")
-            }
-            return true
+    // Shift+K: hover; k, up: move up
+    if is_shift && key == KEY_HOVER {
+        lsp := app_get_lsp_for_file(app, e.file_path)
+        if lsp != nil && lsp.running && e.file_path != "" {
+            lsp_request_hover(lsp, e.file_path, e.cursor.row, e.cursor.col)
+            app_set_message(app, "LSP: Requesting hover...")
         }
+        return true
+    }
+    if key == KEY_MOVE_UP || key == sdl.K_UP {
         if e.cursor.row > 0 {
             e.cursor.row -= 1
             e.cursor.col = editor_byte_col_for_visual(e, e.cursor.row, e.desired_col)
         }
         return true
+    }
 
-    case sdl.K_EQUALS:
-        if e.mode == .Visual {
-            start_row := min(e.cursor.row, e.selection_anchor.row)
-            end_row := max(e.cursor.row, e.selection_anchor.row)
-            lsp := app_get_lsp_for_file(app, e.file_path)
-            if lsp != nil && lsp.running && e.file_path != "" {
-                lsp_request_range_formatting(lsp, e.file_path, start_row, end_row)
-                app_set_message(app, fmt.tprintf("LSP: Formatting lines %d-%d...", start_row + 1, end_row + 1))
-            }
-            editor_set_mode(e, .Normal, window)
-            return true
-        } else {
-            e.pending_cmd = '='
-            return true
+    // =: format selection in Visual, arm == in Normal
+    if e.mode == .Visual && key == KEY_FORMAT_SELECTION {
+        start_row := min(e.cursor.row, e.selection_anchor.row)
+        end_row := max(e.cursor.row, e.selection_anchor.row)
+        lsp := app_get_lsp_for_file(app, e.file_path)
+        if lsp != nil && lsp.running && e.file_path != "" {
+            lsp_request_range_formatting(lsp, e.file_path, start_row, end_row)
+            app_set_message(app, fmt.tprintf("LSP: Formatting lines %d-%d...", start_row + 1, end_row + 1))
         }
+        editor_set_mode(e, .Normal, window)
+        return true
+    }
+    if e.mode != .Visual && key == KEY_FORMAT_LINE {
+        e.pending_cmd = '='
+        return true
+    }
 
-    case sdl.K_LEFT:
+    if key == sdl.K_LEFT {
         e.cursor.col = max(0, e.cursor.col - 1)
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
+    }
 
-    case sdl.K_RIGHT:
+    if key == sdl.K_RIGHT {
         e.cursor.col += 1
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
         return true
+    }
 
     // Line start / end
-    case sdl.K_0:
+    if key == KEY_LINE_START_ZERO {
         e.cursor.col = 0
         e.desired_col = 0
         return true
+    }
 
-    case sdl.K_4:
-        if is_shift {
-            e.cursor.col = line_len
-            e.desired_col = 999999
-            return true
-        }
+    if is_shift && key == KEY_LINE_END_DOLLAR {
+        e.cursor.col = line_len
+        e.desired_col = 999999
+        return true
+    }
 
     // Top / bottom
-    case sdl.K_G:
-        if is_shift {
-            e.cursor.row = max(0, total_lines - 1)
-            e.cursor.col = 0
-        } else {
-            e.pending_cmd = 'g'
-        }
+    if is_shift && key == KEY_FILE_END {
+        e.cursor.row = max(0, total_lines - 1)
+        e.cursor.col = 0
         return true
+    }
+    if key == KEY_GOTO {
+        e.pending_cmd = 'g'
+        return true
+    }
 
-    case sdl.K_Q:
+    if key == KEY_DIRED_EDIT_CANCEL {
         if app.active_pane != nil && app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
             app.active_pane.dired.is_editing = false
             _ = sdl.StopTextInput(window)
             app_set_message(app, "Dired: edit cancelled")
             return true
         }
+    }
 
     // Dash '-' opens parent directory in Dired
-    case sdl.K_MINUS:
+    if key == KEY_OPEN_PARENT_DIR {
         dir := filepath.dir(e.file_path)
         if dir == "" do dir = "."
         app_open_dired(app, dir)
         return true
+    }
 
     // Enter Insert Mode
-    case sdl.K_I:
-        if e.mode != .Visual {
-            if is_shift {
-                e.cursor.col = 0
-            }
-            e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-            editor_set_mode(e, .Insert, window)
-            return true
-        }
+    if e.mode != .Visual && is_shift && key == KEY_INSERT_LINE_START {
+        e.cursor.col = 0
+        e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
+        editor_set_mode(e, .Insert, window)
+        return true
+    }
+    if e.mode != .Visual && key == KEY_INSERT_BEFORE {
+        e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
+        editor_set_mode(e, .Insert, window)
+        return true
+    }
 
-    case sdl.K_A:
-        if e.mode != .Visual {
-            if is_shift {
-                e.cursor.col = line_len
-            } else {
-                e.cursor.col += 1
-            }
-            e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-            editor_set_mode(e, .Insert, window)
-            return true
-        }
+    if e.mode != .Visual && is_shift && key == KEY_APPEND_LINE_END {
+        e.cursor.col = line_len
+        e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
+        editor_set_mode(e, .Insert, window)
+        return true
+    }
+    if e.mode != .Visual && key == KEY_APPEND {
+        e.cursor.col += 1
+        e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
+        editor_set_mode(e, .Insert, window)
+        return true
+    }
 
-    // New lines (o, O, Enter)
-    case sdl.K_O, sdl.K_RETURN, sdl.K_KP_ENTER:
-        if e.mode != .Visual {
-            if key == sdl.K_O && is_shift {
-                start_off := pt_line_to_offset(&e.table, e.cursor.row)
-                pt_insert(&e.table, start_off, "\n")
-                e.cursor.col = 0
-                e.desired_col = 0
-            } else {
-                start_off := pt_line_to_offset(&e.table, e.cursor.row)
-                insert_pos := start_off + line_len
-                pt_insert(&e.table, insert_pos, "\n")
-                e.cursor.row += 1
-                e.cursor.col = 0
-                e.desired_col = 0
-            }
-            e.dirty = true
-            editor_set_mode(e, .Insert, window)
-            return true
-        }
+    // New lines (O above, o / Enter below)
+    if e.mode != .Visual && is_shift && key == KEY_OPEN_ABOVE {
+        start_off := pt_line_to_offset(&e.table, e.cursor.row)
+        pt_insert(&e.table, start_off, "\n")
+        e.cursor.col = 0
+        e.desired_col = 0
+        e.dirty = true
+        editor_set_mode(e, .Insert, window)
+        return true
+    }
+    if e.mode != .Visual && (key == KEY_OPEN_BELOW || key == sdl.K_RETURN || key == sdl.K_KP_ENTER) {
+        start_off := pt_line_to_offset(&e.table, e.cursor.row)
+        insert_pos := start_off + line_len
+        pt_insert(&e.table, insert_pos, "\n")
+        e.cursor.row += 1
+        e.cursor.col = 0
+        e.desired_col = 0
+        e.dirty = true
+        editor_set_mode(e, .Insert, window)
+        return true
+    }
 
     // Line selection with X (Kakoune / Helix style)
-    case sdl.K_X:
+    if key == KEY_SELECT_LINE {
         if e.mode != .Visual {
             e.mode = .Visual
             e.cursor.shape = .Block
@@ -1585,13 +1600,14 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             }
         }
         return true
+    }
 
     // Deletion with D (single char in Normal, selection in Visual)
-    case sdl.K_D:
-        if e.mode == .Visual {
-            editor_delete_selection(e)
-            return true
-        }
+    if e.mode == .Visual && key == KEY_DELETE_SELECTION {
+        editor_delete_selection(e)
+        return true
+    }
+    if e.mode != .Visual && key == KEY_DELETE_CHAR {
         if line_len > 0 && e.cursor.col < line_len {
             offset := pt_line_to_offset(&e.table, e.cursor.row) + e.cursor.col
             pt_delete_range(&e.table, offset, 1)
@@ -1602,26 +1618,26 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
             e.dirty = true
         }
         return true
+    }
 
-    case sdl.K_P:
+    if key == KEY_PASTE_NORMAL {
         editor_paste(e)
         return true
+    }
 
-    case sdl.K_Y:
-        if e.mode == .Visual {
-            editor_yank_selection(e)
-            return true
-        }
+    if e.mode == .Visual && key == KEY_YANK_SELECTION {
+        editor_yank_selection(e)
+        return true
+    }
 
-    case sdl.K_C:
-        if e.mode == .Visual {
-            editor_delete_selection(e)
-            editor_set_mode(e, .Insert, window)
-            return true
-        }
+    if e.mode == .Visual && key == KEY_CHANGE_SELECTION {
+        editor_delete_selection(e)
+        editor_set_mode(e, .Insert, window)
+        return true
+    }
 
     // Undo / Redo
-    case sdl.K_U:
+    if key == KEY_UNDO {
         pt_undo(&e.table)
         e.dirty = true
         editor_clamp_cursor(e)
@@ -1804,15 +1820,15 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                 editor_set_mode(e, .Normal, window)
                 return true
             }
-            allowed := false
-            switch key {
-            case sdl.K_LEFT, sdl.K_RIGHT, sdl.K_UP, sdl.K_DOWN,
-                 sdl.K_H, sdl.K_J, sdl.K_K, sdl.K_L,
-                 sdl.K_0, sdl.K_4, sdl.K_G,
-                 sdl.K_COLON, sdl.K_SEMICOLON:
-                allowed = true
-            case:
-            }
+            allowed :=
+                key == sdl.K_LEFT || key == sdl.K_RIGHT || key == sdl.K_UP || key == sdl.K_DOWN ||
+                key == KEY_MOVE_LEFT || key == KEY_MOVE_DOWN || key == KEY_MOVE_UP || key == KEY_MOVE_RIGHT ||
+                key == KEY_LINE_START || key == KEY_LINE_END ||
+                key == KEY_LINE_START_ZERO || key == KEY_LINE_END_DOLLAR ||
+                key == KEY_GOTO || key == KEY_FILE_END || key == KEY_HOVER ||
+                key == KEY_WORD_FORWARD || key == KEY_WORD_BACKWARD ||
+                key == KEY_SCOPE_DOWN || key == KEY_SCOPE_UP ||
+                key == KEY_CMD_PROMPT || key == KEY_CMD_PROMPT_ALT
             if !allowed {
                 e.pending_cmd = 0
                 editor_set_status_message(e, "Buffer is read-only")
@@ -1821,19 +1837,19 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
         }
 
         // A-j: Move line or selection down
-        if is_alt && key == sdl.K_J {
+        if is_alt && key == KEY_MOVE_LINE_DOWN {
             editor_move_lines(e, 1)
             return true
         }
 
         // A-k: Move line or selection up
-        if is_alt && key == sdl.K_K {
+        if is_alt && key == KEY_MOVE_LINE_UP {
             editor_move_lines(e, -1)
             return true
         }
 
         // A-w: Copy selection (yank)
-        if is_alt && key == sdl.K_W {
+        if is_alt && key == KEY_YANK_ALT {
             if e.mode == .Visual {
                 editor_yank_selection(e)
                 return true
@@ -1841,24 +1857,24 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
         }
 
         // C-y: Paste clipboard
-        if is_ctrl && key == sdl.K_Y {
+        if is_ctrl && key == KEY_PASTE_CLIPBOARD {
             editor_paste(e)
             return true
         }
 
-        if is_ctrl && key == sdl.K_S {
+        if is_ctrl && key == KEY_SAVE {
             editor_save_file(e, app)
             return true
         }
 
-        if is_ctrl && key == sdl.K_Z {
+        if is_ctrl && key == KEY_UNDO_ALT {
             pt_undo(&e.table)
             e.dirty = true
             editor_clamp_cursor(e)
             return true
         }
 
-        if is_ctrl && key == sdl.K_R {
+        if is_ctrl && key == KEY_REDO {
             pt_redo(&e.table)
             e.dirty = true
             editor_clamp_cursor(e)

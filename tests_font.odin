@@ -24,35 +24,38 @@ expect_close :: proc(t: ^testing.T, got, want: f32, what: string) {
 @(test)
 test_font_metrics_line_layout :: proc(t: ^testing.T) {
     m := font_metrics_fixture()
+    base := f32(BASE_FONT_SIZE) / m.bake_px
+    logical := f32(BASE_FONT_SIZE)
 
     expect_close(t, font_natural_height(m), 40.0, "natural height")
 
     // 100% zoom, default spacing: line height equals the font's own metrics.
-    // At BASE_FONT_SIZE=20 this is exactly 20 logical pixels (Ghostty parity).
-    expect_close(t, font_scale_for(m, .HALF, 1.0), 0.5, "HALF scale")
-    expect_close(t, font_scale_for(m, .QUAT, 1.0), 0.25, "QUAT scale")
-    expect_close(t, font_line_height_for(m, .HALF, 1.0, 1.0), 20.0, "line height @1.0")
-    expect_close(t, font_baseline_for(m, .HALF, 1.0, 1.0), 15.9665, "baseline @1.0")
+    // The fixture's natural height matches its bake size, so this is exactly
+    // BASE_FONT_SIZE logical pixels (Ghostty parity).
+    expect_close(t, font_scale_for(m, .HALF, 1.0), base, "HALF scale")
+    expect_close(t, font_scale_for(m, .QUAT, 1.0), base * 0.5, "QUAT scale")
+    expect_close(t, font_line_height_for(m, .HALF, 1.0, 1.0), logical, "line height @1.0")
+    expect_close(t, font_baseline_for(m, .HALF, 1.0, 1.0), 31.933 * base, "baseline @1.0")
 
     // Extra leading is split evenly above and below the glyph box.
-    expect_close(t, font_line_height_for(m, .HALF, 1.0, 1.25), 25.0, "line height @1.25")
-    expect_close(t, font_baseline_for(m, .HALF, 1.0, 1.25), 18.4665, "baseline @1.25")
+    expect_close(t, font_line_height_for(m, .HALF, 1.0, 1.25), logical * 1.25, "line height @1.25")
+    expect_close(t, font_baseline_for(m, .HALF, 1.0, 1.25), 36.933 * base, "baseline @1.25")
 
-    // Native-size bake: when the atlas equals BASE_FONT_SIZE (density 1,
-    // zoom 1) the scale factor is exactly 1.0, so glyphs map 1:1 to pixels.
+    // Native-size bake: the atlas matches BASE_FONT_SIZE at density 1 and
+    // zoom 1, so glyphs map 1:1 to pixels.
     native := Font_Metrics{bake_px = 20.0, ascent = 16.0, descent = 3.0, line_gap = 1.0, cell_width = 10.0}
-    expect_close(t, font_scale_for(native, .HALF, 1.0), 1.0, "native scale")
-    expect_close(t, font_line_height_for(native, .HALF, 1.0, 1.0), 20.0, "native line height")
+    expect_close(t, font_scale_for(native, .HALF, 1.0), f32(BASE_FONT_SIZE) / 20.0, "native scale")
+    expect_close(t, font_line_height_for(native, .HALF, 1.0, 1.0), logical, "native line height")
 
     // At 2x density the atlas doubles while the logical zoom stays 1x.
     hidpi_native := Font_Metrics{bake_px = 40.0, ascent = 32.0, descent = 7.0, line_gap = 1.0, cell_width = 20.0}
-    expect_close(t, font_scale_for(hidpi_native, .HALF, 1.0), 0.5, "2x density scale")
-    expect_close(t, font_line_height_for(hidpi_native, .HALF, 1.0, 1.0), 20.0, "2x density line height")
+    expect_close(t, font_scale_for(hidpi_native, .HALF, 1.0), base, "2x density scale")
+    expect_close(t, font_line_height_for(hidpi_native, .HALF, 1.0, 1.0), logical, "2x density line height")
 
     // UI zoom scales layout linearly.
-    expect_close(t, font_line_height_for(m, .HALF, 2.0, 1.0), 40.0, "line height @200% zoom")
-    expect_close(t, font_baseline_for(m, .HALF, 2.0, 1.0), 31.933, "baseline @200% zoom")
-    expect_close(t, font_line_height_for(m, .QUAT, 1.0, 1.0), 10.0, "QUAT line height")
+    expect_close(t, font_line_height_for(m, .HALF, 2.0, 1.0), logical * 2.0, "line height @200% zoom")
+    expect_close(t, font_baseline_for(m, .HALF, 2.0, 1.0), 31.933 * base * 2.0, "baseline @200% zoom")
+    expect_close(t, font_line_height_for(m, .QUAT, 1.0, 1.0), logical * 0.5, "QUAT line height")
 
     // Baking at a different resolution (HiDPI) must not change logical layout:
     // both the metrics and the bake size scale together.
@@ -61,8 +64,8 @@ test_font_metrics_line_layout :: proc(t: ^testing.T) {
     hidpi.ascent *= 2.0
     hidpi.descent *= 2.0
     hidpi.cell_width *= 2.0
-    expect_close(t, font_line_height_for(hidpi, .HALF, 1.0, 1.0), 20.0, "HiDPI line height")
-    expect_close(t, font_baseline_for(hidpi, .HALF, 1.0, 1.0), 15.9665, "HiDPI baseline")
+    expect_close(t, font_line_height_for(hidpi, .HALF, 1.0, 1.0), logical, "HiDPI line height")
+    expect_close(t, font_baseline_for(hidpi, .HALF, 1.0, 1.0), 63.866 * f32(BASE_FONT_SIZE) / 80.0, "HiDPI baseline")
     fmt.println("  ✓ [Font] line height and baseline derive from font metrics")
 }
 

@@ -241,8 +241,51 @@ test_app_linespace_command :: proc(t: ^testing.T) {
     app_execute_command(&app, "lineheight")
     testing.expect(t, strings.has_prefix(app.cmd_prompt.message, "Line spacing: 1.25"))
 
-    line_spacing = 1.0
+    line_spacing = DEFAULT_LINE_SPACING
     fmt.println("  ✓ [App] :linespace adjusts and validates line-height multiplier")
+}
+
+@(test)
+test_help_template_tokens_render :: proc(t: ^testing.T) {
+    rendered := help_render(context.allocator)
+    defer delete(rendered)
+
+    // Empty braces and a lone opening brace in prose must survive untouched.
+    testing.expect(t, strings.contains(rendered, "() [] {}"))
+    testing.expect(t, strings.contains(rendered, "( [ { ' \""))
+
+    // Every non-empty token in the template must resolve.
+    template := HELP_TEMPLATE
+    for i := 0; i < len(template); i += 1 {
+        if template[i] != '{' do continue
+        j := i + 1
+        for j < len(template) && is_help_token_char(template[j]) do j += 1
+        if j > i + 1 && j < len(template) && template[j] == '}' {
+            name := template[i + 1:j]
+            _, known := help_token_value(name)
+            testing.expectf(t, known, "unresolved help token {%s}", name)
+            i = j
+        }
+    }
+
+    // Labels are derived from config constants rather than hardcoded text.
+    completion_label := key_label(KEY_COMPLETION_TRIGGER, sdl.KMOD_CTRL, .Plain)
+    testing.expect(t, strings.contains(rendered, completion_label))
+    testing.expect(t, strings.contains(rendered, key_label(KEY_LINE_END_DOLLAR, sdl.KMOD_SHIFT, .Shift_Symbol)))
+    testing.expect(t, strings.contains(rendered, help_line_spacing_label()))
+
+    split_h, has_split_h := help_token_value("split_h")
+    testing.expect_value(t, has_split_h, true)
+    testing.expect(t, strings.contains(rendered, split_h))
+
+    gg, has_gg := help_token_value("gg")
+    testing.expect_value(t, has_gg, true)
+    testing.expect(t, strings.contains(rendered, gg))
+
+    // No known placeholder should leak verbatim into the rendered text.
+    testing.expect(t, !strings.contains(rendered, "{completion_trigger}"))
+    testing.expect(t, !strings.contains(rendered, "{split_h}"))
+    fmt.println("  ✓ [Help] template tokens resolve from configuration")
 }
 
 @(test)
@@ -330,11 +373,14 @@ test_app_help_command :: proc(t: ^testing.T) {
     testing.expect_value(t, help_pane.editor.read_only, true)
     testing.expect_value(t, help_pane.editor.dirty, false)
 
+    want := help_render(context.allocator)
+    defer delete(want)
     help_text := pt_full_text(&help_pane.editor.table)
     defer delete(help_text)
-    testing.expect_value(t, help_text, HELP_TEXT)
+    testing.expect_value(t, help_text, want)
     testing.expect(t, strings.contains(help_text, "Odin Text Editor - Help"))
-    testing.expect(t, strings.contains(help_text, "Ctrl+Space"))
+    completion_label := key_label(KEY_COMPLETION_TRIGGER, sdl.KMOD_CTRL, .Plain)
+    testing.expect(t, strings.contains(help_text, completion_label))
     testing.expect(t, strings.contains(help_text, "wdired"))
 
     // Repeating :help (or an alias) focuses the existing buffer
@@ -349,18 +395,18 @@ test_app_help_command :: proc(t: ^testing.T) {
     // Typing is ignored even if Insert mode is forced on the buffer
     editor_set_mode(&help_pane.editor, .Insert, nil)
     simulate_typing(&help_pane.editor, "x")
-    testing.expect_value(t, pt_get_length(&help_pane.editor.table), len(HELP_TEXT))
+    testing.expect_value(t, pt_get_length(&help_pane.editor.table), len(want))
     testing.expect_value(t, help_pane.editor.status_message, "Buffer is read-only")
     editor_set_mode(&help_pane.editor, .Normal, nil)
 
     // Navigation remains available
     help_pane.editor.cursor.row = 0
-    send_key_event(&help_pane.editor, sdl.K_J)
+    send_key_event(&help_pane.editor, KEY_MOVE_DOWN)
     testing.expect_value(t, help_pane.editor.cursor.row, 1)
 
     // Destructive normal-mode keys are rejected
-    send_key_event(&help_pane.editor, sdl.K_D)
-    testing.expect_value(t, pt_get_length(&help_pane.editor.table), len(HELP_TEXT))
+    send_key_event(&help_pane.editor, KEY_DELETE_CHAR)
+    testing.expect_value(t, pt_get_length(&help_pane.editor.table), len(want))
     testing.expect_value(t, help_pane.editor.status_message, "Buffer is read-only")
 
     // Closing the help pane restores the original pane

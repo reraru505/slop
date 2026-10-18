@@ -11,7 +11,6 @@ ThemeId :: enum {
 }
 
 // Compile-time default theme
-DEFAULT_THEME :: ThemeId.GruberDarker
 
 Theme :: struct {
     name               : string,
@@ -173,7 +172,7 @@ theme_get :: proc(id: ThemeId) -> Theme {
             constant           = hex_to_fcolor(0xD65E76),
         }
     }
-    return theme_get(.GruberDarker)
+    return theme_get(DEFAULT_THEME)
 }
 
 theme_from_name :: proc(name: string) -> (ThemeId, bool) {
@@ -188,5 +187,5 @@ theme_from_name :: proc(name: string) -> (ThemeId, bool) {
     case "hemisu":
         return .Hemisu, true
     }
-    return .GruberDarker, false
+    return DEFAULT_THEME, false
 }

@@ -10,6 +10,8 @@ make_test_app :: proc() -> App {
     app: App
     app.panes = make([dynamic]^Pane)
     app.next_pane_id = 1
+    app.current_theme_id = DEFAULT_THEME
+    app.theme = theme_get(DEFAULT_THEME)
     p := pane_create(&app, .Editor)
     app.root_split = split_create_leaf(p)
     app.active_pane = p

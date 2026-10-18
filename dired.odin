@@ -384,21 +384,21 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
         is_ctrl := (mod & sdl.KMOD_CTRL) != {}
 
         // Command mode trigger ':' from Dired
-        if key == sdl.K_COLON || (key == sdl.K_SEMICOLON && is_shift) {
+        if key == KEY_CMD_PROMPT || (key == KEY_CMD_PROMPT_ALT && is_shift) {
             app_open_command_prompt(app)
             return true
         }
 
         // Toggle edit mode via 'i' or 'Esc'
-        if key == sdl.K_I || key == sdl.K_ESCAPE {
+        if key == KEY_DIRED_EDIT || key == sdl.K_ESCAPE {
             dired_enter_edit_mode(d, &pane.editor, &app.font, app.window)
             app.cmd_prompt.message = "-- DIRED EDIT -- Add/edit lines (dir/ for folders), :w to save, :q to cancel"
             return true
         }
 
-        // Cycle sort with 's' or reverse with 'S'
-        if key == sdl.K_S {
-            if is_shift {
+        // Cycle sort or reverse with the shifted key
+        if (is_shift && key == KEY_DIRED_SORT_REVERSE) || key == KEY_DIRED_SORT {
+            if is_shift && key == KEY_DIRED_SORT_REVERSE {
                 d.sort_order = .Desc if d.sort_order == .Asc else .Asc
             } else {
                 dired_cycle_sort(d)
@@ -409,41 +409,43 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
         }
 
         // Block navigation with Ctrl+j and Ctrl+k
-        if is_ctrl && (key == sdl.K_J || key == sdl.K_DOWN) {
+        if is_ctrl && (key == KEY_DIRED_PAGE_DOWN || key == sdl.K_DOWN) {
             if len(d.entries) > 0 {
                 d.cursor = min(len(d.entries) - 1, d.cursor + 5)
             }
             return true
         }
 
-        if is_ctrl && (key == sdl.K_K || key == sdl.K_UP) {
+        if is_ctrl && (key == KEY_DIRED_PAGE_UP || key == sdl.K_UP) {
             if len(d.entries) > 0 {
                 d.cursor = max(0, d.cursor - 5)
             }
             return true
         }
 
-        switch key {
-        case sdl.K_J, sdl.K_DOWN:
+        if key == KEY_DIRED_DOWN || key == sdl.K_DOWN {
             if len(d.entries) > 0 {
                 d.cursor = min(len(d.entries) - 1, d.cursor + 1)
             }
             return true
+        }
 
-        case sdl.K_K, sdl.K_UP:
+        if key == KEY_DIRED_UP || key == sdl.K_UP {
             if len(d.entries) > 0 {
                 d.cursor = max(0, d.cursor - 1)
             }
             return true
+        }
 
-        case sdl.K_H, sdl.K_MINUS:
+        if key == KEY_DIRED_PARENT || key == KEY_DIRED_PARENT_ALT {
             parent := filepath.dir(d.path)
             if parent != "" {
                 dired_load_path(d, parent)
             }
             return true
+        }
 
-        case sdl.K_RETURN, sdl.K_KP_ENTER, sdl.K_L:
+        if key == KEY_DIRED_OPEN || key == sdl.K_RETURN || key == sdl.K_KP_ENTER {
             if d.cursor >= 0 && d.cursor < len(d.entries) {
                 entry := d.entries[d.cursor]
                 if entry.name == ".." {
@@ -462,8 +464,9 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
                 }
             }
             return true
+        }
 
-        case sdl.K_Q:
+        if key == KEY_DIRED_QUIT {
             if pane != nil && pane.editor.file_path != "" && !strings.has_prefix(pane.editor.file_path, "DIRED") {
                 pane.kind = .Editor
             } else if len(app.panes) > 1 {
@@ -527,7 +530,15 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
     sort_info := fmt.tprintf("[Sort: %s (%s)]", dired_sort_name(d.sort_by), "desc" if d.sort_order == .Desc else "asc")
     header_line := fmt.tprintf("DIR: %s   %s", d.path, sort_info)
     push_line(font, header_line, Vec2{rect.x + 16.0, rect.y + 4.0}, theme.keyword, .HALF)
-    push_line(font, "<i>/<Esc> edit, <Enter>/<l> open, <h>/<-> parent, <s> sort, <:> command", Vec2{rect.x + 16.0, rect.y + 4.0 + line_h}, theme.comment, .HALF)
+    hint := fmt.tprintf(
+        "<%s>/<Esc> edit, <Enter>/<%s> open, <%s>/<%s> parent, <%s> sort, <:> command",
+        key_label(KEY_DIRED_EDIT, {}, .Plain),
+        key_label(KEY_DIRED_OPEN, {}, .Plain),
+        key_label(KEY_DIRED_PARENT, {}, .Plain),
+        key_label(KEY_DIRED_PARENT_ALT, {}, .Plain),
+        key_label(KEY_DIRED_SORT, {}, .Plain),
+    )
+    push_line(font, hint, Vec2{rect.x + 16.0, rect.y + 4.0 + line_h}, theme.comment, .HALF)
 
     div_rect := sdl.FRect{
         x = rect.x,
@@ -590,7 +601,14 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
     sdl.RenderFillRect(renderer, &status_bar_rect)
 
     focus_badge := "[ACTIVE] " if is_focused else ""
-    status_str := fmt.tprintf("%s-- DIRED --   %d / %d items   (<s> to sort, <i>/<Esc> to edit)", focus_badge, d.cursor + 1, len(d.entries))
+    status_str := fmt.tprintf(
+        "%s-- DIRED --   %d / %d items   (<%s> to sort, <%s>/<Esc> to edit)",
+        focus_badge,
+        d.cursor + 1,
+        len(d.entries),
+        key_label(KEY_DIRED_SORT, {}, .Plain),
+        key_label(KEY_DIRED_EDIT, {}, .Plain),
+    )
     status_color := theme.keyword if is_focused else theme.status_inactive_fg
     push_line(font, status_str, Vec2{rect.x + 10.0, rect.y + rect.h - status_bar_h + 4.0}, status_color, .HALF)
 

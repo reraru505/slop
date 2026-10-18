@@ -5,6 +5,7 @@ import "core:os"
 import "core:strings"
 import "core:testing"
 import "core:time"
+import sdl "vendor:sdl3"
 
 expect_dired_names :: proc(t: ^testing.T, d: ^Dired, want: []string) {
     testing.expect_value(t, len(d.entries), len(want))
@@ -243,4 +244,51 @@ test_dired_apply_edits_create_rename_delete :: proc(t: ^testing.T) {
     testing.expect_value(t, os.exists("/tmp/odin_editor_tests/dired_apply/old_dir"), false)
     testing.expect_value(t, os.is_dir("/tmp/odin_editor_tests/dired_apply/renamed_dir"), true)
     fmt.println("  ✓ [Dired] wdired create/delete/rename applied on disk")
+}
+
+@(test)
+test_dired_dispatch_uses_config_keys :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/dired_dispatch"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    names := []string{"a", "b", "c", "d", "e", "f"}
+    for name in names {
+        path := fmt.tprintf("%s/%s.txt", dir, name)
+        testing.expect(t, os.write_entire_file_from_string(path, "") == nil)
+    }
+
+    d: Dired
+    dired_init(&d)
+    defer dired_destroy(&d)
+    testing.expect(t, dired_load_path(&d, dir))
+    testing.expect_value(t, len(d.entries), 7) // ".." + six files
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+
+    ev: sdl.Event
+    ev.type = .KEY_DOWN
+    ev.key.key = KEY_DIRED_DOWN
+    ev.key.mod = {}
+    testing.expect_value(t, dired_handle_event(&d, &ev, &app, pane), true)
+    testing.expect_value(t, d.cursor, 1)
+
+    ev.key.key = KEY_DIRED_PAGE_DOWN
+    ev.key.mod = sdl.KMOD_CTRL
+    testing.expect_value(t, dired_handle_event(&d, &ev, &app, pane), true)
+    testing.expect_value(t, d.cursor, 6)
+
+    ev.key.key = KEY_DIRED_UP
+    ev.key.mod = {}
+    testing.expect_value(t, dired_handle_event(&d, &ev, &app, pane), true)
+    testing.expect_value(t, d.cursor, 5)
+
+    before := d.sort_by
+    ev.key.key = KEY_DIRED_SORT
+    testing.expect_value(t, dired_handle_event(&d, &ev, &app, pane), true)
+    testing.expect(t, d.sort_by != before)
+    fmt.println("  ✓ [Dired] dispatch follows configured key constants")
 }

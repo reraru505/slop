@@ -5,7 +5,6 @@ import "core:strings"
 import sdl "vendor:sdl3"
 import ttf "vendor:sdl3/ttf"
 
-FONT_FILE    :: #load("assets/CaskaydiaCoveNerdFont-Regular.ttf");
 // 96 ASCII glyphs plus ligature tiles at 2x-density/250%-zoom sizes need the
 // extra room; 2048x2048 covers the full zoom range without overflow.
 ATLAS_WIDTH  :: 2048 ;
@@ -16,17 +15,13 @@ FONT_COUNT   :: 96   ;
 // neighbouring glyph (Ghostty uses the same trick).
 ATLAS_PADDING :: 1 ;
 
-// Logical pixels occupied by the font's ascent+descent at 100% UI scale.
-// Layout is derived from the font's real metrics at this size.
-BASE_FONT_SIZE :: 20.0 ;
-
 // Multiplier on the font's natural cell height (ascent + descent + line gap).
 // 1.0 is the font/terminal-emulator default (Ghostty parity); raise it for
 // extra breathing room. Adjustable at runtime with :linespace.
-line_spacing : f32 = 1.0 ;
+line_spacing : f32 = DEFAULT_LINE_SPACING ;
 
 // Dynamic global zoom scale (1.0 = 100%)
-global_ui_scale : f32 = 1.0 ;
+global_ui_scale : f32 = DEFAULT_UI_SCALE ;
 
 FONT_SCALE :: enum{
    HALF ,

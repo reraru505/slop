@@ -456,44 +456,49 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
         is_shift := (mod & sdl.KMOD_SHIFT) != {}
         is_ctrl := (mod & sdl.KMOD_CTRL) != {}
 
-        if key == sdl.K_COLON || (key == sdl.K_SEMICOLON && is_shift) {
+        if key == KEY_CMD_PROMPT || (key == KEY_CMD_PROMPT_ALT && is_shift) {
             app_open_command_prompt(app)
             return true
         }
 
-        switch key {
-        case sdl.K_J, sdl.K_DOWN:
+        if key == KEY_COMPILE_DOWN || key == sdl.K_DOWN {
             if len(c.lines) > 0 {
                 c.cursor = min(len(c.lines) - 1, c.cursor + 1)
             }
             return true
+        }
 
-        case sdl.K_K, sdl.K_UP:
+        if key == KEY_COMPILE_UP || key == sdl.K_UP {
             if len(c.lines) > 0 {
                 c.cursor = max(0, c.cursor - 1)
             }
             return true
+        }
 
-        case sdl.K_N:
+        if key == KEY_COMPILE_NEXT_ERROR {
             compilation_next_error(c, app, pane)
             return true
+        }
 
-        case sdl.K_P:
+        if key == KEY_COMPILE_PREV_ERROR {
             compilation_prev_error(c, app, pane)
             return true
+        }
 
-        case sdl.K_RETURN, sdl.K_KP_ENTER, sdl.K_L:
+        if key == KEY_COMPILE_JUMP || key == sdl.K_RETURN || key == sdl.K_KP_ENTER {
             compilation_jump_to_current(c, app, pane)
             return true
+        }
 
-        case sdl.K_R, sdl.K_G:
+        if key == KEY_COMPILE_RECOMPILE || key == KEY_COMPILE_RECOMPILE_ALT {
             if c.command != "" {
                 compilation_run_command(c, c.command)
                 app.cmd_prompt.message = fmt.tprintf("Recompiled: %s", c.command)
             }
             return true
+        }
 
-        case sdl.K_Q:
+        if key == KEY_COMPILE_QUIT {
             if len(app.panes) > 1 {
                 app_close_pane(app, pane)
             }
@@ -598,7 +603,14 @@ compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font
     sdl.RenderFillRect(renderer, &status_bar_rect)
 
     focus_badge := "[ACTIVE] " if is_focused else ""
-    status_info := fmt.tprintf("%s-- COMPILATION --  [%s]   <Enter> jump to error, <n/p> next/prev, <r> recompile", focus_badge, c.status)
+    status_info := fmt.tprintf(
+        "%s-- COMPILATION --  [%s]   <Enter> jump to error, <%s/%s> next/prev, <%s> recompile",
+        focus_badge,
+        c.status,
+        key_label(KEY_COMPILE_NEXT_ERROR, {}, .Plain),
+        key_label(KEY_COMPILE_PREV_ERROR, {}, .Plain),
+        key_label(KEY_COMPILE_RECOMPILE, {}, .Plain),
+    )
     status_color := sdl.FColor{0.45, 0.85, 0.55, 1.0} if (c.finished && c.exit_code == 0) else sdl.FColor{0.95, 0.5, 0.45, 1.0}
     push_line(font, status_info, Vec2{rect.x + 10.0, rect.y + rect.h - status_bar_h + 4.0}, status_color, .HALF)
 
