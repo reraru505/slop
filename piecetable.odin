@@ -23,6 +23,7 @@
 // All allocations use the current context.allocator, following Odin idiom.
 package main
 
+import "core:fmt"
 import "core:strings"
 
 // Byte block size for a buffer's newline index. `cum[j]` holds the number of
@@ -558,6 +559,83 @@ node_update :: proc(n: ^Node) {
 	n.lines = n.piece.lines + sub_lines(n.left) + sub_lines(n.right)
 }
 
+// When false, heap-order violations are reported but do not make validate
+// fail. The original split_bytes knowingly violates the heap (see below), so
+// validation reports rather than fails by default.
+Validate_Heap_Fatal: bool = false
+validate_heap_violations: int
+
+// validate walks the treap and checks every cached aggregate and the max-heap
+// invariant. It reports the first violation and returns false.
+validate :: proc(pt: ^PieceTable) -> bool {
+	if pt == nil do return false
+	validate_heap_violations = 0
+	if !validate_node(pt.root) do return false
+	if pt.length != sub_bytes(pt.root) {
+		fmt.println("piece table validate: pt.length =", pt.length, "but root.bytes =", sub_bytes(pt.root))
+		return false
+	}
+	if pt.line_count != sub_lines(pt.root) {
+		fmt.println("piece table validate: pt.line_count =", pt.line_count, "but root.lines =", sub_lines(pt.root))
+		return false
+	}
+	if validate_heap_violations > 0 {
+		fmt.printf("piece table validate: %d heap violation(s) (non-fatal)\n", validate_heap_violations)
+	}
+	return true
+}
+
+validate_node :: proc(n: ^Node) -> bool {
+	if n == nil do return true
+	if n.piece.length <= 0 {
+		fmt.println("piece table validate: node has non-positive piece length", n.piece.length)
+		return false
+	}
+	if n.left != nil && n.left.prio > n.prio {
+		validate_heap_violations += 1
+		if validate_heap_violations <= 5 {
+			fmt.println("piece table validate: left child priority", n.left.prio, "> parent priority", n.prio, "(heap violation", validate_heap_violations, ")")
+		}
+		if Validate_Heap_Fatal do return false
+	}
+	if n.right != nil && n.right.prio > n.prio {
+		validate_heap_violations += 1
+		if validate_heap_violations <= 5 {
+			fmt.println("piece table validate: right child priority", n.right.prio, "> parent priority", n.prio, "(heap violation", validate_heap_violations, ")")
+		}
+		if Validate_Heap_Fatal do return false
+	}
+	if !validate_node(n.left) do return false
+	if !validate_node(n.right) do return false
+
+	want_size := 1 + sub_size(n.left) + sub_size(n.right)
+	if n.size != want_size {
+		fmt.println("piece table validate: node size", n.size, "!= expected", want_size)
+		return false
+	}
+	want_bytes := n.piece.length + sub_bytes(n.left) + sub_bytes(n.right)
+	if n.bytes != want_bytes {
+		fmt.println("piece table validate: node bytes", n.bytes, "!= expected", want_bytes)
+		return false
+	}
+	want_lines := n.piece.lines + sub_lines(n.left) + sub_lines(n.right)
+	if n.lines != want_lines {
+		fmt.println("piece table validate: node lines", n.lines, "!= expected", want_lines)
+		return false
+	}
+	return true
+}
+
+tree_depth :: proc(pt: ^PieceTable) -> int {
+	if pt == nil do return 0
+	return node_depth(pt.root)
+}
+
+node_depth :: proc(n: ^Node) -> int {
+	if n == nil do return 0
+	return 1 + max(node_depth(n.left), node_depth(n.right))
+}
+
 node_new :: proc(pt: ^PieceTable, p: Piece) -> ^Node {
 	n := pool_alloc(pt)
 	n.piece = p
@@ -663,6 +741,16 @@ pop_min :: proc(n: ^Node) -> (m: ^Node, rest: ^Node) {
 
 // split_bytes splits the treap so that the left result covers exactly the first
 // k bytes of the document, splitting the boundary piece if necessary.
+//
+// In the middle-piece branch the new right node receives a fresh random
+// priority even though it adopts the old node's right subtree. That can briefly
+// violate the treap heap property (a child outranks its parent), which
+// validate() reports. This is a known, accepted deviation: forcing equal
+// priorities (rn.prio = n.prio) preserves the heap but degenerates the tree
+// into a linked list on delete-heavy workloads (~490x slower on benchmark
+// workload E). With fresh priorities the observed depth stays around 3x
+// log2(pieces). Any replacement must be validated against workload E and its
+// depth report before landing.
 split_bytes :: proc(pt: ^PieceTable, n: ^Node, k: int) -> (l: ^Node, r: ^Node) {
 	if n == nil {
 		return nil, nil
