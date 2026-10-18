@@ -101,6 +101,68 @@ test_app_theme_commands :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_compile_path_command_collection :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/compile_path"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    exec_mode := os.Permissions_Read_All + os.Permissions{.Execute_User}
+    names := []string{"cargofake", "cargo-other", "cargo-noexec"}
+    for name in names {
+        path := fmt.tprintf("%s/%s", dir, name)
+        testing.expect(t, os.write_entire_file_from_string(path, "") == nil)
+    }
+    testing.expect(t, os.chmod(fmt.tprintf("%s/cargofake", dir), exec_mode) == nil)
+    testing.expect(t, os.chmod(fmt.tprintf("%s/cargo-other", dir), exec_mode) == nil)
+
+    matches: [dynamic]string
+    defer {
+        for m in matches do delete(m)
+        delete(matches)
+    }
+
+    collect_path_commands(dir, "cargo", "compile", &matches, 100)
+    testing.expect_value(t, len(matches), 2)
+    testing.expect_value(t, completion_has(&matches, "compile cargofake"), true)
+    testing.expect_value(t, completion_has(&matches, "compile cargo-other"), true)
+    testing.expect_value(t, completion_has(&matches, "compile cargo-noexec"), false)
+
+    // The limit is honored.
+    clear(&matches)
+    collect_path_commands(dir, "cargo", "compile", &matches, 1)
+    testing.expect_value(t, len(matches), 1)
+    fmt.println("  ✓ [App] PATH command completion finds executables only")
+}
+
+@(test)
+test_compile_path_token_completion :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/compile_files"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/main.c", dir), "") == nil)
+    testing.expect(t, os.make_directory(fmt.tprintf("%s/sub", dir)) == nil)
+
+    matches: [dynamic]string
+    defer {
+        for m in matches do delete(m)
+        delete(matches)
+    }
+
+    complete_path_token("compile", "", fmt.tprintf("%s/ma", dir), &matches)
+    testing.expect_value(t, len(matches), 1)
+    testing.expect_value(t, matches[0], fmt.tprintf("compile %s/main.c", dir))
+
+    clear(&matches)
+    complete_path_token("compile", "gcc -O2 ", fmt.tprintf("%s/su", dir), &matches)
+    testing.expect_value(t, len(matches), 1)
+    testing.expect_value(t, matches[0], fmt.tprintf("compile gcc -O2 %s/sub/", dir))
+    fmt.println("  ✓ [App] compile arguments complete as filesystem paths")
+}
+
+@(test)
 test_app_dirty_quit_guard :: proc(t: ^testing.T) {
     app := make_test_app()
     defer destroy_test_app(&app)

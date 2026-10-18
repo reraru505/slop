@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:time"
@@ -106,6 +107,77 @@ app_close_command_prompt :: proc(app: ^App) {
     }
 }
 
+completion_has :: proc(matches: ^[dynamic]string, candidate: string) -> bool {
+    for m in matches^ do if m == candidate do return true
+    return false
+}
+
+// Collect executable names from the PATH that start with prefix.
+collect_path_commands :: proc(
+    path_env, prefix, cmd_prefix: string,
+    matches: ^[dynamic]string,
+    limit: int,
+) {
+    if path_env == "" || limit <= 0 do return
+    for entry in strings.split(path_env, ":", context.temp_allocator) {
+        dir := entry
+        if dir == "" do dir = "."
+        handle, err := os.open(dir)
+        if err != nil do continue
+        files, ferr := os.read_dir(handle, -1, context.temp_allocator)
+        os.close(handle)
+        if ferr != nil do continue
+
+        for f in files {
+            if f.type == .Directory do continue
+            if f.mode & os.Permissions_Execute_All == {} do continue
+            if strings.has_prefix(f.name, ".") && !strings.has_prefix(prefix, ".") do continue
+            if !strings.has_prefix(f.name, prefix) do continue
+            candidate := fmt.aprintf("%s %s", cmd_prefix, f.name)
+            if completion_has(matches, candidate) {
+                delete(candidate)
+                continue
+            }
+            append(matches, candidate)
+            if len(matches^) >= limit do return
+        }
+    }
+}
+
+// Complete the final token of a compile command as a filesystem path. head is
+// the already-typed prefix (including its trailing space), if any.
+complete_path_token :: proc(
+    cmd_prefix, head, token: string,
+    matches: ^[dynamic]string,
+) {
+    search_dir := "."
+    dir_part := ""
+    name_prefix := token
+    if slash := strings.last_index_byte(token, '/'); slash >= 0 {
+        search_dir = token[:slash]
+        if search_dir == "" do search_dir = "/"
+        dir_part = token[:slash + 1]
+        name_prefix = token[slash + 1:]
+    }
+
+    handle, err := os.open(search_dir)
+    if err != nil do return
+    files, ferr := os.read_dir(handle, -1, context.temp_allocator)
+    os.close(handle)
+    if ferr != nil do return
+
+    for f in files {
+        if strings.has_prefix(f.name, ".") && !strings.has_prefix(name_prefix, ".") do continue
+        if !strings.has_prefix(f.name, name_prefix) do continue
+        joined := fmt.tprintf("%s%s", dir_part, f.name)
+        if f.type == .Directory do joined = fmt.tprintf("%s/", joined)
+        candidate := fmt.aprintf("%s %s%s", cmd_prefix, head, joined)
+        if !completion_has(matches, candidate) {
+            append(matches, candidate)
+        }
+    }
+}
+
 app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
     p := &app.cmd_prompt
     if !p.in_completion {
@@ -132,6 +204,32 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
                         append(&p.matches, fmt.aprintf("%s %s", cmd_prefix, s))
                     }
                 }
+            case "compile", "make":
+                raw_args := curr_str[first_space + 1:]
+                last_space := strings.last_index_byte(raw_args, ' ')
+                head := ""
+                token := raw_args
+                if last_space >= 0 {
+                    head = raw_args[:last_space + 1]
+                    token = raw_args[last_space + 1:]
+                }
+
+                start := len(p.matches)
+                if last_space < 0 {
+                    // Completing the command itself: PATH executables.
+                    path_env := os.get_env("PATH", context.temp_allocator)
+                    collect_path_commands(path_env, token, cmd_prefix, &p.matches, 100)
+                }
+                // Arguments (and command tokens containing '/') complete as paths.
+                if !strings.has_prefix(token, "-") {
+                    complete_path_token(cmd_prefix, head, token, &p.matches)
+                }
+                if len(p.matches) > start {
+                    slice.sort_by(p.matches[start:], proc(a, b: string) -> bool {
+                        return a < b
+                    })
+                }
+
             case "e", "edit", "sp", "split", "vs", "vsplit", "cd":
                 search_dir := "."
                 name_prefix := arg_prefix
