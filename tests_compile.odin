@@ -197,9 +197,9 @@ test_compilation_dispatch_uses_config_keys :: proc(t: ^testing.T) {
     testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
     testing.expect_value(t, c.cursor, 0)
 
-    // Ctrl+C follows the conventional terminal copy binding.
-    ev.key.key = sdl.K_C
-    ev.key.mod = sdl.KMOD_CTRL
+    // M-w (Alt+W) copies, matching editor Visual mode.
+    ev.key.key = KEY_COMPILE_YANK_ALT
+    ev.key.mod = sdl.KMOD_ALT
     testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
     ev.key.mod = {}
     fmt.println("  ✓ [Compilation] dispatch follows configured key constants")
@@ -425,6 +425,19 @@ test_compilation_copy_sets_clipboard :: proc(t: ^testing.T) {
         testing.expect_value(t, string(cstring(raw)), "second line")
     }
 
+    // Selection copy uses inclusive character bounds.
+    c.selecting = true
+    c.anchor_row, c.anchor_col = 0, 0
+    compilation_set_cursor(&c, 0, 4)
+    compilation_copy(&c, &app, false)
+    raw_sel := sdl.GetClipboardText()
+    testing.expect(t, raw_sel != nil)
+    if raw_sel != nil {
+        defer sdl.free(rawptr(raw_sel))
+        testing.expect_value(t, string(cstring(raw_sel)), "first")
+    }
+    c.selecting = false
+
     compilation_copy(&c, &app, true)
     raw_all := sdl.GetClipboardText()
     testing.expect(t, raw_all != nil)
@@ -434,4 +447,92 @@ test_compilation_copy_sets_clipboard :: proc(t: ^testing.T) {
     }
     fmt.println("  ✓ [Compilation] y/Y copy current line and whole buffer to the clipboard")
 }
+}
+
+@(test)
+test_compilation_selection_copy_text :: proc(t: ^testing.T) {
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+    texts := []string{"alpha", "beta", "gamma"}
+    for text in texts {
+        append(&c.lines, CompilationLine{text = strings.clone(text)})
+    }
+
+    // Same-line, inclusive of the character under the cursor.
+    c.selecting = true
+    c.anchor_row, c.anchor_col = 0, 1
+    compilation_set_cursor(&c, 0, 3)
+    testing.expect_value(t, compilation_copy_text(&c, false), "lph")
+
+    // Multi-line selection: suffix, full middle lines, prefix.
+    c.anchor_row, c.anchor_col = 0, 2
+    compilation_set_cursor(&c, 1, 2)
+    testing.expect_value(t, compilation_copy_text(&c, false), "pha\nbet")
+
+    c.selecting = false
+    testing.expect_value(t, compilation_copy_text(&c, false), "beta")
+
+    fmt.println("  ✓ [Compilation] visual selections copy substrings and line spans")
+}
+
+@(test)
+test_compilation_selection_keys_and_mouse_mapping :: proc(t: ^testing.T) {
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+    texts := []string{"alpha", "beta", "gamma"}
+    for text in texts {
+        append(&c.lines, CompilationLine{text = strings.clone(text)})
+    }
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+    pane.rect = sdl.FRect{0, 0, 500, 300}
+
+    ev: sdl.Event
+    ev.type = .KEY_DOWN
+    ev.key.mod = {}
+
+    ev.key.key = KEY_COMPILE_VISUAL
+    testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
+    testing.expect_value(t, c.selecting, true)
+    testing.expect_value(t, c.anchor_row, 0)
+
+    ev.key.key = KEY_COMPILE_DOWN
+    compilation_handle_event(&c, &ev, &app, pane)
+    testing.expect_value(t, c.cursor, 1)
+    testing.expect_value(t, c.selecting, true)
+
+    ev.key.key = sdl.K_ESCAPE
+    compilation_handle_event(&c, &ev, &app, pane)
+    testing.expect_value(t, c.selecting, false)
+
+    // Mouse mapping: first row's center, second cell.
+    line_h := get_line_height(.HALF)
+    y := line_h * 1.5 + line_h * 0.5
+    row := compilation_line_at_y(&c, pane.rect, y)
+    testing.expect_value(t, row, 0)
+    cell := g_font_metrics.cell_width * get_font_scale_multiplier(.HALF)
+    col := compilation_col_at_x(&c, pane.rect, 12.0 + cell * 2.0, row)
+    testing.expect_value(t, col, 2)
+
+    // Drag from cell 1 to cell 3 selects "lp" (half-open at the drag point,
+    // inclusive of the source character); y/M-w copies it.
+    down: sdl.Event
+    down.type = .MOUSE_BUTTON_DOWN
+    down.button.button = sdl.BUTTON_LEFT
+    down.button.x = 12.0 + cell * 1.0
+    down.button.y = y
+    compilation_handle_event(&c, &down, &app, pane)
+    motion: sdl.Event
+    motion.type = .MOUSE_MOTION
+    motion.motion.x = 12.0 + cell * 3.0
+    motion.motion.y = y
+    compilation_handle_event(&c, &motion, &app, pane)
+    testing.expect_value(t, c.selecting, true)
+    testing.expect_value(t, compilation_copy_text(&c, false), "lph")
+
+    fmt.println("  ✓ [Compilation] v/drag selection and mouse hit-testing")
 }

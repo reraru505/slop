@@ -199,6 +199,8 @@ KEY_COMPILE_PREV_ERROR    :: sdl.K_P     // p
 KEY_COMPILE_JUMP          :: sdl.K_L     // L (lowercase l on the keyboard)
 KEY_COMPILE_RECOMPILE     :: sdl.K_R     // r
 KEY_COMPILE_RECOMPILE_ALT :: sdl.K_G     // g
-KEY_COMPILE_YANK          :: sdl.K_Y     // y: copy current line
+KEY_COMPILE_YANK          :: sdl.K_Y     // y: copy current line / selection
 KEY_COMPILE_YANK_ALL      :: sdl.K_Y     // Shift+Y: copy whole buffer
+KEY_COMPILE_YANK_ALT      :: sdl.K_W     // Alt+W (M-w): copy current line / selection
+KEY_COMPILE_VISUAL        :: sdl.K_V     // v: start/stop character selection
 KEY_COMPILE_QUIT          :: sdl.K_Q     // q
