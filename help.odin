@@ -163,6 +163,9 @@ help_token_value :: proc(name: string) -> (string, bool) {
     shift := sdl.KMOD_SHIFT
 
     switch name {
+    case "editor_name":           return EDITOR_NAME, true
+    case "help_underline":
+        return strings.repeat("=", len(EDITOR_NAME) + len(" - Help"), context.temp_allocator), true
     case "cmd_prompt":            return key_label(KEY_CMD_PROMPT, {}, .Plain), true
     case "insert":                return key_label(KEY_INSERT_BEFORE, {}, .Plain), true
     case "insert_line_start":     return key_label(KEY_INSERT_LINE_START, {}, .Shift_Letter), true
@@ -198,6 +201,8 @@ help_token_value :: proc(name: string) -> (string, bool) {
     case "yank_selection":        return key_label(KEY_YANK_SELECTION, {}, .Upper), true
     case "yank_alt":              return key_label(KEY_YANK_ALT, alt, .Plain), true
     case "paste":                 return key_label(KEY_PASTE_CLIPBOARD, ctrl, .Plain), true
+    case "paste_normal":          return key_label(KEY_PASTE_NORMAL, {}, .Plain), true
+    case "save":                  return key_label(KEY_SAVE, ctrl, .Plain), true
     case "undo":                  return key_label(KEY_UNDO, {}, .Plain), true
     case "undo_alt":              return key_label(KEY_UNDO_ALT, ctrl, .Plain), true
     case "redo":                  return key_label(KEY_REDO, ctrl, .Plain), true
@@ -226,9 +231,18 @@ help_token_value :: proc(name: string) -> (string, bool) {
     case "dired_up":              return key_label(KEY_DIRED_UP, {}, .Plain), true
     case "dired_pages":
         down := key_label(KEY_DIRED_PAGE_DOWN, ctrl, .Plain)
-        up := key_base_name(KEY_DIRED_PAGE_UP)
-        if is_letter_key(KEY_DIRED_PAGE_UP) do up = upper_letter(KEY_DIRED_PAGE_UP)
-        return fmt.aprintf("%s/%s", down, up, allocator = context.temp_allocator), true
+        // Share the Ctrl+ prefix only when both suffixes are simple letters;
+        // otherwise show the full chord so the modifier is not lost.
+        if is_letter_key(KEY_DIRED_PAGE_DOWN) && is_letter_key(KEY_DIRED_PAGE_UP) {
+            up := upper_letter(KEY_DIRED_PAGE_UP)
+            return fmt.aprintf("%s/%s", down, up, allocator = context.temp_allocator), true
+        }
+        return fmt.aprintf(
+            "%s/%s",
+            down,
+            key_label(KEY_DIRED_PAGE_UP, ctrl, .Plain),
+            allocator = context.temp_allocator,
+        ), true
     case "dired_open":            return key_label(KEY_DIRED_OPEN, {}, .Upper), true
     case "dired_parent":          return key_label(KEY_DIRED_PARENT, {}, .Plain), true
     case "dired_parent_alt":      return key_label(KEY_DIRED_PARENT_ALT, {}, .Plain), true
@@ -243,6 +257,8 @@ help_token_value :: proc(name: string) -> (string, bool) {
     case "compile_jump":          return key_label(KEY_COMPILE_JUMP, {}, .Upper), true
     case "compile_recompile":     return key_label(KEY_COMPILE_RECOMPILE, {}, .Plain), true
     case "compile_recompile_alt": return key_label(KEY_COMPILE_RECOMPILE_ALT, {}, .Plain), true
+    case "compile_yank":          return key_label(KEY_COMPILE_YANK, {}, .Plain), true
+    case "compile_yank_all":      return key_label(KEY_COMPILE_YANK_ALL, shift, .Shift_Letter), true
     case "compile_quit":          return key_label(KEY_COMPILE_QUIT, {}, .Plain), true
     }
     return "", false

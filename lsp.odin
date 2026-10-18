@@ -7,6 +7,7 @@ import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import "core:sys/posix"
 import "core:thread"
 import "core:time"
 import "base:runtime"
@@ -182,12 +183,71 @@ LspClient :: struct {
     diagnostics      : map[string][dynamic]LspDiagnostic,
     // Latest completions
     completions      : [dynamic]LspCompletionItem,
+    completions_file : string,
     // Pending results to be handled by editor
     last_definition  : Maybe(LspLocation),
     last_hover       : string,
+    last_hover_file  : string,
     last_edits       : [dynamic]LspTextEdit,
+    last_edits_file  : string,
     last_hover_title : string,
     file_versions    : map[string]int,
+}
+
+// `running` is touched by the main, reader, and writer threads.
+lsp_is_running :: proc(client: ^LspClient) -> bool {
+    return sync.atomic_load(&client.running)
+}
+
+lsp_set_running :: proc(client: ^LspClient, running: bool) {
+    sync.atomic_store(&client.running, running)
+}
+
+lsp_uri_encode_path :: proc(path: string, allocator := context.temp_allocator) -> string {
+    hex := "0123456789ABCDEF"
+    b: strings.Builder
+    strings.builder_init(&b, 0, len(path) + 16, allocator)
+
+    for ch in transmute([]u8)path {
+        if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+           (ch >= '0' && ch <= '9') || ch == '/' || ch == '-' || ch == '_' ||
+           ch == '.' || ch == '~' {
+            strings.write_byte(&b, ch)
+        } else {
+            strings.write_byte(&b, '%')
+            strings.write_byte(&b, hex[ch >> 4])
+            strings.write_byte(&b, hex[ch & 0x0F])
+        }
+    }
+    return strings.to_string(b)
+}
+
+lsp_uri_decode_path :: proc(uri_path: string, allocator := context.temp_allocator) -> string {
+    hex_value :: proc(ch: byte) -> int {
+        if ch >= '0' && ch <= '9' do return int(ch - '0')
+        if ch >= 'a' && ch <= 'f' do return int(ch - 'a') + 10
+        if ch >= 'A' && ch <= 'F' do return int(ch - 'A') + 10
+        return -1
+    }
+
+    b: strings.Builder
+    strings.builder_init(&b, 0, len(uri_path), allocator)
+
+    i := 0
+    for i < len(uri_path) {
+        if uri_path[i] == '%' && i + 2 < len(uri_path) {
+            hi := hex_value(uri_path[i + 1])
+            lo := hex_value(uri_path[i + 2])
+            if hi >= 0 && lo >= 0 {
+                strings.write_byte(&b, byte(hi * 16 + lo))
+                i += 3
+                continue
+            }
+        }
+        strings.write_byte(&b, uri_path[i])
+        i += 1
+    }
+    return strings.to_string(b)
 }
 
 lsp_path_to_uri :: proc(path: string, allocator := context.temp_allocator) -> string {
@@ -202,12 +262,13 @@ lsp_path_to_uri :: proc(path: string, allocator := context.temp_allocator) -> st
             }
         }
     }
-    return fmt.aprintf("file://%s", clean_p, allocator = allocator)
+    escaped := lsp_uri_encode_path(clean_p, context.temp_allocator)
+    return fmt.aprintf("file://%s", escaped, allocator = allocator)
 }
 
 lsp_uri_to_path :: proc(uri: string, allocator := context.temp_allocator) -> string {
     if strings.has_prefix(uri, "file://") {
-        return strings.clone(uri[7:], allocator)
+        return lsp_uri_decode_path(uri[7:], allocator)
     }
     return strings.clone(uri, allocator)
 }
@@ -221,7 +282,7 @@ lsp_reader_thread_proc :: proc(data: rawptr) {
     accum = make([dynamic]u8, 0, 8192)
     defer delete(accum)
 
-    for client.running {
+    for lsp_is_running(client) {
         n, err := os.read(client.stdout_file, read_buf[:])
         if err != nil || n <= 0 {
             break
@@ -274,15 +335,15 @@ lsp_reader_thread_proc :: proc(data: rawptr) {
                 break
             }
 
-            // Extract complete JSON payload
+            // Extract complete JSON payload. `string(json_bytes)` aliases the
+            // accumulator, so parse BEFORE remove_range shifts the buffer down;
+            // otherwise the next buffered message overwrites this payload.
             json_bytes := accum[body_start : body_start + content_length]
+            val, err := json.parse_string(string(json_bytes), allocator = runtime.default_allocator())
 
             // Remove processed message from accumulator
             remove_range(&accum, 0, body_start + content_length)
 
-            // Parse here, off the main thread; the main thread only dispatches
-            // the resulting value and frees it.
-            val, err := json.parse_string(string(json_bytes), allocator = runtime.default_allocator())
             if err != nil do continue
 
             sync.mutex_lock(&client.mutex)
@@ -290,9 +351,38 @@ lsp_reader_thread_proc :: proc(data: rawptr) {
             sync.mutex_unlock(&client.mutex)
         }
     }
+
+    // The server closed its stdout or the read failed. Mark the client dead so
+    // the manager can restart it instead of queueing requests forever.
+    lsp_set_running(client, false)
+}
+
+// Release the containers allocated by lsp_start when spawning the server
+// fails. At that point they are empty; lsp_stop handles the running case.
+lsp_release_start_state :: proc(client: ^LspClient) {
+    if client.server_cmd != "" do delete(client.server_cmd)
+    client.server_cmd = ""
+    delete(client.incoming_queue)
+    client.incoming_queue = nil
+    delete(client.writer_queue)
+    client.writer_queue = nil
+    delete(client.pending_requests)
+    client.pending_requests = nil
+    delete(client.diagnostics)
+    client.diagnostics = nil
+    delete(client.completions)
+    client.completions = nil
+    delete(client.last_edits)
+    client.last_edits = nil
+    delete(client.file_versions)
+    client.file_versions = nil
 }
 
 lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> bool {
+    // A dead server makes writes to its stdin raise SIGPIPE. The app's main
+    // ignores it, but test runners and other entry points may not.
+    posix.sigignore(.SIGPIPE)
+
     // Ensure OLS finds its builtins folder
     builtin_path := ""
     if strings.contains(server_cmd, "ols") {
@@ -304,14 +394,13 @@ lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> b
         for cand in builtin_candidates {
             if os.exists(cand) {
                 builtin_path = cand
-                _ = os.set_env("OLS_BUILTIN_FOLDER", cand)
                 break
             }
         }
     }
 
     client.server_cmd = strings.clone(server_cmd, context.allocator)
-    client.running = false
+    lsp_set_running(client, false)
     client.initialized = false
     client.next_id = 1
     client.incoming_queue = make([dynamic]json.Value, 0, 64)
@@ -324,19 +413,41 @@ lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> b
     client.file_versions = make(map[string]int)
 
     in_r, in_w, err1 := os.pipe()
-    if err1 != nil do return false
+    if err1 != nil {
+        lsp_release_start_state(client)
+        return false
+    }
     out_r, out_w, err2 := os.pipe()
     if err2 != nil {
         os.close(in_r); os.close(in_w)
+        lsp_release_start_state(client)
         return false
     }
 
+    // Build the child environment explicitly instead of mutating the global
+    // environment (which races with compilation's process_exec on another
+    // thread and grew PATH on every LSP start).
     extra_paths := "/home/fnln/opt:/home/fnln/.cargo/bin:/home/fnln/.local/share/nvim/mason/bin:/usr/local/bin:/usr/bin:/bin"
-    if curr_path, ok := os.lookup_env("PATH", context.temp_allocator); ok && curr_path != "" {
-        _ = os.set_env("PATH", fmt.tprintf("%s:%s", extra_paths, curr_path))
+    curr_path, has_path := os.lookup_env("PATH", context.temp_allocator)
+    has_path = has_path && curr_path != ""
+
+    env_list: [dynamic]string
+    defer delete(env_list)
+    base_env, _ := os.environ(context.temp_allocator)
+    for entry in base_env {
+        // Odin's os.environ() currently includes a trailing empty entry
+        // (the terminating NULL). Passing "" in envp makes some servers,
+        // notably ZLS, abort with a recursive panic.
+        if entry == "" do continue
+        if has_path && strings.has_prefix(entry, "PATH=") do continue
+        if builtin_path != "" && strings.has_prefix(entry, "OLS_BUILTIN_FOLDER=") do continue
+        append(&env_list, entry)
+    }
+    if has_path {
+        append(&env_list, fmt.tprintf("PATH=%s:%s", extra_paths, curr_path))
     }
     if builtin_path != "" {
-        _ = os.set_env("OLS_BUILTIN_FOLDER", builtin_path)
+        append(&env_list, fmt.tprintf("OLS_BUILTIN_FOLDER=%s", builtin_path))
     }
 
     cmd := []string{server_cmd}
@@ -346,13 +457,14 @@ lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> b
         stdin       = in_r,
         stdout      = out_w,
         stderr      = nil,
-        env         = nil,
+        env         = env_list[:],
     }
 
     p, perr := os.process_start(desc)
     if perr != nil {
         os.close(in_r); os.close(in_w)
         os.close(out_r); os.close(out_w)
+        lsp_release_start_state(client)
         return false
     }
 
@@ -363,7 +475,7 @@ lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> b
     client.process = p
     client.stdin_file = in_w
     client.stdout_file = out_r
-    client.running = true
+    lsp_set_running(client, true)
 
     // Start reader and writer threads
     client.reader_thread = thread.create_and_start_with_data(rawptr(client), lsp_reader_thread_proc)
@@ -376,7 +488,7 @@ lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> b
     root_uri := lsp_path_to_uri(root_dir)
     folder_name := filepath.base(root_dir)
     init_json := fmt.tprintf(
-        `{{"jsonrpc":"2.0","id":%d,"method":"initialize","params":{{"processId":null,"rootUri":"%s","workspaceFolders":[{{"uri":"%s","name":"%s"}}],"capabilities":{{"workspace":{{"configuration":true,"workspaceFolders":true}},"textDocument":{{"synchronization":{{"didSave":true}},"publishDiagnostics":{{"relatedInformation":true}},"completion":{{"completionItem":{{"snippetSupport":true,"documentationFormat":["plaintext","markdown"]}}}},"hover":{{"contentFormat":["plaintext","markdown"]}},"definition":{{}},"formatting":{{}},"rangeFormatting":{{}}}}}}}}}}`,
+        `{{"jsonrpc":"2.0","id":%d,"method":"initialize","params":{{"processId":null,"rootUri":"%s","workspaceFolders":[{{"uri":"%s","name":"%s"}}],"capabilities":{{"general":{{"positionEncodings":["utf-8"]}},"workspace":{{"configuration":true,"workspaceFolders":true}},"textDocument":{{"synchronization":{{"didSave":true}},"publishDiagnostics":{{"relatedInformation":true}},"completion":{{"completionItem":{{"snippetSupport":false,"documentationFormat":["plaintext","markdown"]}}}},"hover":{{"contentFormat":["plaintext","markdown"]}},"definition":{{}},"formatting":{{}},"rangeFormatting":{{}}}}}}}}}}`,
         client.next_id,
         root_uri,
         root_uri,
@@ -390,7 +502,7 @@ lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> b
 }
 
 lsp_stop :: proc(client: ^LspClient) {
-    if !client.running && client.stdin_file == nil && client.reader_thread == nil && client.writer_thread == nil {
+    if !lsp_is_running(client) && client.stdin_file == nil && client.reader_thread == nil && client.writer_thread == nil {
         return
     }
 
@@ -406,7 +518,7 @@ lsp_stop :: proc(client: ^LspClient) {
         }
     }
 
-    client.running = false
+    lsp_set_running(client, false)
 
     sync.mutex_lock(&client.writer_mutex)
     client.writer_running = false
@@ -427,15 +539,18 @@ lsp_stop :: proc(client: ^LspClient) {
     _ = os.process_kill(client.process)
     _, _ = os.process_wait(client.process)
 
-    if client.stdout_file != nil {
-        os.close(client.stdout_file)
-        client.stdout_file = nil
-    }
-
+    // The reader is blocked in os.read(); the killed child closes the write
+    // end, so let the reader observe EOF and exit before we close/free the
+    // file object it is using.
     if client.reader_thread != nil {
         thread.join(client.reader_thread)
         thread.destroy(client.reader_thread)
         client.reader_thread = nil
+    }
+
+    if client.stdout_file != nil {
+        os.close(client.stdout_file)
+        client.stdout_file = nil
     }
 
     // Free structures
@@ -445,6 +560,9 @@ lsp_stop :: proc(client: ^LspClient) {
 
     for q in client.incoming_queue do json.destroy_value(q, runtime.default_allocator())
     delete(client.incoming_queue)
+    for req in client.pending_requests {
+        if req.file_path != "" do delete(req.file_path)
+    }
     delete(client.pending_requests)
 
     for k, v in client.diagnostics {
@@ -461,13 +579,18 @@ lsp_stop :: proc(client: ^LspClient) {
         delete(c.insert_text)
     }
     delete(client.completions)
+    if client.completions_file != "" do delete(client.completions_file)
 
     for e in client.last_edits do delete(e.new_text)
     delete(client.last_edits)
+    if client.last_edits_file != "" do delete(client.last_edits_file)
 
+    if loc, ok := client.last_definition.?; ok && loc.file_path != "" do delete(loc.file_path)
     if client.last_hover != "" do delete(client.last_hover)
+    if client.last_hover_file != "" do delete(client.last_hover_file)
     if client.last_hover_title != "" do delete(client.last_hover_title)
     if client.server_cmd != "" do delete(client.server_cmd)
+    for k in client.file_versions do delete(k)
     delete(client.file_versions)
 }
 
@@ -475,11 +598,19 @@ LspManager :: struct {
     clients      : [LspServerKind]^LspClient,
     working_dir  : string,
     opened_files : map[string]bool,
+    // Throttle failed spawn attempts (missing servers) to once per second.
+    attempted    : [LspServerKind]bool,
+    last_attempt : [LspServerKind]time.Time,
 }
 
 lsp_manager_init :: proc(mgr: ^LspManager, working_dir: string) {
     mgr.working_dir = strings.clone(working_dir, context.allocator)
     mgr.opened_files = make(map[string]bool)
+}
+
+lsp_manager_set_working_dir :: proc(mgr: ^LspManager, dir: string) {
+    if mgr.working_dir != "" do delete(mgr.working_dir)
+    mgr.working_dir = strings.clone(dir, context.allocator)
 }
 
 lsp_find_project_root :: proc(file_path: string, fallback_dir: string) -> string {
@@ -585,7 +716,7 @@ lsp_manager_get_client :: proc(mgr: ^LspManager, lang: LanguageKind, file_path: 
     if !has_server do return nil
 
     if mgr.clients[server_kind] != nil {
-        if mgr.clients[server_kind].running {
+        if lsp_is_running(mgr.clients[server_kind]) {
             return mgr.clients[server_kind]
         }
         lsp_stop(mgr.clients[server_kind])
@@ -595,6 +726,14 @@ lsp_manager_get_client :: proc(mgr: ^LspManager, lang: LanguageKind, file_path: 
 
     server_cmd, found := lsp_find_server_cmd(server_kind)
     if !found do return nil
+
+    // A missing server would otherwise be re-spawned on every frame.
+    now := time.now()
+    if mgr.attempted[server_kind] && time.since(mgr.last_attempt[server_kind]) < time.Second {
+        return nil
+    }
+    mgr.attempted[server_kind] = true
+    mgr.last_attempt[server_kind] = now
 
     root_dir := lsp_find_project_root(file_path, mgr.working_dir)
     defer delete(root_dir)
@@ -631,7 +770,7 @@ lsp_destroy_out_message :: proc(m: ^Lsp_Out_Message) {
 
 // Called on the main thread; the writer thread owns the actual pipe writes.
 lsp_send_raw :: proc(client: ^LspClient, json_str: string) {
-    if client.stdin_file == nil || !client.running do return
+    if client.stdin_file == nil || !lsp_is_running(client) do return
     sync.mutex_lock(&client.writer_mutex)
     append(&client.writer_queue, Lsp_Out_Message{
         kind = .Raw,
@@ -647,11 +786,11 @@ lsp_write_framed :: proc(client: ^LspClient, json_str: string) {
     header := fmt.bprintf(header_buf[:], "Content-Length: %d\r\n\r\n", len(json_str))
 
     if _, err := os.write(client.stdin_file, transmute([]u8)header); err != nil {
-        client.running = false
+        lsp_set_running(client, false)
         return
     }
     if _, err := os.write(client.stdin_file, transmute([]u8)json_str); err != nil {
-        client.running = false
+        lsp_set_running(client, false)
     }
 }
 
@@ -703,16 +842,28 @@ lsp_append_json_escaped :: proc(b: ^strings.Builder, s: string) {
         case '\n': strings.write_string(b, "\\n")
         case '\r': strings.write_string(b, "\\r")
         case '\t': strings.write_string(b, "\\t")
-        case:      strings.write_rune(b, ch)
+        case:
+            if ch < 0x20 {
+                esc_buf: [8]u8
+                strings.write_string(b, fmt.bprintf(esc_buf[:], "\\u%04x", u32(ch)))
+            } else {
+                strings.write_rune(b, ch)
+            }
         }
     }
 }
 
 lsp_did_open :: proc(client: ^LspClient, file_path: string, text: string) {
-    if !client.running || !client.initialized do return
+    if !lsp_is_running(client) || !client.initialized do return
     uri := lsp_path_to_uri(file_path)
 
-    client.file_versions[file_path] = 1
+    // Map keys are borrowed, not copied; clone because callers such as the
+    // picker pass strings from a per-frame temp allocator.
+    if _, exists := client.file_versions[file_path]; !exists {
+        client.file_versions[strings.clone(file_path, context.allocator)] = 1
+    } else {
+        client.file_versions[file_path] = 1
+    }
 
     lang := language_from_file_path(file_path)
     lang_id := language_id_string(lang)
@@ -730,26 +881,29 @@ lsp_did_open :: proc(client: ^LspClient, file_path: string, text: string) {
 }
 
 lsp_did_change :: proc(client: ^LspClient, file_path: string, text: string) {
-    if !client.running || !client.initialized do return
+    if !lsp_is_running(client) || !client.initialized do return
 
     ver := 2
     if v, ok := &client.file_versions[file_path]; ok {
         v^ += 1
         ver = v^
     } else {
-        client.file_versions[file_path] = 2
+        client.file_versions[strings.clone(file_path, context.allocator)] = 2
     }
 
     // Unit tests exercise version bookkeeping without a live pipe.
     if client.stdin_file == nil do return
 
-    // Coalesce unsent changes: only the newest full-document snapshot matters.
+    // Coalesce only with a trailing snapshot for the same file. If a request
+    // was queued after that snapshot, appending (not mutating) preserves the
+    // text the request's positions were computed against.
     sync.mutex_lock(&client.writer_mutex)
-    for &m in client.writer_queue {
-        if m.kind == .Did_Change && m.file_path == file_path {
-            if m.text != "" do delete(m.text, runtime.default_allocator())
-            m.text = strings.clone(text, runtime.default_allocator())
-            m.version = ver
+    if len(client.writer_queue) > 0 {
+        last := &client.writer_queue[len(client.writer_queue) - 1]
+        if last.kind == .Did_Change && last.file_path == file_path {
+            if last.text != "" do delete(last.text, runtime.default_allocator())
+            last.text = strings.clone(text, runtime.default_allocator())
+            last.version = ver
             sync.mutex_unlock(&client.writer_mutex)
             sync.cond_signal(&client.writer_cond)
             return
@@ -769,7 +923,7 @@ lsp_did_change :: proc(client: ^LspClient, file_path: string, text: string) {
 }
 
 lsp_did_save :: proc(client: ^LspClient, file_path: string) {
-    if !client.running || !client.initialized do return
+    if !lsp_is_running(client) || !client.initialized do return
     uri := lsp_path_to_uri(file_path)
     msg := fmt.tprintf(
         `{{"jsonrpc":"2.0","method":"textDocument/didSave","params":{{"textDocument":{{"uri":"%s"}}}}}}`,
@@ -779,7 +933,7 @@ lsp_did_save :: proc(client: ^LspClient, file_path: string) {
 }
 
 lsp_request_definition :: proc(client: ^LspClient, file_path: string, row, col: int) {
-    if !client.running || !client.initialized do return
+    if !lsp_is_running(client) || !client.initialized do return
     uri := lsp_path_to_uri(file_path)
     id := client.next_id
     client.next_id += 1
@@ -794,7 +948,7 @@ lsp_request_definition :: proc(client: ^LspClient, file_path: string, row, col: 
 }
 
 lsp_request_hover :: proc(client: ^LspClient, file_path: string, row, col: int) {
-    if !client.running || !client.initialized do return
+    if !lsp_is_running(client) || !client.initialized do return
     uri := lsp_path_to_uri(file_path)
     id := client.next_id
     client.next_id += 1
@@ -809,7 +963,7 @@ lsp_request_hover :: proc(client: ^LspClient, file_path: string, row, col: int) 
 }
 
 lsp_request_completion :: proc(client: ^LspClient, file_path: string, row, col: int) {
-    if !client.running || !client.initialized do return
+    if !lsp_is_running(client) || !client.initialized do return
     uri := lsp_path_to_uri(file_path)
     id := client.next_id
     client.next_id += 1
@@ -824,7 +978,7 @@ lsp_request_completion :: proc(client: ^LspClient, file_path: string, row, col: 
 }
 
 lsp_request_range_formatting :: proc(client: ^LspClient, file_path: string, start_row, end_row: int) {
-    if !client.running || !client.initialized do return
+    if !lsp_is_running(client) || !client.initialized do return
     uri := lsp_path_to_uri(file_path)
     id := client.next_id
     client.next_id += 1
@@ -854,7 +1008,7 @@ lsp_json_escape :: proc(s: string, allocator := context.temp_allocator) -> strin
 
 // Poll and dispatch all completed LSP messages in main thread
 lsp_update :: proc(client: ^LspClient, app: ^App) {
-    if !client.running do return
+    if !lsp_is_running(client) do return
 
     messages_to_process: [dynamic]json.Value
     sync.mutex_lock(&client.mutex)
@@ -907,7 +1061,9 @@ lsp_update :: proc(client: ^LspClient, app: ^App) {
 
 lsp_id_to_string :: proc(id_val: json.Value, allocator := context.temp_allocator) -> string {
     #partial switch v in id_val {
-    case json.String:  return fmt.aprintf(`"%s"`, v, allocator = allocator)
+    case json.String:
+        escaped := lsp_json_escape(v, context.temp_allocator)
+        return fmt.aprintf(`"%s"`, escaped, allocator = allocator)
     case json.Integer: return fmt.aprintf(`%d`, v, allocator = allocator)
     case json.Float:   return fmt.aprintf(`%d`, int(v), allocator = allocator)
     case:              return "null"
@@ -955,6 +1111,13 @@ lsp_handle_notification :: proc(client: ^LspClient, method: string, obj: json.Ob
             norm_temp, _ = filepath.clean(file_path, context.temp_allocator)
         }
 
+        // Validate the payload before touching existing diagnostics. A
+        // malformed notification must not wipe them.
+        diags_value, has_diags := params_obj["diagnostics"]
+        if !has_diags do return
+        diags_arr, is_array := diags_value.(json.Array)
+        if !is_array do return
+
         // Clear existing diagnostics for this path
         existing_key := ""
         for k, v in client.diagnostics {
@@ -966,8 +1129,7 @@ lsp_handle_notification :: proc(client: ^LspClient, method: string, obj: json.Ob
             }
         }
 
-        diags_arr, has_diags := params_obj["diagnostics"].(json.Array)
-        if !has_diags || len(diags_arr) == 0 {
+        if len(diags_arr) == 0 {
             if existing_key != "" {
                 delete_key(&client.diagnostics, existing_key)
                 delete(existing_key)
@@ -1053,6 +1215,9 @@ lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, a
             }
             app_set_message(app, fmt.tprintf("LSP Error: %s", err_msg))
         }
+        // A failed initialize must not leave a client that looks alive but
+        // never becomes initialized.
+        if req.kind == .Initialize do lsp_set_running(client, false)
         return
     }
 
@@ -1066,7 +1231,9 @@ lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, a
             if app != nil do app_set_message(app, "LSP: No definition found")
         case .RangeFormatting:
             if app != nil do app_set_message(app, "LSP: Formatting returned no changes")
-        case .Completion, .Initialize, .None:
+        case .Initialize:
+            lsp_set_running(client, false)
+        case .Completion, .None:
         }
         return
     }
@@ -1093,6 +1260,11 @@ lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, a
         }
 
     case .Definition:
+        if prev, has_prev := client.last_definition.?; has_prev && prev.file_path != "" {
+            delete(prev.file_path)
+        }
+        client.last_definition = nil
+
         // Can be a Location object or an array of Locations
         loc_obj: json.Object
         found := false
@@ -1170,6 +1342,11 @@ lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, a
                         if s, ok2 := item.(json.String); ok2 {
                             strings.write_string(&b, s)
                             strings.write_byte(&b, '\n')
+                        } else if marked, ok2 := item.(json.Object); ok2 {
+                            if v, ok3 := marked["value"].(json.String); ok3 {
+                                strings.write_string(&b, v)
+                                strings.write_byte(&b, '\n')
+                            }
                         }
                     }
                     content_str = strings.to_string(b)
@@ -1178,6 +1355,11 @@ lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, a
         }
 
         if client.last_hover != "" do delete(client.last_hover)
+        if client.last_hover_file != "" do delete(client.last_hover_file)
+        client.last_hover_file = ""
+        if req.file_path != "" {
+            client.last_hover_file = strings.clone(req.file_path, context.allocator)
+        }
         if content_str != "" {
             client.last_hover = strings.clone(content_str, context.allocator)
         } else {
@@ -1185,6 +1367,12 @@ lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, a
         }
 
     case .Completion:
+        if client.completions_file != "" do delete(client.completions_file)
+        client.completions_file = ""
+        if req.file_path != "" {
+            client.completions_file = strings.clone(req.file_path, context.allocator)
+        }
+
         for c in client.completions {
             delete(c.label)
             delete(c.detail)
@@ -1239,6 +1427,12 @@ lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, a
         }
 
     case .RangeFormatting:
+        if client.last_edits_file != "" do delete(client.last_edits_file)
+        client.last_edits_file = ""
+        if req.file_path != "" {
+            client.last_edits_file = strings.clone(req.file_path, context.allocator)
+        }
+
         for e in client.last_edits do delete(e.new_text)
         clear(&client.last_edits)
 

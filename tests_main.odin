@@ -6,6 +6,11 @@ import "core:strings"
 import "core:testing"
 import sdl "vendor:sdl3"
 
+free_path_matches :: proc(matches: ^[dynamic]string) {
+    for m in matches^ do delete(m)
+    clear(matches)
+}
+
 set_command_buffer :: proc(app: ^App, command: string) {
     clear(&app.cmd_prompt.buffer)
     for b in transmute([]u8)command {
@@ -129,7 +134,7 @@ test_compile_path_command_collection :: proc(t: ^testing.T) {
     testing.expect_value(t, completion_has(&matches, "compile cargo-noexec"), false)
 
     // The limit is honored.
-    clear(&matches)
+    free_path_matches(&matches)
     collect_path_commands(dir, "cargo", "compile", &matches, 1)
     testing.expect_value(t, len(matches), 1)
     fmt.println("  ✓ [App] PATH command completion finds executables only")
@@ -155,11 +160,30 @@ test_compile_path_token_completion :: proc(t: ^testing.T) {
     testing.expect_value(t, len(matches), 1)
     testing.expect_value(t, matches[0], fmt.tprintf("compile %s/main.c", dir))
 
-    clear(&matches)
+    free_path_matches(&matches)
     complete_path_token("compile", "gcc -O2 ", fmt.tprintf("%s/su", dir), &matches)
     testing.expect_value(t, len(matches), 1)
     testing.expect_value(t, matches[0], fmt.tprintf("compile gcc -O2 %s/sub/", dir))
-    fmt.println("  ✓ [App] compile arguments complete as filesystem paths")
+
+    // Relative tokens complete against the supplied project root.
+    free_path_matches(&matches)
+    complete_path_token("compile", "", "ma", &matches, dir)
+    testing.expect_value(t, len(matches), 1)
+    testing.expect_value(t, matches[0], "compile main.c")
+
+    free_path_matches(&matches)
+    complete_path_token("compile", "", "su", &matches, dir)
+    testing.expect_value(t, len(matches), 1)
+    testing.expect_value(t, matches[0], "compile sub/")
+
+    // A root component at "/" must search the filesystem root.
+    free_path_matches(&matches)
+    complete_path_token("compile", "", "/us", &matches, dir)
+    testing.expect(t, len(matches) > 0)
+    if len(matches) > 0 {
+        testing.expect(t, strings.has_prefix(matches[0], "compile /usr"), matches[0])
+    }
+    fmt.println("  ✓ [App] compile arguments complete as project-relative paths")
 }
 
 @(test)
@@ -268,6 +292,12 @@ test_help_template_tokens_render :: proc(t: ^testing.T) {
         }
     }
 
+    // The title follows the configured editor name.
+    help_title := fmt.tprintf("%s - Help", EDITOR_NAME)
+    testing.expect(t, strings.contains(rendered, help_title))
+    underline := strings.repeat("=", len(help_title), context.temp_allocator)
+    testing.expect(t, strings.contains(rendered, underline))
+
     // Labels are derived from config constants rather than hardcoded text.
     completion_label := key_label(KEY_COMPLETION_TRIGGER, sdl.KMOD_CTRL, .Plain)
     testing.expect(t, strings.contains(rendered, completion_label))
@@ -282,9 +312,17 @@ test_help_template_tokens_render :: proc(t: ^testing.T) {
     testing.expect_value(t, has_gg, true)
     testing.expect(t, strings.contains(rendered, gg))
 
+    copy_line, has_copy := help_token_value("compile_yank")
+    testing.expect_value(t, has_copy, true)
+    testing.expect(t, strings.contains(rendered, copy_line))
+    copy_all, has_copy_all := help_token_value("compile_yank_all")
+    testing.expect_value(t, has_copy_all, true)
+    testing.expect(t, strings.contains(rendered, copy_all))
+
     // No known placeholder should leak verbatim into the rendered text.
     testing.expect(t, !strings.contains(rendered, "{completion_trigger}"))
     testing.expect(t, !strings.contains(rendered, "{split_h}"))
+    testing.expect(t, !strings.contains(rendered, "{compile_yank}"))
     fmt.println("  ✓ [Help] template tokens resolve from configuration")
 }
 
@@ -378,7 +416,8 @@ test_app_help_command :: proc(t: ^testing.T) {
     help_text := pt_full_text(&help_pane.editor.table)
     defer delete(help_text)
     testing.expect_value(t, help_text, want)
-    testing.expect(t, strings.contains(help_text, "Odin Text Editor - Help"))
+    help_title := fmt.tprintf("%s - Help", EDITOR_NAME)
+    testing.expect(t, strings.contains(help_text, help_title))
     completion_label := key_label(KEY_COMPLETION_TRIGGER, sdl.KMOD_CTRL, .Plain)
     testing.expect(t, strings.contains(help_text, completion_label))
     testing.expect(t, strings.contains(help_text, "wdired"))
@@ -408,6 +447,11 @@ test_app_help_command :: proc(t: ^testing.T) {
     send_key_event(&help_pane.editor, KEY_DELETE_CHAR)
     testing.expect_value(t, pt_get_length(&help_pane.editor.table), len(want))
     testing.expect_value(t, help_pane.editor.status_message, "Buffer is read-only")
+
+    // :w must not create a file for a read-only buffer (or close it via :wq)
+    app_execute_command(&app, "w")
+    testing.expect_value(t, app.cmd_prompt.message, "Buffer is read-only")
+    testing.expect_value(t, len(app.panes), 2)
 
     // Closing the help pane restores the original pane
     app_execute_command(&app, "q")
@@ -451,4 +495,163 @@ test_app_open_completion_doc_split :: proc(t: ^testing.T) {
     testing.expect(t, strings.contains(doc_text, "Documentation here"))
     testing.expect_value(t, orig.editor.completion.active, false)
     fmt.println("  ✓ [App] Shift+Enter completion docs open in a vertical split")
+}
+
+@(test)
+test_app_root_command :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    dir := "/tmp/odin_editor_tests/app_root"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    app_execute_command(&app, fmt.tprintf("root %s", dir))
+    testing.expect_value(t, app.root_dir, dir)
+    testing.expect_value(t, app.working_dir, dir)
+    testing.expect_value(t, app.lsp_manager.working_dir, dir)
+    testing.expect(t, strings.has_prefix(app.cmd_prompt.message, "Project root:"))
+    testing.expect_value(t, app_picker_root(&app), dir)
+    testing.expect_value(t, app_resolve_path(&app, "src/main.odin"), fmt.tprintf("%s/src/main.odin", dir))
+
+    app_execute_command(&app, "root")
+    testing.expect(t, strings.contains(app.cmd_prompt.message, dir))
+
+    app_execute_command(&app, "root /definitely/not/a/dir")
+    testing.expect_value(t, app.root_dir, dir)
+    testing.expect(t, strings.has_prefix(app.cmd_prompt.message, "Invalid directory"))
+    fmt.println("  ✓ [App] :root sets and reports the file-picker project root")
+}
+
+@(test)
+test_app_root_here_from_dired :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/app_root_here"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    pane := app.active_pane
+    pane.kind = .Dired
+    pane.dired.path = strings.clone(dir, context.allocator)
+
+    app_execute_command(&app, "root here")
+    testing.expect_value(t, app.root_dir, dir)
+    testing.expect(t, strings.contains(app.cmd_prompt.message, dir))
+    fmt.println("  ✓ [App] :root here adopts the current Dired directory")
+}
+
+@(test)
+test_app_recompile_self_alias :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    app.last_compile_cmd = strings.clone("printf 'recompiled\\n'")
+    app_run_compile(&app, app.last_compile_cmd)
+
+    comp: ^Pane
+    for p in app.panes {
+        if p.kind == .Compilation {
+            comp = p
+            break
+        }
+    }
+    testing.expect(t, comp != nil)
+    if comp == nil do return
+
+    compilation_wait(&comp.compilation)
+    testing.expect_value(t, comp.compilation.finished, true)
+    found := false
+    for line in comp.compilation.lines {
+        if strings.trim_space(line.text) == "recompiled" do found = true
+    }
+    testing.expect_value(t, found, true)
+    testing.expect_value(t, app.last_compile_cmd, "printf 'recompiled\\n'")
+    fmt.println("  ✓ [App] :recompile clones its command before freeing")
+}
+
+@(test)
+test_app_dired_refuses_dirty_editor :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/dirty_dired"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+    pane.editor.dirty = true
+
+    app_pane_open_dired(&app, pane, dir)
+    testing.expect_value(t, pane.kind, PaneKind.Editor)
+    testing.expect(t, strings.contains(app.cmd_prompt.message, "E37"))
+
+    pane.editor.dirty = false
+    app_pane_open_dired(&app, pane, dir)
+    testing.expect_value(t, pane.kind, PaneKind.Dired)
+    fmt.println("  ✓ [App] :dired refuses to hide a modified editor buffer")
+}
+
+@(test)
+test_app_edit_command_dispatches :: proc(t: ^testing.T) {
+    path := "/tmp/odin_editor_tests/edit_command.txt"
+    _ = os.remove(path)
+    testing.expect(t, os.write_entire_file_from_string(path, "edit me") == nil)
+    defer os.remove(path)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    app_execute_command(&app, fmt.tprintf("edit %s", path))
+    testing.expect_value(t, app.active_pane.editor.file_path, path)
+    text := pt_full_text(&app.active_pane.editor.table)
+    defer delete(text)
+    testing.expect_value(t, text, "edit me")
+    fmt.println("  ✓ [App] :edit dispatches like :e")
+}
+
+@(test)
+test_app_open_file_guards_dirty_and_read_only :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/open_guards"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    a := fmt.tprintf("%s/a.txt", dir)
+    b := fmt.tprintf("%s/b.txt", dir)
+    testing.expect(t, os.write_entire_file_from_string(a, "aaa") == nil)
+    testing.expect(t, os.write_entire_file_from_string(b, "bbb") == nil)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+
+    // Dirty buffers are not silently replaced.
+    set_editor_text(&pane.editor, "unsaved")
+    pane.editor.dirty = true
+    testing.expect_value(t, app_pane_open_file(&app, pane, b), false)
+    testing.expect(t, strings.contains(app.cmd_prompt.message, "E37"))
+    text := pt_full_text(&pane.editor.table)
+    testing.expect_value(t, text, "unsaved")
+    delete(text)
+
+    // Forced :e! replaces it.
+    app_execute_command(&app, fmt.tprintf("e! %s", b))
+    testing.expect_value(t, pane.editor.file_path, b)
+    testing.expect_value(t, pane.editor.dirty, false)
+
+    // Read-only buffers are not replaced, even when clean.
+    pane.editor.read_only = true
+    testing.expect_value(t, app_pane_open_file(&app, pane, a), false)
+    testing.expect_value(t, app.cmd_prompt.message, "Buffer is read-only")
+
+    // Opening a file cancels a stale wdired editing flag.
+    pane.editor.read_only = false
+    pane.dired.is_editing = true
+    testing.expect_value(t, app_pane_open_file(&app, pane, a), true)
+    testing.expect_value(t, pane.dired.is_editing, false)
+    fmt.println("  ✓ [App] file retargeting guards dirty/read-only and clears wdired")
 }

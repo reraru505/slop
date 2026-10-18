@@ -1,6 +1,5 @@
 package main
 
-import "core:path/filepath"
 import "core:strings"
 import sdl "vendor:sdl3"
 
@@ -1703,13 +1702,15 @@ syntax_highlight_toml_line :: proc(line: string, theme: ^Theme, colors: []sdl.FC
     if strings.has_prefix(trimmed, "[") {
         idx := strings.index(line, "[")
         if idx >= 0 {
-            end_idx := strings.last_index(line, "]")
+            // Only look for the closing bracket before any comment, so a ']'
+            // inside the trailing comment cannot extend the header.
+            comment_idx := strings.index_byte(line, '#')
+            header_end := n if comment_idx < 0 else comment_idx
+            end_idx := strings.last_index(line[:header_end], "]")
             if end_idx >= idx {
                 for k in idx ..= end_idx do colors[k] = theme.type_name
-                // Check if comment follows
-                comment_idx := strings.index(line[end_idx:], "#")
                 if comment_idx >= 0 {
-                    for k in (end_idx + comment_idx) ..< n do colors[k] = theme.comment
+                    for k in comment_idx ..< n do colors[k] = theme.comment
                 }
                 return
             }

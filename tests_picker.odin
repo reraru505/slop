@@ -1,5 +1,6 @@
 package main
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:strings"
@@ -7,8 +8,8 @@ import "core:testing"
 
 add_picker_item :: proc(fp: ^FilePicker, rel_path: string) {
     append(&fp.items, FilePickerItem{
-        rel_path  = strings.clone(rel_path),
-        full_path = strings.clone(rel_path),
+        rel_path  = strings.clone(rel_path, runtime.default_allocator()),
+        full_path = strings.clone(rel_path, runtime.default_allocator()),
     })
 }
 
@@ -120,6 +121,7 @@ test_picker_open_walks_tree :: proc(t: ^testing.T) {
     defer file_picker_destroy(&fp)
 
     file_picker_open(&fp, dir, nil)
+    file_picker_wait(&fp)
     testing.expect_value(t, fp.active, true)
     testing.expect_value(t, fp.root_dir, dir)
     testing.expect_value(t, fp.query_len, 0)
@@ -131,4 +133,56 @@ test_picker_open_walks_tree :: proc(t: ^testing.T) {
     file_picker_close(&fp, nil)
     testing.expect_value(t, fp.active, false)
     fmt.println("  ✓ [Picker] open skips VCS/build dirs and editor backups")
+}
+
+@(test)
+test_picker_scan_defers_results :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/picker_async"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/one.txt", dir), "1") == nil)
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/two.txt", dir), "2") == nil)
+
+    fp: FilePicker
+    file_picker_init(&fp)
+    defer file_picker_destroy(&fp)
+
+    file_picker_open(&fp, dir, nil)
+    // The walk is owned by a background thread; nothing is published until
+    // the main thread polls for completion.
+    testing.expect(t, fp.scan_thread != nil)
+    testing.expect_value(t, len(fp.items), 0)
+
+    file_picker_wait(&fp)
+    testing.expect(t, fp.scan_thread == nil)
+    testing.expect_value(t, len(fp.items), 2)
+
+    file_picker_close(&fp, nil)
+    testing.expect_value(t, fp.active, false)
+    fmt.println("  ✓ [Picker] tree walk runs off-thread and publishes on poll")
+}
+
+@(test)
+test_picker_query_utf8_truncation :: proc(t: ^testing.T) {
+    fp: FilePicker
+    file_picker_init(&fp)
+    defer file_picker_destroy(&fp)
+
+    // Leave exactly one byte of room; a two-byte rune must not be split.
+    for fp.query_len < len(fp.query_buffer) - 1 {
+        fp.query_buffer[fp.query_len] = 'a'
+        fp.query_len += 1
+    }
+    before := fp.query_len
+    picker_append_query(&fp, "é")
+    testing.expect_value(t, fp.query_len, before)
+
+    // With room, multi-byte text is copied intact.
+    fp.query_len = 0
+    picker_append_query(&fp, "éx")
+    testing.expect_value(t, fp.query_len, 3)
+    testing.expect_value(t, string(fp.query_buffer[:fp.query_len]), "éx")
+    fmt.println("  ✓ [Picker] query buffer never splits UTF-8 sequences")
 }

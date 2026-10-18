@@ -10,6 +10,11 @@ ThemeId :: enum {
     Hemisu,
 }
 
+// Keep this in sync with ThemeId; used for cycling and completion.
+THEME_IDS :: [?]ThemeId{.GruberDarker, .Naysayer, .Kanagawa, .Hemisu}
+THEME_NAMES :: [?]string{"gruber-darker", "naysayer", "kanagawa", "hemisu"}
+THEME_COUNT :: len(THEME_IDS)
+
 // Compile-time default theme
 
 Theme :: struct {

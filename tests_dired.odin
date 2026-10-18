@@ -148,8 +148,10 @@ test_dired_load_path :: proc(t: ^testing.T) {
     testing.expect_value(t, d.entries[2].is_dir, false)
     testing.expect_value(t, d.entries[2].size, 3)
 
-    // Nonexistent directories fail without leaving a bogus entry list
+    // Nonexistent directories fail without destroying the current listing
     testing.expect_value(t, dired_load_path(&d, "/tmp/odin_editor_tests/does_not_exist_98765"), false)
+    testing.expect_value(t, d.path, dir)
+    testing.expect_value(t, len(d.entries), 4)
     fmt.println("  ✓ [Dired] directory load, sort order and error handling verified")
 }
 
@@ -291,4 +293,74 @@ test_dired_dispatch_uses_config_keys :: proc(t: ^testing.T) {
     testing.expect_value(t, dired_handle_event(&d, &ev, &app, pane), true)
     testing.expect(t, d.sort_by != before)
     fmt.println("  ✓ [Dired] dispatch follows configured key constants")
+}
+
+@(test)
+test_dired_symlink_directory :: proc(t: ^testing.T) {
+    root := "/tmp/odin_editor_tests/dired_symlink"
+    _ = os.remove_all(root)
+    testing.expect(t, os.make_directory_all(root) == nil)
+    defer os.remove_all(root)
+
+    target := fmt.tprintf("%s/real_dir", root)
+    link := fmt.tprintf("%s/link_dir", root)
+    testing.expect(t, os.make_directory(target) == nil)
+    testing.expect(t, os.symlink(target, link) == nil)
+
+    d: Dired
+    dired_init(&d)
+    defer dired_destroy(&d)
+    testing.expect(t, dired_load_path(&d, root))
+
+    found := false
+    for e in d.entries {
+        if e.name == "link_dir" {
+            found = true
+            testing.expect_value(t, e.is_dir, true)
+        }
+    }
+    testing.expect_value(t, found, true)
+    fmt.println("  ✓ [Dired] symlinked directories are treated as directories")
+}
+
+@(test)
+test_dired_wdired_rejects_unsafe_edits :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/dired_wdired_validate"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    file := fmt.tprintf("%s/a.txt", dir)
+    testing.expect(t, os.write_entire_file_from_string(file, "original") == nil)
+
+    d: Dired
+    dired_init(&d)
+    defer dired_destroy(&d)
+    testing.expect(t, dired_load_path(&d, dir))
+
+    e: Editor
+    editor_init(&e, nil, "")
+    defer editor_destroy(&e)
+    dired_enter_edit_mode(&d, &e, nil, nil)
+
+    // Duplicate entries must not truncate the existing file.
+    set_editor_text(&e, "a.txt\na.txt\n")
+    msg := dired_apply_edits(&d, &e)
+    testing.expect(t, strings.contains(msg, "duplicate"), msg)
+
+    // Path separators must not escape the listed directory.
+    set_editor_text(&e, "a.txt\n../escape.txt\n")
+    msg = dired_apply_edits(&d, &e)
+    testing.expect(t, strings.contains(msg, "invalid name"), msg)
+    testing.expect_value(t, os.exists("/tmp/odin_editor_tests/escape.txt"), false)
+
+    // Changing a file into a directory (or vice versa) is refused.
+    set_editor_text(&e, "a.txt/\n")
+    msg = dired_apply_edits(&d, &e)
+    testing.expect(t, strings.contains(msg, "cannot change"), msg)
+
+    content, read_err := os.read_entire_file(file, context.temp_allocator)
+    testing.expect_value(t, read_err, nil)
+    testing.expect_value(t, string(content), "original")
+    fmt.println("  ✓ [Dired] wdired rejects duplicates, path escapes and type changes")
 }

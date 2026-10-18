@@ -133,3 +133,14 @@ test_font_cell_width :: proc(t: ^testing.T) {
     expect_close(t, font_cell_width(&f), 20.168, "cell width")
     fmt.println("  ✓ [Font] column width comes from the monospace advance")
 }
+
+@(test)
+test_font_ligature_table_has_reachable_starts :: proc(t: ^testing.T) {
+    for seq in LIGATURE_SEQUENCES {
+        testing.expectf(t, len(seq) > 0, "empty ligature sequence")
+        if len(seq) > 0 {
+            testing.expectf(t, is_ligature_start(seq[0]), "unreachable ligature %q", seq)
+        }
+    }
+    fmt.println("  ✓ [Font] every ligature sequence has a reachable start byte")
+}

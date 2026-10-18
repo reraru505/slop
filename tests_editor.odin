@@ -1302,3 +1302,303 @@ test_editor_enter_between_braces :: proc(t: ^testing.T) {
 }
 
 
+
+@(test)
+test_editor_insert_text_at_cursor_multiline :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "abc\ndef")
+    defer editor_destroy(&e)
+
+    // Multi-line clip: the cursor ends after the last inserted character.
+    e.cursor.row = 0
+    e.cursor.col = 1
+    editor_insert_text_at_cursor(&e, "X\nY\nZ")
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "aX\nY\nZbc\ndef")
+    testing.expect_value(t, e.cursor.row, 2)
+    testing.expect_value(t, e.cursor.col, 1)
+    testing.expect_value(t, e.desired_col, 1)
+
+    // A trailing newline leaves the cursor at the start of the next line.
+    e.cursor.row = 2
+    e.cursor.col = 1
+    editor_insert_text_at_cursor(&e, "Q\n")
+    text2 := pt_full_text(&e.table)
+    defer delete(text2)
+    testing.expect_value(t, text2, "aX\nY\nZQ\nbc\ndef")
+    testing.expect_value(t, e.cursor.row, 3)
+    testing.expect_value(t, e.cursor.col, 0)
+    testing.expect_value(t, e.desired_col, 0)
+
+    // A single-line clip only advances the column.
+    e.cursor.row = 0
+    e.cursor.col = 0
+    editor_insert_text_at_cursor(&e, "hi")
+    text3 := pt_full_text(&e.table)
+    defer delete(text3)
+    testing.expect_value(t, text3, "hiaX\nY\nZQ\nbc\ndef")
+    testing.expect_value(t, e.cursor.row, 0)
+    testing.expect_value(t, e.cursor.col, 2)
+    testing.expect_value(t, e.desired_col, 2)
+
+    // Empty text is a no-op.
+    editor_insert_text_at_cursor(&e, "")
+    testing.expect_value(t, e.cursor.col, 2)
+    fmt.println("  ✓ [Editor] pasted text advances rows and leaves the cursor at its end")
+}
+
+@(test)
+test_editor_read_only_save_rejected :: proc(t: ^testing.T) {
+    path := "/tmp/odin_editor_tests/read_only_save.txt"
+    _ = os.remove(path)
+
+    e: Editor
+    editor_init(&e, nil, "do not write", path)
+    defer editor_destroy(&e)
+    e.read_only = true
+
+    testing.expect_value(t, editor_save_file(&e, nil), false)
+    testing.expect_value(t, os.exists(path), false)
+    testing.expect_value(t, e.status_message, "Buffer is read-only")
+    fmt.println("  ✓ [Editor] read-only buffers cannot be written")
+}
+
+@(test)
+test_editor_mutations_schedule_lsp_sync :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "abc\ndef")
+    defer editor_destroy(&e)
+    e.dirty = false
+    e.needs_lsp_sync = false
+
+    // Paste/text insertion
+    editor_insert_text_at_cursor(&e, "X")
+    testing.expect_value(t, e.dirty, true)
+    testing.expect_value(t, e.needs_lsp_sync, true)
+
+    // Undo
+    e.dirty = false
+    e.needs_lsp_sync = false
+    send_key_event(&e, KEY_UNDO)
+    testing.expect_value(t, e.dirty, true)
+    testing.expect_value(t, e.needs_lsp_sync, true)
+
+    // Line moves
+    e.dirty = false
+    e.needs_lsp_sync = false
+    editor_move_lines(&e, 1)
+    testing.expect_value(t, e.dirty, true)
+    testing.expect_value(t, e.needs_lsp_sync, true)
+    fmt.println("  ✓ [Editor] paste/undo/line-move schedule LSP sync")
+}
+
+@(test)
+test_editor_autopair_step_over_stays_clean :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "()")
+    defer editor_destroy(&e)
+    editor_set_mode(&e, .Insert, nil)
+    e.cursor.col = 1
+    e.dirty = false
+    e.needs_lsp_sync = false
+
+    simulate_typing(&e, ")")
+    testing.expect_value(t, e.cursor.col, 2)
+    testing.expect_value(t, e.dirty, false)
+    testing.expect_value(t, e.needs_lsp_sync, false)
+    fmt.println("  ✓ [Editor] auto-pair step-over does not dirty the buffer")
+}
+
+@(test)
+test_editor_dollar_vertical_and_append_eol :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "abcdef\nabc")
+    defer editor_destroy(&e)
+
+    // `$` keeps a sticky EOL column; j lands at the shorter line's EOL.
+    e.cursor.row = 0
+    e.cursor.col = 6
+    e.desired_col = 6
+    send_key_event(&e, KEY_LINE_END_DOLLAR, sdl.KMOD_SHIFT)
+    testing.expect_value(t, e.desired_col, DESIRED_EOL)
+    send_key_event(&e, KEY_MOVE_DOWN)
+    testing.expect_value(t, e.cursor.row, 1)
+    testing.expect_value(t, e.cursor.col, 3)
+
+    // `a` at EOL (as left by Esc) must not step into a virtual column.
+    set_editor_text(&e, "abc")
+    e.cursor.row = 0
+    e.cursor.col = 3
+    e.desired_col = 3
+    send_key_event(&e, KEY_APPEND)
+    simulate_typing(&e, "d")
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "abcd")
+    fmt.println("  ✓ [Editor] sticky $ and append-at-EOL stay within the line")
+}
+
+@(test)
+test_editor_undo_resnaps_cursor :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "")
+    defer editor_destroy(&e)
+
+    editor_set_mode(&e, .Insert, nil)
+    simulate_typing(&e, "hello")
+    editor_set_mode(&e, .Normal, nil)
+    send_key_event(&e, KEY_UNDO)
+
+    testing.expect_value(t, pt_get_length(&e.table), 0)
+    testing.expect_value(t, e.cursor.col, 0)
+    testing.expect_value(t, e.desired_col, 0)
+
+    editor_set_mode(&e, .Insert, nil)
+    simulate_typing(&e, "x")
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "x")
+    fmt.println("  ✓ [Editor] undo re-snaps the cursor instead of materializing spaces")
+}
+
+@(test)
+test_editor_completion_is_single_undo_step :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "sta")
+    defer editor_destroy(&e)
+    editor_set_mode(&e, .Insert, nil)
+    e.cursor.col = 3
+    e.desired_col = 3
+    e.completion.active = true
+    e.completion.trigger_row = 0
+    e.completion.trigger_col = 0
+    append(&e.completion.items, LspCompletionItem{
+        label = strings.clone("static"),
+        insert_text = strings.clone("static"),
+    })
+
+    editor_apply_completion(&e)
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "static")
+
+    // Prefix replacement is one pt_replace edit, so one undo restores "sta".
+    testing.expect_value(t, pt_undo(&e.table), true)
+    text2 := pt_full_text(&e.table)
+    defer delete(text2)
+    testing.expect_value(t, text2, "sta")
+    fmt.println("  ✓ [Editor] completion replacement is a single undo step")
+}
+
+@(test)
+test_editor_completion_multiline_cursor :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "pri")
+    defer editor_destroy(&e)
+    editor_set_mode(&e, .Insert, nil)
+    e.cursor.col = 3
+    e.desired_col = 3
+    e.completion.active = true
+    e.completion.trigger_row = 0
+    e.completion.trigger_col = 0
+    append(&e.completion.items, LspCompletionItem{
+        label = strings.clone("snippet"),
+        insert_text = strings.clone("static\nfn"),
+    })
+
+    editor_apply_completion(&e)
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "static\nfn")
+    testing.expect_value(t, e.cursor.row, 1)
+    testing.expect_value(t, e.cursor.col, 2)
+    testing.expect_value(t, e.desired_col, 2)
+    fmt.println("  ✓ [Editor] multi-line completion advances rows")
+}
+
+@(test)
+test_editor_completion_ignores_stale_trigger_row :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "pri\nxyz")
+    defer editor_destroy(&e)
+    editor_set_mode(&e, .Insert, nil)
+    e.cursor.row = 1
+    e.cursor.col = 3
+    e.desired_col = 3
+    e.completion.active = true
+    e.completion.trigger_row = 0
+    e.completion.trigger_col = 0
+    append(&e.completion.items, LspCompletionItem{
+        label = strings.clone("Q"),
+        insert_text = strings.clone("Q"),
+    })
+
+    editor_apply_completion(&e)
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "pri\nxyzQ")
+    testing.expect_value(t, e.cursor.row, 1)
+    testing.expect_value(t, e.cursor.col, 4)
+    fmt.println("  ✓ [Editor] completion does not delete across a moved trigger row")
+}
+
+@(test)
+test_editor_read_only_blocks_line_moves :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "aa\nbb")
+    defer editor_destroy(&e)
+    e.read_only = true
+    e.cursor.row = 0
+
+    send_key_event(&e, KEY_MOVE_LINE_DOWN, sdl.KMOD_ALT)
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "aa\nbb")
+    testing.expect_value(t, e.status_message, "Buffer is read-only")
+    fmt.println("  ✓ [Editor] Alt+J cannot mutate a read-only buffer")
+}
+
+@(test)
+test_editor_crlf_join_and_line_delete :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "ab\r\ncd")
+    defer editor_destroy(&e)
+
+    // d at EOL joins the next line, removing both CR and LF.
+    e.cursor.row = 0
+    e.cursor.col = editor_get_line_len(&e, 0)
+    send_key_event(&e, KEY_DELETE_CHAR)
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "abcd")
+
+    // Deleting the final line of a CRLF file also removes the preceding CRLF.
+    set_editor_text(&e, "aaa\r\nbbb")
+    e.cursor.row = 1
+    e.cursor.col = 0
+    send_key_event(&e, KEY_SELECT_LINE)
+    send_key_event(&e, KEY_DELETE_SELECTION)
+    text2 := pt_full_text(&e.table)
+    defer delete(text2)
+    testing.expect_value(t, text2, "aaa")
+    fmt.println("  ✓ [Editor] CRLF join and final-line deletion handle both bytes")
+}
+
+@(test)
+test_editor_visual_delete_clamps_virtual_start :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "ab\ncdefgh")
+    defer editor_destroy(&e)
+
+    e.mode = .Visual
+    e.selection_anchor = Cursor{row = 0, col = 5}
+    e.cursor = Cursor{row = 1, col = 5}
+    e.desired_col = 5
+
+    editor_delete_selection(&e)
+    text := pt_full_text(&e.table)
+    defer delete(text)
+    testing.expect_value(t, text, "ab")
+    fmt.println("  ✓ [Editor] visual delete clamps a virtual start column to its line")
+}

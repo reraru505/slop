@@ -1,10 +1,6 @@
 package main
 
-import "core:math"
-import "core:os"
-import "core:path/filepath"
 import "core:strings"
-import "core:time"
 import sdl "vendor:sdl3"
 
 SplitDir :: enum {
@@ -146,13 +142,16 @@ app_split_pane :: proc(app: ^App, target: ^Pane, dir: SplitDir) {
         new_pane.editor.scroll_row = target.editor.scroll_row
         new_pane.editor.scroll_col = target.editor.scroll_col
         new_pane.editor.desired_col = target.editor.desired_col
+        new_pane.editor.read_only = target.editor.read_only
     } else if target.kind == .Dired {
         dired_load_path(&new_pane.dired, target.dired.path)
         new_pane.dired.cursor = target.dired.cursor
         new_pane.dired.scroll = target.dired.scroll
     } else if target.kind == .Compilation {
+        // Do not start a second concurrent build just because the pane was
+        // split; copy the command so r/g can re-run it explicitly.
         if target.compilation.command != "" {
-            compilation_run_command(&new_pane.compilation, target.compilation.command)
+            new_pane.compilation.command = strings.clone(target.compilation.command, context.allocator)
         }
     }
 

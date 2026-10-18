@@ -1,11 +1,19 @@
 package main
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
 import "core:strings"
+import "core:sync"
+import "core:thread"
+import "core:time"
 import sdl "vendor:sdl3"
+
+// Cap the walk so opening the picker in a huge tree stays bounded. The scan
+// runs off the main thread, so even a slow filesystem cannot freeze the UI.
+FILE_PICKER_MAX_ITEMS :: 20_000
 
 FilePickerItem :: struct {
     rel_path : string,
@@ -21,22 +29,35 @@ FilePicker :: struct {
     query_len       : int,
     selected_index  : int,
     scroll_offset   : int,
+
+    // Background walk state. `scan_thread` itself is main-thread-owned; the
+    // result fields are guarded by scan_mutex.
+    scan_thread     : ^thread.Thread,
+    scan_mutex      : sync.Mutex,
+    scan_done       : bool,
+    scan_cancel     : bool,
+    scan_items      : [dynamic]FilePickerItem,
 }
 
 file_picker_init :: proc(fp: ^FilePicker) {
     fp.active = false
     fp.root_dir = ""
-    fp.items = make([dynamic]FilePickerItem, 0, 256)
-    fp.filtered_indices = make([dynamic]int, 0, 256)
+    fp.items = make([dynamic]FilePickerItem, 0, 256, runtime.default_allocator())
+    fp.filtered_indices = make([dynamic]int, 0, 256, runtime.default_allocator())
     fp.query_len = 0
     fp.selected_index = 0
     fp.scroll_offset = 0
+    fp.scan_thread = nil
+    fp.scan_done = false
+    fp.scan_cancel = false
+    fp.scan_items = nil
 }
 
 file_picker_destroy :: proc(fp: ^FilePicker) {
+    file_picker_stop_scan(fp)
     for it in fp.items {
-        delete(it.rel_path)
-        delete(it.full_path)
+        delete(it.rel_path, runtime.default_allocator())
+        delete(it.full_path, runtime.default_allocator())
     }
     delete(fp.items)
     delete(fp.filtered_indices)
@@ -44,6 +65,7 @@ file_picker_destroy :: proc(fp: ^FilePicker) {
 }
 
 file_picker_close :: proc(fp: ^FilePicker, app: ^App = nil) {
+    file_picker_stop_scan(fp)
     fp.active = false
     if app != nil && app.window != nil {
         needs_text := false
@@ -115,12 +137,165 @@ file_picker_filter :: proc(fp: ^FilePicker) {
     }
 }
 
-file_picker_open :: proc(fp: ^FilePicker, root: string, window: ^sdl.Window = nil) {
-    for it in fp.items {
-        delete(it.rel_path)
-        delete(it.full_path)
+file_picker_scan_worker :: proc(data: rawptr) {
+    fp := (^FilePicker)(data)
+    alloc := runtime.default_allocator()
+    items := make([dynamic]FilePickerItem, 0, 256, alloc)
+    canceled := false
+
+    w := os.walker_create(fp.root_dir)
+    defer os.walker_destroy(&w)
+
+    for info in os.walker_walk(&w) {
+        if sync.atomic_load(&fp.scan_cancel) {
+            canceled = true
+            break
+        }
+        // walker_error persists after one bad directory. Error iterations
+        // yield a zero File_Info; skip just those, not every later entry.
+        if info.fullpath == "" {
+            continue
+        }
+
+        if info.type == .Directory {
+            name := info.name
+            // Hidden directories cover .git, .cache, .local, .cargo, etc.
+            if name != "" && name[0] == '.' {
+                os.walker_skip_dir(&w)
+                continue
+            }
+            switch name {
+            case "bin", "node_modules", "target", "build", "__pycache__":
+                os.walker_skip_dir(&w)
+                continue
+            }
+            continue
+        }
+
+        // The walker does not descend symlinks; skip symlinked directories so
+        // they are not offered as (unopenable) files.
+        if info.type == .Symlink && os.is_dir(info.fullpath) {
+            continue
+        }
+
+        // Skip editor backup/swap files.
+        if strings.has_suffix(info.name, "~") || strings.has_suffix(info.name, ".swp") {
+            continue
+        }
+
+        rel, rel_err := filepath.rel(fp.root_dir, info.fullpath, alloc)
+        if rel_err != .None {
+            rel = strings.clone(info.name, alloc)
+        }
+
+        append(&items, FilePickerItem{
+            rel_path  = rel,
+            full_path = strings.clone(info.fullpath, alloc),
+        })
+        if len(items) >= FILE_PICKER_MAX_ITEMS {
+            break
+        }
     }
-    clear(&fp.items)
+
+    if !canceled {
+        slice.sort_by(items[:], proc(a, b: FilePickerItem) -> bool {
+            return a.rel_path < b.rel_path
+        })
+    }
+
+    sync.mutex_lock(&fp.scan_mutex)
+    fp.scan_done = true
+    if canceled {
+        sync.mutex_unlock(&fp.scan_mutex)
+        for it in items {
+            delete(it.rel_path, alloc)
+            delete(it.full_path, alloc)
+        }
+        delete(items)
+    } else {
+        fp.scan_items = items
+        sync.mutex_unlock(&fp.scan_mutex)
+    }
+}
+
+// Adopt results from a finished scan. Called on the main thread each frame.
+file_picker_poll :: proc(fp: ^FilePicker) {
+    if fp.scan_thread == nil do return
+
+    done := false
+    sync.mutex_lock(&fp.scan_mutex)
+    done = fp.scan_done
+    sync.mutex_unlock(&fp.scan_mutex)
+    if !done do return
+
+    thread.join(fp.scan_thread)
+    thread.destroy(fp.scan_thread)
+    fp.scan_thread = nil
+
+    scan_items: [dynamic]FilePickerItem
+    sync.mutex_lock(&fp.scan_mutex)
+    scan_items = fp.scan_items
+    fp.scan_items = nil
+    fp.scan_done = false
+    sync.mutex_unlock(&fp.scan_mutex)
+
+    if scan_items != nil {
+        alloc := runtime.default_allocator()
+        for it in fp.items {
+            delete(it.rel_path, alloc)
+            delete(it.full_path, alloc)
+        }
+        delete(fp.items)
+        fp.items = scan_items
+    }
+
+    fp.selected_index = 0
+    fp.scroll_offset = 0
+    file_picker_filter(fp)
+}
+
+// Cancel and join a running scan, discarding partial results.
+file_picker_stop_scan :: proc(fp: ^FilePicker) {
+    if fp.scan_thread == nil do return
+
+    sync.atomic_store(&fp.scan_cancel, true)
+    thread.join(fp.scan_thread)
+    thread.destroy(fp.scan_thread)
+    fp.scan_thread = nil
+
+    scan_items: [dynamic]FilePickerItem
+    sync.mutex_lock(&fp.scan_mutex)
+    scan_items = fp.scan_items
+    fp.scan_items = nil
+    fp.scan_done = false
+    sync.mutex_unlock(&fp.scan_mutex)
+
+    alloc := runtime.default_allocator()
+    for it in scan_items {
+        delete(it.rel_path, alloc)
+        delete(it.full_path, alloc)
+    }
+    delete(scan_items)
+}
+
+// Blocking wait used by tests.
+file_picker_wait :: proc(fp: ^FilePicker) {
+    for fp.scan_thread != nil {
+        file_picker_poll(fp)
+        if fp.scan_thread != nil do time.sleep(time.Millisecond)
+    }
+}
+
+file_picker_open :: proc(fp: ^FilePicker, root: string, window: ^sdl.Window = nil) {
+    file_picker_stop_scan(fp)
+
+    alloc := runtime.default_allocator()
+    for it in fp.items {
+        delete(it.rel_path, alloc)
+        delete(it.full_path, alloc)
+    }
+    delete(fp.items)
+    fp.items = nil
     clear(&fp.filtered_indices)
 
     abs_root, abs_err := filepath.abs(root, context.allocator)
@@ -130,56 +305,48 @@ file_picker_open :: proc(fp: ^FilePicker, root: string, window: ^sdl.Window = ni
     if fp.root_dir != "" do delete(fp.root_dir)
     fp.root_dir = abs_root
 
-    // Walk directory tree
-    w := os.walker_create(abs_root)
-    defer os.walker_destroy(&w)
-
-    for info in os.walker_walk(&w) {
-        if _, err := os.walker_error(&w); err != nil {
-            continue
-        }
-
-        // Check if directory should be skipped
-        if info.type == .Directory {
-            name := info.name
-            if name == ".git" || name == ".odin" || name == "bin" ||
-               name == ".cache" || name == "node_modules" || name == "target" ||
-               name == "build" || name == ".gemini" || name == "__pycache__" {
-                os.walker_skip_dir(&w)
-                continue
-            }
-            continue
-        }
-
-        // Skip binary and backup files
-        if strings.has_suffix(info.name, "~") || strings.has_suffix(info.name, ".swp") {
-            continue
-        }
-
-        rel, rel_err := filepath.rel(abs_root, info.fullpath, context.allocator)
-        if rel_err != .None {
-            rel = strings.clone(info.name, context.allocator)
-        }
-
-        append(&fp.items, FilePickerItem{
-            rel_path  = rel,
-            full_path = strings.clone(info.fullpath, context.allocator),
-        })
-    }
-
-    // Sort items alphabetically by rel_path
-    slice.sort_by(fp.items[:], proc(a, b: FilePickerItem) -> bool {
-        return a.rel_path < b.rel_path
-    })
-
     fp.query_len = 0
     fp.selected_index = 0
     fp.scroll_offset = 0
     file_picker_filter(fp)
     fp.active = true
 
+    sync.atomic_store(&fp.scan_cancel, false)
+    sync.mutex_lock(&fp.scan_mutex)
+    fp.scan_done = false
+    sync.mutex_unlock(&fp.scan_mutex)
+    fp.scan_thread = thread.create_and_start_with_data(rawptr(fp), file_picker_scan_worker)
+
     if window != nil {
         _ = sdl.StartTextInput(window)
+    }
+}
+
+// Append query text without splitting a UTF-8 sequence at the buffer limit.
+picker_append_query :: proc(fp: ^FilePicker, text: string, filter_controls := false) {
+    if len(text) == 0 do return
+
+    if filter_controls {
+        b: strings.Builder
+        strings.builder_init(&b, 0, len(text), context.temp_allocator)
+        for ch in transmute([]u8)text {
+            if ch >= 32 && ch != 127 do strings.write_byte(&b, ch)
+        }
+        picker_append_query(fp, strings.to_string(b))
+        return
+    }
+
+    available := len(fp.query_buffer) - fp.query_len
+    if available <= 0 do return
+
+    take := min(len(text), available)
+    // If cutting inside a multi-byte rune, back up to its lead byte.
+    for take > 0 && take < len(text) && (text[take] & 0xC0) == 0x80 {
+        take -= 1
+    }
+    for i in 0 ..< take {
+        fp.query_buffer[fp.query_len] = text[i]
+        fp.query_len += 1
     }
 }
 
@@ -188,13 +355,7 @@ file_picker_handle_event :: proc(fp: ^FilePicker, event: ^sdl.Event, app: ^App) 
 
     #partial switch event.type {
     case .TEXT_INPUT:
-        text_str := string(event.text.text)
-        for b in transmute([]u8)text_str {
-            if fp.query_len < len(fp.query_buffer) {
-                fp.query_buffer[fp.query_len] = b
-                fp.query_len += 1
-            }
-        }
+        picker_append_query(fp, string(event.text.text))
         fp.selected_index = 0
         fp.scroll_offset = 0
         file_picker_filter(fp)
@@ -214,13 +375,9 @@ file_picker_handle_event :: proc(fp: ^FilePicker, event: ^sdl.Event, app: ^App) 
             if sdl.HasClipboardText() {
                 clip_raw := sdl.GetClipboardText()
                 if clip_raw != nil {
+                    defer sdl.free(rawptr(clip_raw))
                     clip := string(cstring(clip_raw))
-                    for b in transmute([]u8)clip {
-                        if b >= 32 && b <= 126 && fp.query_len < len(fp.query_buffer) {
-                            fp.query_buffer[fp.query_len] = b
-                            fp.query_len += 1
-                        }
-                    }
+                    picker_append_query(fp, clip, filter_controls = true)
                     fp.selected_index = 0
                     fp.scroll_offset = 0
                     file_picker_filter(fp)
@@ -251,7 +408,9 @@ file_picker_handle_event :: proc(fp: ^FilePicker, event: ^sdl.Event, app: ^App) 
         }
 
         if is_ctrl && key == sdl.K_W {
-            for fp.query_len > 0 && fp.query_buffer[fp.query_len - 1] == ' ' {
+            // Drop trailing separators first, then the preceding segment.
+            for fp.query_len > 0 &&
+                (fp.query_buffer[fp.query_len - 1] == ' ' || fp.query_buffer[fp.query_len - 1] == '/') {
                 fp.query_len -= 1
             }
             for fp.query_len > 0 && fp.query_buffer[fp.query_len - 1] != ' ' && fp.query_buffer[fp.query_len - 1] != '/' {
@@ -282,8 +441,11 @@ file_picker_handle_event :: proc(fp: ^FilePicker, event: ^sdl.Event, app: ^App) 
                 item_idx := fp.filtered_indices[fp.selected_index]
                 item := fp.items[item_idx]
                 target_path := strings.clone(item.full_path, context.temp_allocator)
-                file_picker_close(fp, app)
-                app_pane_open_file(app, app.active_pane, target_path)
+                // Keep the picker open if the target pane rejects the open
+                // (dirty buffer / read-only help).
+                if app_pane_open_file(app, app.active_pane, target_path) {
+                    file_picker_close(fp, app)
+                }
             }
             return true
         }
@@ -291,7 +453,9 @@ file_picker_handle_event :: proc(fp: ^FilePicker, event: ^sdl.Event, app: ^App) 
         return true // Intercept all other keys while picker is open
     }
 
-    return false
+    // While modal, swallow mouse/wheel events too so clicks do not change the
+    // pane behind the picker.
+    return true
 }
 
 file_picker_render :: proc(fp: ^FilePicker, renderer: ^sdl.Renderer, font: ^Font, screen_w: f32, screen_h: f32, theme: ^Theme) {
@@ -344,7 +508,8 @@ file_picker_render :: proc(fp: ^FilePicker, renderer: ^sdl.Renderer, font: ^Font
     sdl.RenderFillRect(renderer, &cursor_rect)
 
     // Match count on top right
-    count_str := fmt.tprintf("%d / %d", len(fp.filtered_indices), len(fp.items))
+    scanning := fp.scan_thread != nil
+    count_str := "scanning..." if scanning else fmt.tprintf("%d / %d", len(fp.filtered_indices), len(fp.items))
     count_w := f32(len(count_str)) * 10.0 * scale
     push_line(font, count_str, Vec2{modal_x + modal_w - count_w - 16.0, modal_y + 8.0}, theme.comment, .HALF)
 
@@ -384,6 +549,7 @@ file_picker_render :: proc(fp: ^FilePicker, renderer: ^sdl.Renderer, font: ^Font
 
     // If no results
     if len(fp.filtered_indices) == 0 {
-        push_line(font, "No matching files", Vec2{modal_x + 20.0, list_y + 10.0}, theme.comment, .HALF)
+        message := "Scanning..." if scanning else "No matching files"
+        push_line(font, message, Vec2{modal_x + 20.0, list_y + 10.0}, theme.comment, .HALF)
     }
 }

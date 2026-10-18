@@ -70,6 +70,7 @@ App :: struct {
     pending_w_cmd    : bool,
     pending_leader   : bool,
     working_dir      : string,
+    root_dir         : string,
     file_picker      : FilePicker,
     last_compile_cmd : string,
     current_theme_id : ThemeId,
@@ -77,6 +78,40 @@ App :: struct {
     running          : bool,
     font_density     : f32,
     lsp_manager      : LspManager,
+}
+
+// Current project root. Falls back to the working directory for callers
+// (mostly tests) that build an App without running load().
+app_picker_root :: proc(app: ^App) -> string {
+    if app.root_dir != "" do return app.root_dir
+    return app.working_dir
+}
+
+// Change the project root. This is also the base directory for compilation,
+// the picker, relative :e/:sp/:vs paths, and new LSP clients. It intentionally
+// does not call chdir; :cd does that as well.
+app_set_project_root :: proc(app: ^App, dir: string) {
+    if app.root_dir != "" do delete(app.root_dir)
+    app.root_dir = strings.clone(dir, context.allocator)
+
+    if app.working_dir != "" do delete(app.working_dir)
+    app.working_dir = strings.clone(dir, context.allocator)
+
+    lsp_manager_set_working_dir(&app.lsp_manager, dir)
+}
+
+// Resolve a user-supplied path against the project root. Absolute paths are
+// returned unchanged; every other path is rooted at the project directory.
+app_resolve_path :: proc(app: ^App, path: string) -> string {
+    p := expand_home_path(path)
+    if p == "" || filepath.is_abs(p) do return p
+
+    root := app_picker_root(app)
+    if root == "" do return p
+
+    joined, err := filepath.join([]string{root, p}, context.temp_allocator)
+    if err != nil do return p
+    return joined
 }
 
 app_get_lsp_for_file :: proc(app: ^App, file_path: string) -> ^LspClient {
@@ -149,15 +184,33 @@ collect_path_commands :: proc(
 complete_path_token :: proc(
     cmd_prefix, head, token: string,
     matches: ^[dynamic]string,
+    base_dir := "",
 ) {
-    search_dir := "."
+    base := base_dir
+    if base == "" do base = "."
+
+    search_dir := base
     dir_part := ""
     name_prefix := token
     if slash := strings.last_index_byte(token, '/'); slash >= 0 {
-        search_dir = token[:slash]
-        if search_dir == "" do search_dir = "/"
+        dir_no_slash := token[:slash]
         dir_part = token[:slash + 1]
         name_prefix = token[slash + 1:]
+
+        if dir_no_slash == "" && strings.has_prefix(token, "/") {
+            // "/us" has an empty dir component but is rooted at filesystem /.
+            search_dir = "/"
+        } else if filepath.is_abs(dir_no_slash) {
+            search_dir = dir_no_slash
+        } else if dir_no_slash == "~" || strings.has_prefix(dir_no_slash, "~/") {
+            search_dir = expand_home_path(dir_no_slash)
+        } else if dir_no_slash == "" {
+            search_dir = base
+        } else if joined, err := filepath.join([]string{base, dir_no_slash}, context.temp_allocator); err == nil {
+            search_dir = joined
+        } else {
+            search_dir = dir_no_slash
+        }
     }
 
     handle, err := os.open(search_dir)
@@ -174,6 +227,8 @@ complete_path_token :: proc(
         candidate := fmt.aprintf("%s %s%s", cmd_prefix, head, joined)
         if !completion_has(matches, candidate) {
             append(matches, candidate)
+        } else {
+            delete(candidate)
         }
     }
 }
@@ -191,8 +246,7 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
 
             switch cmd_prefix {
             case "theme", "colorscheme":
-                themes := []string{"gruber-darker", "naysayer", "kanagawa", "hemisu"}
-                for th in themes {
+                for th in THEME_NAMES {
                     if strings.has_prefix(th, arg_prefix) {
                         append(&p.matches, fmt.aprintf("%s %s", cmd_prefix, th))
                     }
@@ -222,7 +276,7 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
                 }
                 // Arguments (and command tokens containing '/') complete as paths.
                 if !strings.has_prefix(token, "-") {
-                    complete_path_token(cmd_prefix, head, token, &p.matches)
+                    complete_path_token(cmd_prefix, head, token, &p.matches, app_picker_root(app))
                 }
                 if len(p.matches) > start {
                     slice.sort_by(p.matches[start:], proc(a, b: string) -> bool {
@@ -230,13 +284,30 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
                     })
                 }
 
-            case "e", "edit", "sp", "split", "vs", "vsplit", "cd":
-                search_dir := "."
+            case "e", "edit", "sp", "split", "vs", "vsplit", "cd", "root":
+                if cmd_prefix == "root" && strings.has_prefix("here", arg_prefix) {
+                    append(&p.matches, fmt.aprintf("%s here", cmd_prefix))
+                }
+                base_dir := app_picker_root(app)
+                if base_dir == "" do base_dir = "."
+                search_dir := base_dir
                 name_prefix := arg_prefix
                 if slash_idx := strings.last_index_byte(arg_prefix, '/'); slash_idx >= 0 {
-                    search_dir = arg_prefix[:slash_idx]
-                    if search_dir == "" do search_dir = "/"
+                    dir_no_slash := arg_prefix[:slash_idx]
                     name_prefix = arg_prefix[slash_idx+1:]
+                    if dir_no_slash == "" && strings.has_prefix(arg_prefix, "/") {
+                        search_dir = "/"
+                    } else if filepath.is_abs(dir_no_slash) {
+                        search_dir = dir_no_slash
+                    } else if dir_no_slash == "~" || strings.has_prefix(dir_no_slash, "~/") {
+                        search_dir = expand_home_path(dir_no_slash)
+                    } else if dir_no_slash == "" {
+                        search_dir = base_dir
+                    } else if joined, err := filepath.join([]string{base_dir, dir_no_slash}, context.temp_allocator); err == nil {
+                        search_dir = joined
+                    } else {
+                        search_dir = dir_no_slash
+                    }
                 }
 
                 handle, err := os.open(search_dir)
@@ -273,8 +344,8 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
                 "cnext", "cn", "cprev", "cp", "cfirst", "crewind",
                 "bnext", "bn",
                 "theme", "colorscheme",
-                "sort", "cd", "pwd", "files", "zoom", "linespace", "lineheight", "help",
-                "qa!", "goto", "line",
+                "sort", "cd", "pwd", "root", "files", "zoom", "linespace", "lineheight", "help",
+                "qa!", "goto", "line", "d", "h", "?", "find", "picker", "next-error", "prev-error",
             }
             for cmd in ALL_COMMANDS {
                 if strings.has_prefix(cmd, curr_str) {
@@ -302,46 +373,75 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
     }
 }
 
-app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string) {
-    if pane == nil do return
+app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string, force := false) -> bool {
+    if pane == nil do return false
+
+    // Refuse to silently replace a modified or read-only editor buffer.
+    if pane.kind == .Editor {
+        if pane.editor.read_only && !force {
+            app_set_message(app, "Buffer is read-only")
+            return false
+        }
+        if pane.editor.dirty && !force {
+            app_set_message(app, "E37: No write since last change (use :e! to override)")
+            return false
+        }
+    }
+
+    // Any editor replacement ends a wdired session in this pane.
+    pane.dired.is_editing = false
+
     data, err := os.read_entire_file(file_path, context.allocator)
     initial_text := ""
-    if err == nil {
+    if err == nil && data != nil {
         initial_text = string(data)
     }
 
     editor_destroy(&pane.editor)
     editor_init(&pane.editor, &app.font, initial_text, file_path)
 
-    if err == nil {
-        delete(data)
-    }
+    // read_entire_file can return a partial buffer together with an error.
+    if data != nil do delete(data)
 
     pane.kind = .Editor
     app.active_pane = pane
 
     if file_path != "" {
-        if lsp := app_get_lsp_for_file(app, file_path); lsp != nil && lsp.running {
+        if lsp := app_get_lsp_for_file(app, file_path); lsp != nil && lsp_is_running(lsp) {
             full_text := pt_full_text(&pane.editor.table)
             defer delete(full_text)
             lsp_did_open(lsp, file_path, full_text)
         }
     }
+    return true
 }
 
 app_pane_open_dired :: proc(app: ^App, pane: ^Pane, dir_path: string) {
     if pane == nil do return
+    // Dired keeps the old editor buffer hidden but still allocated. Converting
+    // a modified or read-only buffer would hide it from the quit guard (and
+    // wdired's editor_init would destroy it), so refuse.
+    if pane.kind == .Editor {
+        if pane.editor.read_only {
+            app_set_message(app, "Buffer is read-only")
+            return
+        }
+        if pane.editor.dirty {
+            app_set_message(app, "E37: No write since last change (save before :dired)")
+            return
+        }
+    }
     if dired_load_path(&pane.dired, dir_path) {
         pane.kind = .Dired
         app.active_pane = pane
     }
 }
 
-app_pane_open :: proc(app: ^App, pane: ^Pane, target: string) {
+app_pane_open :: proc(app: ^App, pane: ^Pane, target: string, force := false) {
     if os.is_dir(target) {
         app_pane_open_dired(app, pane, target)
     } else {
-        app_pane_open_file(app, pane, target)
+        app_pane_open_file(app, pane, target, force)
     }
 }
 
@@ -394,20 +494,30 @@ app_open_help :: proc(app: ^App) {
 }
 
 app_run_compile :: proc(app: ^App, cmd_str: string) {
+    workdir := app_picker_root(app)
     target_cmd := strings.trim_space(cmd_str)
     if target_cmd == "" {
         if app.last_compile_cmd != "" {
             target_cmd = app.last_compile_cmd
         } else {
-            if os.exists("Makefile") {
+            makefile := "Makefile"
+            if workdir != "" {
+                if joined, err := filepath.join([]string{workdir, "Makefile"}, context.temp_allocator); err == nil {
+                    makefile = joined
+                }
+            }
+            if os.exists(makefile) {
                 target_cmd = "make"
             } else {
                 target_cmd = "odin check ."
             }
         }
     }
+    // target_cmd may alias app.last_compile_cmd (recompile passes it), so
+    // clone before freeing the old value.
+    owned_cmd := strings.clone(target_cmd)
     if app.last_compile_cmd != "" do delete(app.last_compile_cmd)
-    app.last_compile_cmd = strings.clone(target_cmd)
+    app.last_compile_cmd = owned_cmd
 
     comp_pane: ^Pane = nil
     for p in app.panes {
@@ -423,8 +533,8 @@ app_run_compile :: proc(app: ^App, cmd_str: string) {
         comp_pane.kind = .Compilation
     }
 
-    compilation_run_command(&comp_pane.compilation, target_cmd)
-    app.cmd_prompt.message = fmt.tprintf("Compilation: %s", comp_pane.compilation.status)
+    compilation_run_command(&comp_pane.compilation, owned_cmd, workdir)
+    app_set_message(app, fmt.tprintf("Compilation: %s", comp_pane.compilation.status))
 }
 
 app_execute_command :: proc(app: ^App, raw_cmd: string) {
@@ -438,9 +548,12 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                 app_set_message(app, msg)
                 _ = sdl.StopTextInput(app.window)
             } else if app.active_pane.kind == .Editor {
-                if editor_save_file(&app.active_pane.editor, app) {
-                    app_set_message(app, fmt.tprintf("\"%s\" written", app.active_pane.editor.file_path))
-                } else {
+                e := &app.active_pane.editor
+                if e.read_only {
+                    app_set_message(app, "Buffer is read-only")
+                } else if editor_save_file(e, app) {
+                    app_set_message(app, fmt.tprintf("\"%s\" written", e.file_path))
+                } else if e.file_path == "" {
                     app_set_message(app, "E32: No file name")
                 }
             } else {
@@ -464,9 +577,12 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                 app_set_message(app, msg)
                 _ = sdl.StopTextInput(app.window)
             } else if app.active_pane.kind == .Editor {
-                if editor_save_file(&app.active_pane.editor, app) {
+                e := &app.active_pane.editor
+                if e.read_only {
+                    app_set_message(app, "Buffer is read-only")
+                } else if editor_save_file(e, app) {
                     app_close_pane(app, app.active_pane)
-                } else if app.active_pane.editor.file_path == "" {
+                } else if e.file_path == "" {
                     app_set_message(app, "E32: No file name")
                 }
             }
@@ -505,7 +621,8 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         app_split_pane(app, app.active_pane, .Vertical)
         app_set_message(app, "Vertical split")
     } else if cmd == "dired" || cmd == "d" || cmd == "e ." {
-        dir := "."
+        dir := app_picker_root(app)
+        if dir == "" do dir = "."
         if app.active_pane != nil && app.active_pane.kind == .Editor && app.active_pane.editor.file_path != "" {
             dir = filepath.dir(app.active_pane.editor.file_path)
             if dir == "" do dir = "."
@@ -562,20 +679,29 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         } else {
             app.cmd_prompt.message = "No compilation buffer"
         }
-    } else if strings.has_prefix(cmd, "e ") {
-        target := strings.trim_space(cmd[2:])
-        app_pane_open(app, app.active_pane, target)
+    } else if strings.has_prefix(cmd, "e! ") || strings.has_prefix(cmd, "edit! ") {
+        target := strings.trim_space(cmd[3:] if strings.has_prefix(cmd, "e! ") else cmd[6:])
+        app_pane_open(app, app.active_pane, app_resolve_path(app, target), force = true)
+    } else if strings.has_prefix(cmd, "e ") || strings.has_prefix(cmd, "edit ") {
+        target := strings.trim_space(cmd[2:] if strings.has_prefix(cmd, "e ") else cmd[5:])
+        app_pane_open(app, app.active_pane, app_resolve_path(app, target))
+    } else if cmd == "e" || cmd == "edit" {
+        if app.active_pane != nil && app.active_pane.kind == .Editor && app.active_pane.editor.file_path != "" {
+            _ = app_pane_open_file(app, app.active_pane, app.active_pane.editor.file_path)
+        } else {
+            app_set_message(app, "Usage: :e <path>")
+        }
     } else if strings.has_prefix(cmd, "sp ") || strings.has_prefix(cmd, "split ") {
         target := strings.trim_space(cmd[3:] if strings.has_prefix(cmd, "sp ") else cmd[6:])
         app_split_pane(app, app.active_pane, .Horizontal)
         if target != "" {
-            app_pane_open(app, app.active_pane, target)
+            app_pane_open(app, app.active_pane, app_resolve_path(app, target))
         }
     } else if strings.has_prefix(cmd, "vs ") || strings.has_prefix(cmd, "vsplit ") {
         target := strings.trim_space(cmd[3:] if strings.has_prefix(cmd, "vs ") else cmd[7:])
         app_split_pane(app, app.active_pane, .Vertical)
         if target != "" {
-            app_pane_open(app, app.active_pane, target)
+            app_pane_open(app, app.active_pane, app_resolve_path(app, target))
         }
     } else if cmd == "bn" || cmd == "bnext" {
         app_cycle_pane(app)
@@ -587,7 +713,7 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
             arg = strings.trim_space(cmd[12:])
         }
         if arg == "" {
-            next_id := ThemeId((int(app.current_theme_id) + 1) % 4)
+            next_id := ThemeId((int(app.current_theme_id) + 1) % THEME_COUNT)
             app.current_theme_id = next_id
             app.theme = theme_get(next_id)
             app_set_message(app, fmt.tprintf("Theme: %s", app.theme.name))
@@ -598,7 +724,12 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                 app.theme = theme_get(id)
                 app_set_message(app, fmt.tprintf("Theme: %s", app.theme.name))
             } else {
-                app_set_message(app, fmt.tprintf("Unknown theme: %s (options: gruber-darker, naysayer, kanagawa, hemisu)", arg))
+                theme_names := THEME_NAMES
+                app_set_message(app, fmt.tprintf(
+                    "Unknown theme: %s (options: %s)",
+                    arg,
+                    strings.join(theme_names[:], ", ", context.temp_allocator),
+                ))
             }
         }
     } else if strings.has_prefix(cmd, "cd ") || cmd == "cd" {
@@ -607,14 +738,34 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
             arg = os.get_env("HOME", context.temp_allocator)
             if arg == "" do arg = "."
         }
+        // Relative :cd paths are relative to the current project root.
+        arg = app_resolve_path(app, arg)
         abs_target, abs_err := filepath.abs(arg, context.temp_allocator)
         if abs_err == nil && os.is_dir(abs_target) {
-            if app.working_dir != "" do delete(app.working_dir)
-            app.working_dir = strings.clone(abs_target, context.allocator)
+            app_set_project_root(app, abs_target)
             _ = os.set_working_directory(app.working_dir)
             app_set_message(app, fmt.tprintf("Working dir: %s", app.working_dir))
         } else {
             app_set_message(app, fmt.tprintf("Invalid directory: %s", arg))
+        }
+    } else if strings.has_prefix(cmd, "root ") || cmd == "root" {
+        arg := strings.trim_space(cmd[5:]) if strings.has_prefix(cmd, "root ") else ""
+        if arg == "" {
+            app_set_message(app, fmt.tprintf("Project root: %s", app_picker_root(app)))
+        } else {
+            if arg == "here" do arg = app_here_directory(app)
+            if arg == "" {
+                app_set_message(app, "No directory here")
+            } else {
+                arg = app_resolve_path(app, arg)
+                abs_target, abs_err := filepath.abs(arg, context.temp_allocator)
+                if abs_err == nil && os.is_dir(abs_target) {
+                    app_set_project_root(app, abs_target)
+                    app_set_message(app, fmt.tprintf("Project root: %s", app.root_dir))
+                } else {
+                    app_set_message(app, fmt.tprintf("Invalid directory: %s", arg))
+                }
+            }
         }
     } else if cmd == "pwd" {
         app_set_message(app, fmt.tprintf("Working dir: %s", app.working_dir))
@@ -648,11 +799,16 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
     } else if cmd == "help" || cmd == "h" || cmd == "?" {
         app_open_help(app)
     } else if cmd == "files" || cmd == "find" || cmd == "picker" {
-        file_picker_open(&app.file_picker, app.working_dir, app.window)
+        file_picker_open(&app.file_picker, app_picker_root(app), app.window)
+    } else if cmd == "zoom" || cmd == "scale" {
+        app_set_message(app, fmt.tprintf(
+            "Zoom: %.0f%% (usage: :zoom <0.5 .. 2.5>)",
+            global_ui_scale * 100.0,
+        ))
     } else if strings.has_prefix(cmd, "zoom ") || strings.has_prefix(cmd, "scale ") {
         val_str := strings.trim_space(cmd[5:] if strings.has_prefix(cmd, "zoom ") else cmd[6:])
         scale_val, ok := strconv.parse_f32(val_str)
-        if ok && scale_val >= 0.25 && scale_val <= 3.0 {
+        if ok && scale_val >= 0.5 && scale_val <= 2.5 {
             global_ui_scale = scale_val
             app_reload_font(app)
             app_set_message(app, fmt.tprintf("UI Scale: %.2f", global_ui_scale))
@@ -673,6 +829,63 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
     } else {
         app_set_message(app, fmt.tprintf("Unknown command: :%s", cmd))
     }
+}
+
+// Directory implied by "here": the Dired listing, the current file's
+// directory, or the working directory for scratch/help buffers.
+app_here_directory :: proc(app: ^App) -> string {
+    if app == nil || app.active_pane == nil do return ""
+    p := app.active_pane
+    if p.kind == .Dired {
+        return p.dired.path
+    }
+    if p.kind == .Editor && p.editor.file_path != "" && !strings.has_prefix(p.editor.file_path, "*") {
+        dir := filepath.dir(p.editor.file_path)
+        if dir != "" && dir != "." do return dir
+    }
+    return app.working_dir
+}
+
+// Expand a leading ~ or ~/ using $HOME. Returns the trimmed input otherwise.
+expand_home_path :: proc(path: string) -> string {
+    trimmed := strings.trim_space(path)
+    if trimmed != "~" && !strings.has_prefix(trimmed, "~/") {
+        return trimmed
+    }
+
+    home := os.get_env("HOME", context.temp_allocator)
+    if home == "" do return trimmed
+    if trimmed == "~" do return home
+
+    joined, err := filepath.join([]string{home, trimmed[2:]}, context.temp_allocator)
+    if err != nil do return trimmed
+    return joined
+}
+
+// Pick the project root used by the file picker at startup:
+//   1. DEFAULT_ROOT_DIRECTORY from config.odin, if it names a directory
+//   2. the directory given on the command line
+//   3. the project containing the file given on the command line
+//   4. the process working directory
+resolve_startup_root :: proc(cwd: string) -> string {
+    if DEFAULT_ROOT_DIRECTORY != "" {
+        expanded := expand_home_path(DEFAULT_ROOT_DIRECTORY)
+        abs, err := filepath.abs(expanded, context.temp_allocator)
+        if err == nil && os.is_dir(abs) {
+            return strings.clone(abs, context.allocator)
+        }
+    }
+
+    if len(os.args) > 1 {
+        arg := os.args[1]
+        abs, err := filepath.abs(arg, context.temp_allocator)
+        if err == nil && os.is_dir(abs) {
+            return strings.clone(abs, context.allocator)
+        }
+        return lsp_find_project_root(arg, cwd)
+    }
+
+    return strings.clone(cwd, context.allocator)
 }
 
 load :: proc(app: ^App) {
@@ -708,11 +921,29 @@ load :: proc(app: ^App) {
         app.working_dir = strings.clone(".", context.allocator)
     }
 
+    app.root_dir = resolve_startup_root(app.working_dir)
+    // Features operate from the project root, not the shell's launch dir.
+    if app.root_dir != app.working_dir {
+        delete(app.working_dir)
+        app.working_dir = strings.clone(app.root_dir, context.allocator)
+    }
+
     file_picker_init(&app.file_picker)
 
     target_path := app.working_dir
     if len(os.args) > 1 {
         target_path = os.args[1]
+        // Resolve CLI-relative paths now, while the process cwd is still the
+        // launch directory. Later :cd/:root changes must not reinterpret them.
+        if !filepath.is_abs(target_path) {
+            if abs, err := filepath.abs(target_path, context.temp_allocator); err == nil {
+                target_path = abs
+            } else if launch_cwd, err_cwd := os.get_working_directory(context.temp_allocator); err_cwd == nil {
+                if joined, join_err := filepath.join([]string{launch_cwd, target_path}, context.temp_allocator); join_err == nil {
+                    target_path = joined
+                }
+            }
+        }
     }
 
     initial_pane: ^Pane
@@ -723,14 +954,13 @@ load :: proc(app: ^App) {
         initial_pane = pane_create(app, .Editor)
         data, err := os.read_entire_file(target_path, context.allocator)
         initial_text := ""
-        if err == nil {
+        if err == nil && data != nil {
             initial_text = string(data)
         }
         editor_destroy(&initial_pane.editor)
         editor_init(&initial_pane.editor, &app.font, initial_text, target_path)
-        if err == nil {
-            delete(data)
-        }
+        // A failed read may still return a partial allocated buffer.
+        if data != nil do delete(data)
     }
 
     // Initialize LSP manager
@@ -741,7 +971,7 @@ load :: proc(app: ^App) {
     app.running = true
 
     if initial_pane.kind == .Editor && initial_pane.editor.file_path != "" {
-        if lsp := app_get_lsp_for_file(app, initial_pane.editor.file_path); lsp != nil && lsp.running {
+        if lsp := app_get_lsp_for_file(app, initial_pane.editor.file_path); lsp != nil && lsp_is_running(lsp) {
             full_text := pt_full_text(&initial_pane.editor.table)
             defer delete(full_text)
             lsp_did_open(lsp, initial_pane.editor.file_path, full_text)
@@ -758,15 +988,19 @@ update :: proc(app: ^App) {
         app_reload_font(app)
     }
 
-    // Collect finished background builds.
-    for p in app.panes {
-        if p.kind == .Compilation do compilation_poll(&p.compilation)
-    }
+    // Collect finished background builds and picker scans. Poll every pane:
+    // a compilation pane can be repurposed to an editor while its build runs.
+    for p in app.panes do compilation_poll(&p.compilation)
+    file_picker_poll(&app.file_picker)
 
     event: sdl.Event
     for sdl.PollEvent(&event) {
         if event.type == .QUIT {
-            app.running = false
+            if app_has_unsaved_changes(app) {
+                app_set_message(app, "E37: No write since last change (use :qa! to force quit)")
+            } else {
+                app.running = false
+            }
             break
         }
 
@@ -832,6 +1066,11 @@ update :: proc(app: ^App) {
                     }
                     if len(app.cmd_prompt.buffer) > 0 {
                         pop(&app.cmd_prompt.buffer)
+                        // Remove the rest of a UTF-8 codepoint.
+                        for len(app.cmd_prompt.buffer) > 0 &&
+                            (app.cmd_prompt.buffer[len(app.cmd_prompt.buffer) - 1] & 0xC0) == 0x80 {
+                            pop(&app.cmd_prompt.buffer)
+                        }
                     } else {
                         app_close_command_prompt(app)
                     }
@@ -868,7 +1107,7 @@ update :: proc(app: ^App) {
                 app.pending_leader = false
                 app.cmd_prompt.message = ""
                 if key == KEY_LEADER_FILES {
-                    file_picker_open(&app.file_picker, app.working_dir, app.window)
+                    file_picker_open(&app.file_picker, app_picker_root(app), app.window)
                     continue
                 }
             }
@@ -894,7 +1133,7 @@ update :: proc(app: ^App) {
                 } else if key == KEY_WINDOW_CYCLE {
                     app_cycle_pane(app)
                 } else if key == KEY_WINDOW_CLOSE || key == KEY_WINDOW_CLOSE_ALT {
-                    app_close_pane(app, app.active_pane)
+                    app_close_current_pane(app, false)
                 }
                 continue
             }
@@ -937,7 +1176,7 @@ update :: proc(app: ^App) {
     // LSP update and response dispatch for all running servers
     for server_kind in LspServerKind {
         client := app.lsp_manager.clients[server_kind]
-        if client != nil && client.running {
+        if client != nil && lsp_is_running(client) {
             lsp_update(client, app)
         }
     }
@@ -948,7 +1187,8 @@ update :: proc(app: ^App) {
         if len(active_lsp.completions) > 0 {
             if app.active_pane != nil && app.active_pane.kind == .Editor {
                 e := &app.active_pane.editor
-                if e.mode == .Insert {
+                file_matches := active_lsp.completions_file == "" || paths_match(e.file_path, active_lsp.completions_file)
+                if file_matches && e.mode == .Insert {
                     for c in e.completion.all_items {
                         delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
                     }
@@ -969,11 +1209,16 @@ update :: proc(app: ^App) {
                 delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
             }
             clear(&active_lsp.completions)
+            if active_lsp.completions_file != "" {
+                delete(active_lsp.completions_file)
+                active_lsp.completions_file = ""
+            }
         }
 
         // Handle Go to Definition result
         if loc, ok := active_lsp.last_definition.?; ok {
             active_lsp.last_definition = nil
+            defer if loc.file_path != "" do delete(loc.file_path)
             if app.active_pane != nil && app.active_pane.kind == .Editor {
                 cur_abs, _ := filepath.abs(app.active_pane.editor.file_path, context.temp_allocator)
                 if cur_abs != loc.file_path {
@@ -990,24 +1235,41 @@ update :: proc(app: ^App) {
 
         // Handle Hover result
         if active_lsp.last_hover != "" {
-            clean_hover := strings.trim_space(active_lsp.last_hover)
-            first_nl := strings.index(clean_hover, "\n")
-            display_line := clean_hover
-            if first_nl >= 0 do display_line = clean_hover[:first_nl]
-            app_set_message(app, fmt.tprintf("Hover: %s", display_line))
+            show_hover := true
+            if app.active_pane != nil && app.active_pane.kind == .Editor && active_lsp.last_hover_file != "" {
+                show_hover = paths_match(app.active_pane.editor.file_path, active_lsp.last_hover_file)
+            }
+            if show_hover {
+                clean_hover := strings.trim_space(active_lsp.last_hover)
+                first_nl := strings.index(clean_hover, "\n")
+                display_line := clean_hover
+                if first_nl >= 0 do display_line = clean_hover[:first_nl]
+                app_set_message(app, fmt.tprintf("Hover: %s", display_line))
+            }
             delete(active_lsp.last_hover)
             active_lsp.last_hover = ""
+            if active_lsp.last_hover_file != "" {
+                delete(active_lsp.last_hover_file)
+                active_lsp.last_hover_file = ""
+            }
         }
 
         // Handle Range Formatting edits
         if len(active_lsp.last_edits) > 0 {
             if app.active_pane != nil && app.active_pane.kind == .Editor {
                 e := &app.active_pane.editor
-                editor_apply_lsp_edits(e, active_lsp.last_edits[:])
-                app_set_message(app, fmt.tprintf("LSP: Formatted range (%d edits)", len(active_lsp.last_edits)))
+                file_matches := active_lsp.last_edits_file == "" || paths_match(e.file_path, active_lsp.last_edits_file)
+                if file_matches {
+                    editor_apply_lsp_edits(e, active_lsp.last_edits[:])
+                    app_set_message(app, fmt.tprintf("LSP: Formatted range (%d edits)", len(active_lsp.last_edits)))
+                }
             }
             for ed in active_lsp.last_edits do delete(ed.new_text)
             clear(&active_lsp.last_edits)
+            if active_lsp.last_edits_file != "" {
+                delete(active_lsp.last_edits_file)
+                active_lsp.last_edits_file = ""
+            }
         }
     }
 
@@ -1017,7 +1279,7 @@ update :: proc(app: ^App) {
             e := &pane.editor
             if e.needs_lsp_sync && time.since(e.last_edit_time) > 250 * time.Millisecond {
                 e.needs_lsp_sync = false
-                if lsp := app_get_lsp_for_file(app, e.file_path); lsp != nil && lsp.running && e.file_path != "" {
+                if lsp := app_get_lsp_for_file(app, e.file_path); lsp != nil && lsp_is_running(lsp) && e.file_path != "" {
                     full_text := pt_full_text(&e.table)
                     defer delete(full_text)
                     lsp_did_change(lsp, e.file_path, full_text)
@@ -1181,6 +1443,10 @@ cleanup :: proc(app: ^App) {
     if app.working_dir != "" {
         delete(app.working_dir)
         app.working_dir = ""
+    }
+    if app.root_dir != "" {
+        delete(app.root_dir)
+        app.root_dir = ""
     }
 
     split_destroy_tree(app.root_split)

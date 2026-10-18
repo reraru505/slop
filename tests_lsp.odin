@@ -3,6 +3,10 @@ package main
 import "core:testing"
 import "core:fmt"
 import "core:os"
+import "core:sync"
+import "core:thread"
+import "core:time"
+import "base:runtime"
 import "core:strings"
 import "core:path/filepath"
 import "core:encoding/json"
@@ -108,11 +112,11 @@ test_lsp_project_root_detection :: proc(t: ^testing.T) {
 
 @(test)
 test_lsp_json_escaping :: proc(t: ^testing.T) {
-    raw := "hello \"world\"\nnew line\ttab\\backslash\r"
+    raw := "hello \"world\"\nnew line\ttab\\backslash\r\x01"
     escaped := lsp_json_escape(raw, context.allocator)
     defer delete(escaped)
 
-    expected := "hello \\\"world\\\"\\nnew line\\ttab\\\\backslash\\r"
+    expected := "hello \\\"world\\\"\\nnew line\\ttab\\\\backslash\\r\\u0001"
     testing.expect_value(t, escaped, expected)
     fmt.println("  ✓ [LSP Unit] JSON escape sequences (quotes, newlines, tabs) verified")
 }
@@ -169,11 +173,18 @@ test_lsp_uri_edge_cases :: proc(t: ^testing.T) {
     testing.expect_value(t, strings.has_prefix(missing_uri, "file:///"), true)
     testing.expect_value(t, strings.has_suffix(missing_uri, "/zzz_nonexistent_file_98765.odin"), true)
 
-    // Spaces and unicode survive a roundtrip (the client does not percent-encode)
+    // Spaces and unicode are percent-encoded and survive a roundtrip
     orig := "/tmp/some dir/файл.odin"
     uri2 := lsp_path_to_uri(orig, context.temp_allocator)
+    testing.expect(t, strings.contains(uri2, "%20"), uri2)
+    testing.expect(t, strings.contains(uri2, "%D1"), uri2)
+    testing.expect(t, !strings.contains(uri2, " "), uri2)
     back := lsp_uri_to_path(uri2, context.temp_allocator)
     testing.expect_value(t, back, orig)
+
+    // Percent escapes from the server are decoded
+    decoded := lsp_uri_to_path("file:///tmp/some%20dir/x.odin", context.temp_allocator)
+    testing.expect_value(t, decoded, "/tmp/some dir/x.odin")
 
     // Non-file URIs are passed through unchanged
     passthrough := lsp_uri_to_path("https://example.com/x", context.temp_allocator)
@@ -231,13 +242,17 @@ lsp_test_cleanup :: proc(client: ^LspClient) {
     delete(client.pending_requests)
     lsp_test_clear_completions(client)
     delete(client.completions)
+    if client.completions_file != "" do delete(client.completions_file)
     if client.last_hover != "" do delete(client.last_hover)
+    if client.last_hover_file != "" do delete(client.last_hover_file)
     for e in client.last_edits do delete(e.new_text)
     delete(client.last_edits)
+    if client.last_edits_file != "" do delete(client.last_edits_file)
     if loc, ok := client.last_definition.?; ok && loc.file_path != "" {
         delete(loc.file_path)
     }
     lsp_test_clear_diagnostics(client)
+    for k in client.file_versions do delete(k)
     delete(client.file_versions)
 }
 
@@ -310,6 +325,7 @@ test_lsp_completion_response_parsing :: proc(t: ^testing.T) {
     lsp_handle_response(&client, 7, obj, nil)
 
     testing.expect_value(t, len(client.pending_requests), 0)
+    testing.expect_value(t, client.completions_file, "/tmp/odin_lsp_completion.odin")
     testing.expect_value(t, len(client.completions), 2)
     testing.expect_value(t, client.completions[0].label, "printf")
     testing.expect_value(t, client.completions[0].detail, "int printf(...)")
@@ -372,6 +388,7 @@ test_lsp_hover_and_definition_parsing :: proc(t: ^testing.T) {
     testing.expect_value(t, hover_ok, true)
     lsp_handle_response(&client, 11, hover_obj, nil)
     testing.expect_value(t, client.last_hover, "details here")
+    testing.expect_value(t, client.last_hover_file, "/tmp/x.odin")
 
     // Definition result with uri + range start
     append(&client.pending_requests, PendingRequest{
@@ -415,6 +432,7 @@ test_lsp_range_formatting_parsing :: proc(t: ^testing.T) {
     lsp_handle_response(&client, 13, fmt_obj, nil)
 
     testing.expect_value(t, len(client.last_edits), 1)
+    testing.expect_value(t, client.last_edits_file, "/tmp/x.odin")
     if len(client.last_edits) == 1 {
         edit := client.last_edits[0]
         testing.expect_value(t, edit.start_row, 1)
@@ -468,7 +486,7 @@ test_lsp_range_formatting_parsing :: proc(t: ^testing.T) {
 test_lsp_request_bookkeeping :: proc(t: ^testing.T) {
     client: LspClient
     defer lsp_test_cleanup(&client)
-    client.running = true
+    lsp_set_running(&client, true)
     client.initialized = true
 
     lsp_did_open(&client, "test.odin", "package main")
@@ -512,12 +530,13 @@ test_lsp_uri_roundtrip :: proc(t: ^testing.T) {
 @(test)
 test_lsp_did_change_queue_coalescing :: proc(t: ^testing.T) {
     client: LspClient
-    client.running = true
+    lsp_set_running(&client, true)
     client.initialized = true
     client.writer_queue = make([dynamic]Lsp_Out_Message, 0, 4)
     defer {
         for &m in client.writer_queue do lsp_destroy_out_message(&m)
         delete(client.writer_queue)
+        for k in client.file_versions do delete(k)
         delete(client.file_versions)
     }
 
@@ -549,5 +568,65 @@ test_lsp_did_change_queue_coalescing :: proc(t: ^testing.T) {
     lsp_send_raw(&client, `{"jsonrpc":"2.0","method":"initialized","params":{}}`)
     testing.expect_value(t, len(client.writer_queue), 3)
     testing.expect_value(t, client.writer_queue[2].kind, Lsp_Out_Kind.Raw)
+
+    // A snapshot after a queued request must NOT be coalesced into the one
+    // before the request; the request's coordinates refer to the older text.
+    lsp_did_change(&client, "/tmp/coalesce.odin", "three")
+    testing.expect_value(t, len(client.writer_queue), 4)
+    testing.expect_value(t, client.writer_queue[3].kind, Lsp_Out_Kind.Did_Change)
+    testing.expect_value(t, client.writer_queue[3].text, "three")
     fmt.println("  ✓ [LSP Unit] unsent didChange snapshots coalesce per file")
+}
+
+@(test)
+test_lsp_start_failure_cleans_up :: proc(t: ^testing.T) {
+    client: LspClient
+    ok := lsp_start(&client, "/definitely/not/a/language/server", "/tmp")
+    testing.expect_value(t, ok, false)
+    testing.expect_value(t, client.server_cmd, "")
+    fmt.println("  ✓ [LSP Unit] failed server start releases initialized state")
+}
+
+@(test)
+test_lsp_reader_handles_batched_messages :: proc(t: ^testing.T) {
+    client: LspClient
+    client.incoming_queue = make([dynamic]json.Value, 0, 4)
+    lsp_set_running(&client, true)
+
+    r, w, pipe_err := os.pipe()
+    testing.expect_value(t, pipe_err, nil)
+    client.stdout_file = r
+    client.reader_thread = thread.create_and_start_with_data(rawptr(&client), lsp_reader_thread_proc)
+
+    defer {
+        lsp_set_running(&client, false)
+        os.close(w)
+        if client.reader_thread != nil {
+            thread.join(client.reader_thread)
+            thread.destroy(client.reader_thread)
+        }
+        os.close(r)
+        for v in client.incoming_queue do json.destroy_value(v, runtime.default_allocator())
+        delete(client.incoming_queue)
+    }
+
+    m1 := `{"jsonrpc":"2.0","id":1,"result":null}`
+    m2 := `{"jsonrpc":"2.0","id":2,"result":{"items":[1,2,3]}}`
+    payload := fmt.tprintf(
+        "Content-Length: %d\r\n\r\n%sContent-Length: %d\r\n\r\n%s",
+        len(m1), m1, len(m2), m2,
+    )
+    _, write_err := os.write(w, transmute([]u8)payload)
+    testing.expect_value(t, write_err, nil)
+
+    count := 0
+    for _ in 0 ..< 2000 {
+        sync.mutex_lock(&client.mutex)
+        count = len(client.incoming_queue)
+        sync.mutex_unlock(&client.mutex)
+        if count >= 2 do break
+        time.sleep(time.Millisecond)
+    }
+    testing.expect_value(t, count, 2)
+    fmt.println("  ✓ [LSP Unit] reader parses multiple messages batched in one read")
 }

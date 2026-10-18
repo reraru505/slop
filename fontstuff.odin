@@ -356,13 +356,17 @@ push_glyph :: proc(font: ^Font, g: Glyph, x, y, w, h: f32, color: sdl.FColor) {
 // Find the longest ligature starting at pos. Ligatures are skipped when the
 // span crosses a syntax-color boundary, and the caller may veto a match when
 // the cursor highlight falls inside it.
+is_ligature_start :: proc(b: byte) -> bool {
+   switch b {
+   case '-', '=', '!', '<', '>', '|', '/', '.', ':', '?', '~', '#', '&', '[', '*':
+      return true
+   }
+   return false
+}
+
 find_ligature :: proc(font: ^Font, text: string, pos: int, colors: []sdl.FColor) -> (Glyph, int, bool) {
    if pos >= len(text) do return {}, 0, false
-   switch text[pos] {
-   case '-', '=', '!', '<', '>', '|', '/', '.', ':', '?', '~', '#', '&':
-   case:
-      return {}, 0, false
-   }
+   if !is_ligature_start(text[pos]) do return {}, 0, false
 
    color := sdl.FColor{}
    if colors != nil && pos < len(colors) do color = colors[pos]

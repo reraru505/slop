@@ -350,3 +350,17 @@ test_syntax_resilience :: proc(t: ^testing.T) {
     }
     fmt.println("  ✓ [Syntax] Unterminated strings & escape sequences safe")
 }
+
+@(test)
+test_syntax_toml_header_with_comment :: proc(t: ^testing.T) {
+    th := theme_get(.GruberDarker)
+    line := "[table] # a]b"
+    colors := make([]sdl.FColor, len(line), context.temp_allocator)
+    syntax_highlight_line("Cargo.toml", line, &th, colors)
+
+    testing.expect_value(t, colors[0], th.type_name)
+    testing.expect_value(t, colors[6], th.type_name)
+    testing.expect_value(t, colors[8], th.comment)
+    testing.expect_value(t, colors[11], th.comment)
+    fmt.println("  ✓ [Syntax] TOML headers stop before trailing comments")
+}

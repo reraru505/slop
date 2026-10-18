@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:strings"
 import "core:testing"
 import sdl "vendor:sdl3"
 
@@ -24,11 +25,13 @@ destroy_test_app :: proc(app: ^App) {
     }
     split_destroy_tree(app.root_split)
     app.root_split = nil
+    lsp_manager_stop_all(&app.lsp_manager)
     delete(app.panes)
     app_reset_command_completion(&app.cmd_prompt)
     delete(app.cmd_prompt.buffer)
     delete(app.cmd_prompt.matches)
     if app.working_dir != "" do delete(app.working_dir)
+    if app.root_dir != "" do delete(app.root_dir)
     if app.last_compile_cmd != "" do delete(app.last_compile_cmd)
 }
 
@@ -184,4 +187,35 @@ test_split_focus_and_cycle_geometry :: proc(t: ^testing.T) {
     app_cycle_pane(&app)
     testing.expect_value(t, app.active_pane, center)
     fmt.println("  ✓ [Split] directional focus and pane cycling wrap verified")
+}
+
+@(test)
+test_split_preserves_read_only :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    orig := app.active_pane
+    orig.editor.read_only = true
+    app_split_pane(&app, orig, .Horizontal)
+    copy := app.active_pane
+    testing.expect(t, copy != orig)
+    testing.expect_value(t, copy.editor.read_only, true)
+    fmt.println("  ✓ [Split] read-only buffers stay read-only across splits")
+}
+
+@(test)
+test_split_compilation_does_not_start_build :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    comp := app.active_pane
+    comp.kind = .Compilation
+    comp.compilation.command = strings.clone("printf 'copy-only\\n'")
+
+    app_split_pane(&app, comp, .Horizontal)
+    copy := app.active_pane
+    testing.expect(t, copy != comp)
+    testing.expect_value(t, copy.compilation.command, "printf 'copy-only\\n'")
+    testing.expect_value(t, copy.compilation.job, nil)
+    fmt.println("  ✓ [Split] splitting a compilation pane does not start another build")
 }

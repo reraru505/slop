@@ -1,14 +1,16 @@
+BIN := slop
+
 .PHONY: all build release test test-verbose test-unit test-live clean
 
 all: build
 
 build:
-	odin build . -out:text-editor
+	odin build . -out:$(BIN)
 
 # Optimized binary for daily use. Bounds checks are off; asserts stay on so
 # problems still surface while dogfooding.
 release:
-	odin build . -o:speed -no-bounds-check -out:text-editor
+	odin build . -o:speed -no-bounds-check -out:$(BIN)
 
 # Unit tests only (live LSP tests are opt-in below)
 test:
@@ -24,4 +26,4 @@ test-live:
 	odin test . -define:ODIN_TEST_LIVE_LSP=true -define:ODIN_TEST_NAMES=main.test_live_lsp_zig,main.test_live_lsp_clangd,main.test_live_lsp_odin
 
 clean:
-	rm -f text-editor
+	rm -f $(BIN)

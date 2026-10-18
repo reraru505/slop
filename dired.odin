@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 import "core:time"
 import sdl "vendor:sdl3"
@@ -126,23 +127,17 @@ dired_sort_entries :: proc(d: ^Dired) {
         }
     }
 
-    // Sort directories
-    for i := 0; i < len(dirs); i += 1 {
-        for j := i + 1; j < len(dirs); j += 1 {
-            if !dired_compare_entries(dirs[i], dirs[j], d.sort_by, d.sort_order) {
-                dirs[i], dirs[j] = dirs[j], dirs[i]
-            }
-        }
+    Sort_Context :: struct {
+        sort_by:    DiredSortBy,
+        sort_order: DiredSortOrder,
     }
-
-    // Sort files
-    for i := 0; i < len(files); i += 1 {
-        for j := i + 1; j < len(files); j += 1 {
-            if !dired_compare_entries(files[i], files[j], d.sort_by, d.sort_order) {
-                files[i], files[j] = files[j], files[i]
-            }
-        }
+    sort_ctx := Sort_Context{sort_by = d.sort_by, sort_order = d.sort_order}
+    less := proc(a, b: DiredEntry, user_data: rawptr) -> bool {
+        ctx := (^Sort_Context)(user_data)
+        return dired_compare_entries(a, b, ctx.sort_by, ctx.sort_order)
     }
+    slice.sort_by_with_data(dirs[:], less, rawptr(&sort_ctx))
+    slice.sort_by_with_data(files[:], less, rawptr(&sort_ctx))
 
     parent := d.entries[0]
     clear(&d.entries)
@@ -156,28 +151,28 @@ dired_sort_entries :: proc(d: ^Dired) {
 }
 
 dired_load_path :: proc(d: ^Dired, dir_path: string) -> bool {
-    for e in d.entries {
-        delete(e.name)
-    }
-    clear(&d.entries)
-
     abs_path, abs_err := filepath.abs(dir_path, context.allocator)
     if abs_err != nil {
         abs_path, _ = filepath.clean(dir_path, context.allocator)
     }
-    if d.path != "" do delete(d.path)
-    d.path = abs_path
 
     handle, err := os.open(abs_path)
-    if err != nil do return false
+    if err != nil {
+        delete(abs_path)
+        return false
+    }
     defer os.close(handle)
 
     files, ferr := os.read_dir(handle, -1, context.allocator)
-    if ferr != nil do return false
+    if ferr != nil {
+        delete(abs_path)
+        return false
+    }
     defer os.file_info_slice_delete(files, context.allocator)
 
-    // Parent directory entry ".."
-    append(&d.entries, DiredEntry{
+    // Build the new listing first; a failed load must leave the old one intact.
+    new_entries := make([dynamic]DiredEntry, 0, len(files) + 1, context.allocator)
+    append(&new_entries, DiredEntry{
         name     = strings.clone(".."),
         is_dir   = true,
         size     = 0,
@@ -187,15 +182,35 @@ dired_load_path :: proc(d: ^Dired, dir_path: string) -> bool {
     for f in files {
         if f.name == "." || f.name == ".." do continue
         is_directory := f.type == .Directory
+        // readdir reports symlinks as .Symlink; follow them for navigation.
+        if f.type == .Symlink {
+            if full, join_err := filepath.join([]string{abs_path, f.name}, context.temp_allocator); join_err == nil {
+                is_directory = os.is_dir(full)
+            }
+        }
 
-        entry := DiredEntry{
+        append(&new_entries, DiredEntry{
             name     = strings.clone(f.name),
             is_dir   = is_directory,
             size     = f.size,
             mod_time = f.modification_time,
-        }
-        append(&d.entries, entry)
+        })
     }
+
+    // Swap in the successful result.
+    for e in d.entries {
+        delete(e.name)
+    }
+    delete(d.entries)
+    d.entries = new_entries
+
+    if d.path != "" do delete(d.path)
+    d.path = abs_path
+
+    // A directory reload ends any wdired session and its snapshot.
+    for orig in d.orig_entries do delete(orig.name)
+    clear(&d.orig_entries)
+    d.is_editing = false
 
     dired_sort_entries(d)
 
@@ -277,19 +292,38 @@ dired_apply_edits :: proc(d: ^Dired, e: ^Editor) -> string {
         delete(new_items)
     }
 
-    for line in raw_lines {
-        trimmed := strings.trim_space(line)
-        trimmed = strings.trim_right(trimmed, "\r")
-        if len(trimmed) == 0 do continue
+    for raw_line in raw_lines {
+        // Preserve spaces: they are legal filename characters. Only strip CR.
+        line := strings.trim_right(raw_line, "\r")
+        if len(line) == 0 do continue
 
-        is_directory := strings.has_suffix(trimmed, "/")
-        clean_name := strings.trim_right(trimmed, "/")
+        is_directory := strings.has_suffix(line, "/")
+        clean_name := strings.trim_right(line, "/")
         if clean_name == "." || clean_name == ".." || clean_name == "" do continue
+
+        // '/' would let an edited listing escape the browsed directory.
+        if strings.contains(clean_name, "/") {
+            return fmt.tprintf("Dired: invalid name '%s' (contains '/'); no changes applied", clean_name)
+        }
 
         append(&new_items, EditItem{
             name   = strings.clone(clean_name),
             is_dir = is_directory,
         })
+    }
+
+    // Validate the whole edit before touching the filesystem.
+    seen_names := make(map[string]bool, context.temp_allocator)
+    for item in new_items {
+        if seen_names[item.name] do return fmt.tprintf("Dired: duplicate entry '%s'; no changes applied", item.name)
+        seen_names[item.name] = true
+    }
+    for item in new_items {
+        for orig in d.orig_entries {
+            if item.name == orig.name && item.is_dir != orig.is_dir {
+                return fmt.tprintf("Dired: cannot change '%s' between file and directory; no changes applied", item.name)
+            }
+        }
     }
 
     orig_matched := make([]bool, len(d.orig_entries), context.allocator)
@@ -404,7 +438,7 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
                 dired_cycle_sort(d)
             }
             dired_sort_entries(d)
-            app.cmd_prompt.message = fmt.tprintf("Dired: sorted by %s (%s)", dired_sort_name(d.sort_by), "desc" if d.sort_order == .Desc else "asc")
+            app_set_message(app, fmt.tprintf("Dired: sorted by %s (%s)", dired_sort_name(d.sort_by), "desc" if d.sort_order == .Desc else "asc"))
             return true
         }
 
@@ -471,6 +505,8 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
                 pane.kind = .Editor
             } else if len(app.panes) > 1 {
                 app_close_pane(app, pane)
+            } else {
+                app.running = false
             }
             return true
         }
@@ -490,7 +526,6 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
 dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme) {
     if rect.w < 50 || rect.h < 50 do return
 
-    scale := get_font_scale_multiplier(.HALF)
     line_h := get_line_height(.HALF)
 
     header_h := line_h * 2.0

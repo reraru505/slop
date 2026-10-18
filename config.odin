@@ -26,6 +26,9 @@ import sdl "vendor:sdl3"
 // Appearance
 // ============================================================================
 
+// Editor name used in the window title and the :help heading.
+EDITOR_NAME :: "slop"
+
 // The font is embedded into the binary at compile time. To use a different
 // font, put its .ttf/.otf file in assets/ and change this path (the path must
 // be a string literal, which is an Odin #load requirement).
@@ -42,9 +45,14 @@ DEFAULT_THEME :: ThemeId.GruberDarker
 DEFAULT_LINE_SPACING :: 1.0
 DEFAULT_UI_SCALE     :: 1.0
 
-WINDOW_TITLE  :: "Odin Text Editor"
+WINDOW_TITLE  :: EDITOR_NAME
 WINDOW_WIDTH  :: 1024
 WINDOW_HEIGHT :: 768
+
+// Root directory used by the file picker (Space f / :files). Empty means:
+// infer from the file or directory passed on the command line, otherwise use
+// the process working directory. Change it at runtime with :root <dir>.
+DEFAULT_ROOT_DIRECTORY :: ""
 
 // ============================================================================
 // Keybindings
@@ -135,7 +143,7 @@ KEY_APPEND_LINE_END    :: sdl.K_A        // Shift+A
 KEY_UNDO               :: sdl.K_U        // u
 
 KEY_OPEN_PARENT_DIR    :: sdl.K_MINUS    // - (open parent in Dired)
-KEY_DIRED_EDIT_CANCEL  :: sdl.K_Q        // q while editing a dired listing
+KEY_DIRED_EDIT_CANCEL  :: sdl.K_Q        // q in Normal while a dired edit is active
 
 // ---- Dired -----------------------------------------------------------------
 
@@ -160,4 +168,6 @@ KEY_COMPILE_PREV_ERROR    :: sdl.K_P     // p
 KEY_COMPILE_JUMP          :: sdl.K_L     // L (lowercase l on the keyboard)
 KEY_COMPILE_RECOMPILE     :: sdl.K_R     // r
 KEY_COMPILE_RECOMPILE_ALT :: sdl.K_G     // g
+KEY_COMPILE_YANK          :: sdl.K_Y     // y: copy current line
+KEY_COMPILE_YANK_ALL      :: sdl.K_Y     // Shift+Y: copy whole buffer
 KEY_COMPILE_QUIT          :: sdl.K_Q     // q

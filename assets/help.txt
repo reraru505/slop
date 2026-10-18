@@ -1,5 +1,5 @@
-Odin Text Editor - Help
-========================
+{editor_name} - Help
+{help_underline}
 
 MODES
   Normal / Insert / Visual / Command
@@ -12,7 +12,6 @@ MODES
 
 MOVEMENT
   {left} {down} {up} {right} ...... left / down / up / right (arrow keys work too)
-  {left_upper}, {right_upper} ......... left / right one character
   {line_start} ...... start of line
   {line_end} ...... end of line
   {zero}, {dollar} ......... start / end of line
@@ -27,6 +26,8 @@ EDITING
   {delete_char} ............ delete character; at end of line, join the next line
   {select_line} then {delete_selection} ..... delete selected line(s)
   {paste} ....... paste the clipboard
+  {paste_normal} ....... paste in Normal / Visual mode
+  {save} ....... save the file
   Visual {delete_selection} ..... delete selection
   Visual {change_selection} ..... change selection (delete, then Insert mode)
   Visual {yank_selection} ..... yank selection to the clipboard (also {yank_alt})
@@ -54,7 +55,7 @@ COMMANDS  (type '{cmd_prompt}' in Normal mode)
   :w  :q  :wq  :x       write / quit / write and quit
   :q!  :qa  :qa!        force-close buffer / quit all / force quit all
   :<n>  :goto <n>       jump to line n
-  :e <path>             edit a file or directory
+  :e[!] <path>          edit a file or directory (:e! discards changes)
   :sp [file]            horizontal split (also {split_h})
   :vs [file]            vertical split (also {split_v})
   :dired                open the directory browser
@@ -66,6 +67,7 @@ COMMANDS  (type '{cmd_prompt}' in Normal mode)
   :theme [name]         cycle themes or set one by name
   :sort [name|size|time|rev]  sort the current dired listing
   :cd <dir>  :pwd       change / show the working directory
+  :root [dir|here]      show / set the file-picker root (here = current directory)
   :zoom <0.5-2.5>       UI scale ({zoom_in} / {zoom_out} / {zoom_reset})
   :linespace <1.0-2.0>  line-height multiplier (default {line_spacing_default} = font metrics)
   :help                 this screen
@@ -91,6 +93,8 @@ COMPILATION BUFFER
   {compile_next_error} / {compile_prev_error} ................ next / previous error
   Enter or {compile_jump} ........... jump to the error location
   {compile_recompile} or {compile_recompile_alt} ............... recompile
+  {compile_yank} .................... copy the current line
+  {compile_yank_all} .................... copy the whole buffer
   {compile_quit} .................... close the pane
 
 Help buffers and LSP documentation splits are read-only; navigation and

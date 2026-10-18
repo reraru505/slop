@@ -24,18 +24,20 @@ CompilationLine :: struct {
 // A running build. The worker owns everything except the fields protected by
 // mutex; the main thread polls `done` and takes the results.
 Compilation_Job :: struct {
-    thread:     ^thread.Thread,
-    mutex:      sync.Mutex,
-    command:    string,
-    output:     string,
-    exit_code:  int,
-    failed:     bool,
-    error_text: string,
-    done:       bool,
+    thread:      ^thread.Thread,
+    mutex:       sync.Mutex,
+    command:     string,
+    working_dir: string,
+    output:      string,
+    exit_code:   int,
+    failed:      bool,
+    error_text:  string,
+    done:        bool,
 }
 
 Compilation :: struct {
     command     : string,
+    working_dir : string,
     lines       : [dynamic]CompilationLine,
     cursor      : int,
     scroll      : int,
@@ -50,6 +52,7 @@ Compilation :: struct {
 
 compilation_init :: proc(c: ^Compilation) {
     c.command = ""
+    c.working_dir = ""
     c.lines = make([dynamic]CompilationLine, context.allocator)
     c.cursor = 0
     c.scroll = 0
@@ -84,6 +87,7 @@ compilation_destroy :: proc(c: ^Compilation) {
             if job.output != "" do delete(job.output, runtime.default_allocator())
             if job.error_text != "" do delete(job.error_text, runtime.default_allocator())
             if job.command != "" do delete(job.command)
+            if job.working_dir != "" do delete(job.working_dir)
             free(job)
         }
         // If the build is still running the worker owns the job; it finishes
@@ -104,6 +108,10 @@ compilation_destroy :: proc(c: ^Compilation) {
     if c.command != "" {
         delete(c.command)
         c.command = ""
+    }
+    if c.working_dir != "" {
+        delete(c.working_dir)
+        c.working_dir = ""
     }
     if c.status != "" {
         delete(c.status)
@@ -140,11 +148,14 @@ compilation_parse_line :: proc(c: ^Compilation, line: string) -> CompilationLine
     l_num, _ := strconv.parse_int(raw_line)
     if l_num <= 0 do return result
 
-    // Group 3 is column number if 4 or more groups
+    // Group 3 (when present) is the column. Non-participating capture groups
+    // are omitted, so a column with no trailing message still gives four
+    // groups: full match, path, line, column. If it is a message instead,
+    // parse_int fails and the column stays 1.
     c_num := 1
-    if len(capture.groups) >= 5 {
-        parsed_col, _ := strconv.parse_int(capture.groups[3])
-        if parsed_col > 0 do c_num = parsed_col
+    if len(capture.groups) >= 4 {
+        parsed_col, ok_col := strconv.parse_int(capture.groups[3])
+        if ok_col && parsed_col > 0 do c_num = parsed_col
     }
 
     result.file_path = strings.clone(raw_path)
@@ -169,6 +180,7 @@ compilation_worker :: proc(data: rawptr) {
     // context the worker or the test harness happens to use.
     alloc := runtime.default_allocator()
     desc := os.Process_Desc{command = []string{"sh", "-c", job.command}}
+    if job.working_dir != "" do desc.working_dir = job.working_dir
     state, stdout, stderr, err := os.process_exec(desc, alloc)
 
     combined: strings.Builder
@@ -249,10 +261,17 @@ compilation_finish :: proc(c: ^Compilation, output: string, exit_code: int, fail
 
     append(&c.lines, CompilationLine{text = strings.clone("")})
     if c.status != "" do delete(c.status)
-    if c.exit_code == 0 {
+    if c.exit_code == 0 && error_count == 0 {
         c.status = fmt.aprintf("Finished (%d warnings)", warn_count)
         append(&c.lines, CompilationLine{
             text = fmt.aprintf("Compilation finished successfully (%d warnings).", warn_count),
+        })
+    } else if c.exit_code == 0 {
+        // Some tools print diagnostics but still exit 0.
+        c.status = fmt.aprintf("Finished (%d errors, %d warnings)", error_count, warn_count)
+        append(&c.lines, CompilationLine{
+            text = fmt.aprintf("Compilation completed with %d errors and %d warnings.", error_count, warn_count),
+            is_error = true,
         })
     } else {
         c.status = fmt.aprintf("Exited with code %d (%d errors, %d warnings)", c.exit_code, error_count, warn_count)
@@ -300,6 +319,7 @@ compilation_poll :: proc(c: ^Compilation) {
     c.job = nil
     compilation_finish(c, output, exit_code, failed, error_text)
     if job.command != "" do delete(job.command)
+    if job.working_dir != "" do delete(job.working_dir)
     free(job)
 }
 
@@ -311,7 +331,7 @@ compilation_wait :: proc(c: ^Compilation) {
     }
 }
 
-compilation_run_command :: proc(c: ^Compilation, cmd_str: string) {
+compilation_run_command :: proc(c: ^Compilation, cmd_str: string, working_dir := "") {
     compilation_poll(c)
     if c.job != nil {
         if c.status != "" do delete(c.status)
@@ -319,8 +339,11 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string) {
         return
     }
 
+    // cmd_str may alias c.command (recompile passes it), so own the copy
+    // before releasing the old one.
+    new_command := strings.clone(cmd_str)
     if c.command != "" do delete(c.command)
-    c.command = strings.clone(cmd_str)
+    c.command = new_command
 
     // Clear previous output
     for l in c.lines {
@@ -328,13 +351,24 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string) {
         if l.file_path != "" do delete(l.file_path)
     }
     clear(&c.lines)
+    c.cursor = 0
+    c.scroll = 0
 
-    cwd, _ := os.get_working_directory(context.temp_allocator)
+    display_cwd := working_dir
+    if display_cwd == "" {
+        cwd, _ := os.get_working_directory(context.temp_allocator)
+        display_cwd = cwd
+    }
+    // Remember the actual build directory so diagnostics in this buffer keep
+    // resolving correctly even if the project root changes later.
+    if c.working_dir != "" do delete(c.working_dir)
+    c.working_dir = strings.clone(display_cwd, context.allocator)
+
     append(&c.lines, CompilationLine{
-        text = fmt.aprintf("-*- mode: compilation; default-directory: \"%s\" -*-", cwd),
+        text = fmt.aprintf("-*- mode: compilation; default-directory: \"%s\" -*-", display_cwd),
     })
     append(&c.lines, CompilationLine{
-        text = fmt.aprintf("Compilation started: %s", cmd_str),
+        text = fmt.aprintf("Compilation started: %s", new_command),
     })
     append(&c.lines, CompilationLine{text = strings.clone("")})
 
@@ -343,16 +377,20 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string) {
     c.status = strings.clone("Running...")
 
     job := new(Compilation_Job)
-    job.command = strings.clone(cmd_str)
+    job.command = strings.clone(new_command)
+    if working_dir != "" do job.working_dir = strings.clone(working_dir)
     job.thread = thread.create_and_start_with_data(rawptr(job), compilation_worker)
     c.job = job
 }
 
 paths_match :: proc(p1, p2: string) -> bool {
     if p1 == p2 do return true
-    c1, _ := filepath.clean(p1, context.temp_allocator)
-    c2, _ := filepath.clean(p2, context.temp_allocator)
-    return c1 == c2
+
+    a1, err1 := filepath.abs(p1, context.temp_allocator)
+    if err1 != nil do a1, _ = filepath.clean(p1, context.temp_allocator)
+    a2, err2 := filepath.abs(p2, context.temp_allocator)
+    if err2 != nil do a2, _ = filepath.clean(p2, context.temp_allocator)
+    return a1 == a2
 }
 
 compilation_jump_to_current :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
@@ -360,11 +398,24 @@ compilation_jump_to_current :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
     entry := c.lines[c.cursor]
     if entry.file_path == "" || entry.line_num <= 0 do return
 
+    // Compiler paths are relative to the build's directory, which may no
+    // longer be the current project root.
+    target_path := entry.file_path
+    if !filepath.is_abs(target_path) {
+        if c.working_dir != "" {
+            if joined, join_err := filepath.join([]string{c.working_dir, target_path}, context.temp_allocator); join_err == nil {
+                target_path = joined
+            }
+        } else {
+            target_path = app_resolve_path(app, target_path)
+        }
+    }
+
     // Find target editor pane (preferably another pane)
     target_pane: ^Pane = nil
     for p in app.panes {
         if p != pane && p.kind == .Editor {
-            if paths_match(p.editor.file_path, entry.file_path) {
+            if paths_match(p.editor.file_path, target_path) {
                 target_pane = p
                 break
             }
@@ -397,8 +448,8 @@ compilation_jump_to_current :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
     }
 
     // Open file in target editor pane if not already opened
-    if !paths_match(target_pane.editor.file_path, entry.file_path) {
-        app_pane_open_file(app, target_pane, entry.file_path)
+    if !paths_match(target_pane.editor.file_path, target_path) {
+        app_pane_open_file(app, target_pane, target_path)
     }
 
     // Position cursor on error line and col
@@ -411,7 +462,7 @@ compilation_jump_to_current :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
     target_pane.editor.scroll_row = max(0, target_pane.editor.cursor.row - 10)
 
     app.active_pane = target_pane
-    app.cmd_prompt.message = fmt.tprintf("%s:%d:%d", entry.file_path, entry.line_num, entry.col_num)
+    app_set_message(app, fmt.tprintf("%s:%d:%d", entry.file_path, entry.line_num, entry.col_num))
 }
 
 compilation_first_error :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
@@ -447,6 +498,35 @@ compilation_prev_error :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
     app.cmd_prompt.message = "No prior errors in compilation buffer"
 }
 
+// Text copied from the compilation buffer: the current line, or everything.
+compilation_copy_text :: proc(c: ^Compilation, all: bool, allocator := context.temp_allocator) -> string {
+    b: strings.Builder
+    strings.builder_init(&b, 0, 256, allocator)
+
+    if all {
+        for line, i in c.lines {
+            strings.write_string(&b, line.text)
+            if i + 1 < len(c.lines) do strings.write_byte(&b, '\n')
+        }
+    } else if c.cursor >= 0 && c.cursor < len(c.lines) {
+        strings.write_string(&b, c.lines[c.cursor].text)
+    }
+
+    return strings.to_string(b)
+}
+
+compilation_copy :: proc(c: ^Compilation, app: ^App, all: bool) {
+    text := compilation_copy_text(c, all)
+    if text == "" {
+        app_set_message(app, "Nothing to copy")
+        return
+    }
+
+    c_text := strings.clone_to_cstring(text, context.temp_allocator)
+    _ = sdl.SetClipboardText(c_text)
+    app_set_message(app, "Copied the compilation buffer" if all else "Copied the current line")
+}
+
 compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, pane: ^Pane) -> bool {
     #partial switch event.type {
     case .KEY_DOWN:
@@ -454,7 +534,6 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
         key := event.key.key
         mod := event.key.mod
         is_shift := (mod & sdl.KMOD_SHIFT) != {}
-        is_ctrl := (mod & sdl.KMOD_CTRL) != {}
 
         if key == KEY_CMD_PROMPT || (key == KEY_CMD_PROMPT_ALT && is_shift) {
             app_open_command_prompt(app)
@@ -492,15 +571,29 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
 
         if key == KEY_COMPILE_RECOMPILE || key == KEY_COMPILE_RECOMPILE_ALT {
             if c.command != "" {
-                compilation_run_command(c, c.command)
-                app.cmd_prompt.message = fmt.tprintf("Recompiled: %s", c.command)
+                workdir := c.working_dir
+                if workdir == "" do workdir = app_picker_root(app)
+                compilation_run_command(c, c.command, workdir)
+                app_set_message(app, fmt.tprintf("Recompiled: %s", c.command))
             }
+            return true
+        }
+
+        if is_shift && key == KEY_COMPILE_YANK_ALL {
+            compilation_copy(c, app, true)
+            return true
+        }
+
+        if key == KEY_COMPILE_YANK {
+            compilation_copy(c, app, false)
             return true
         }
 
         if key == KEY_COMPILE_QUIT {
             if len(app.panes) > 1 {
                 app_close_pane(app, pane)
+            } else {
+                app.running = false
             }
             return true
         }
@@ -520,7 +613,6 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
 compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme) {
     if rect.w < 50 || rect.h < 50 do return
 
-    scale := get_font_scale_multiplier(.HALF)
     line_h := get_line_height(.HALF)
 
     header_h := line_h * 1.5
@@ -604,12 +696,13 @@ compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font
 
     focus_badge := "[ACTIVE] " if is_focused else ""
     status_info := fmt.tprintf(
-        "%s-- COMPILATION --  [%s]   <Enter> jump to error, <%s/%s> next/prev, <%s> recompile",
+        "%s-- COMPILATION --  [%s]   <Enter> jump, <%s/%s> next/prev, <%s> recompile, <%s> copy",
         focus_badge,
         c.status,
         key_label(KEY_COMPILE_NEXT_ERROR, {}, .Plain),
         key_label(KEY_COMPILE_PREV_ERROR, {}, .Plain),
         key_label(KEY_COMPILE_RECOMPILE, {}, .Plain),
+        key_label(KEY_COMPILE_YANK, {}, .Plain),
     )
     status_color := sdl.FColor{0.45, 0.85, 0.55, 1.0} if (c.finished && c.exit_code == 0) else sdl.FColor{0.95, 0.5, 0.45, 1.0}
     push_line(font, status_info, Vec2{rect.x + 10.0, rect.y + rect.h - status_bar_h + 4.0}, status_color, .HALF)

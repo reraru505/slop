@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:testing"
 import sdl "vendor:sdl3"
@@ -48,6 +49,8 @@ test_compilation_parse_line_formats :: proc(t: ^testing.T) {
         {"src/main.c:12:3: error: expected ';'", "src/main.c", 12, 3, true, false},
         // GCC/Clang style without a column
         {"src/main.c:12: error: expected ';'", "src/main.c", 12, 1, true, false},
+        // Column with no trailing message must still be captured
+        {"src/main.c:12:3", "src/main.c", 12, 3, true, false},
         // Warnings set is_warn rather than is_error
         {"src/lib.rs:7:9: warning: unused variable", "src/lib.rs", 7, 9, false, true},
         {"main.odin(2:4) warn: something", "main.odin", 2, 4, false, true},
@@ -187,4 +190,113 @@ test_compilation_dispatch_uses_config_keys :: proc(t: ^testing.T) {
     testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
     testing.expect_value(t, c.cursor, 0)
     fmt.println("  ✓ [Compilation] dispatch follows configured key constants")
+}
+
+@(test)
+test_compilation_working_directory :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/compile_cwd"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/marker.txt", dir), "") == nil)
+
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+
+    compilation_run_command(&c, "test -f marker.txt && printf 'found\\n'", dir)
+    compilation_wait(&c)
+
+    found := false
+    banner := false
+    for line in c.lines {
+        if strings.trim_space(line.text) == "found" do found = true
+        if strings.contains(line.text, dir) do banner = true
+    }
+    testing.expect_value(t, found, true)
+    testing.expect_value(t, banner, true)
+    fmt.println("  ✓ [Compilation] commands run in the configured working directory")
+}
+
+@(test)
+test_compilation_copy_text :: proc(t: ^testing.T) {
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+
+    lines := []string{"alpha", "beta", "gamma"}
+    for text in lines {
+        append(&c.lines, CompilationLine{text = strings.clone(text)})
+    }
+
+    c.cursor = 1
+    testing.expect_value(t, compilation_copy_text(&c, false), "beta")
+    testing.expect_value(t, compilation_copy_text(&c, true), "alpha\nbeta\ngamma")
+
+    c.cursor = 99
+    testing.expect_value(t, compilation_copy_text(&c, false), "")
+    fmt.println("  ✓ [Compilation] current-line and whole-buffer copy text")
+}
+
+@(test)
+test_compilation_jump_resolves_paths_against_root :: proc(t: ^testing.T) {
+    root := "/tmp/odin_editor_tests/compile_jump_root"
+    _ = os.remove_all(root)
+    testing.expect(t, os.make_directory_all(fmt.tprintf("%s/src", root)) == nil)
+    defer os.remove_all(root)
+
+    target := fmt.tprintf("%s/src/main.txt", root)
+    testing.expect(t, os.write_entire_file_from_string(target, "line one\nline two\n") == nil)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    // The jump must use the build directory, not the current project root.
+    app.root_dir = strings.clone(fmt.tprintf("%s/wrong_root", root), context.allocator)
+
+    comp_pane := app.active_pane
+    app_split_pane(&app, comp_pane, .Horizontal)
+    comp_pane.kind = .Compilation
+    editor_pane := app.panes[1]
+
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+    c.working_dir = strings.clone(root, context.allocator)
+    append(&c.lines, CompilationLine{
+        text = strings.clone(""),
+        file_path = strings.clone("src/main.txt"),
+        line_num = 2,
+        col_num = 3,
+    })
+
+    compilation_jump_to_current(&c, &app, comp_pane)
+
+    testing.expect_value(t, editor_pane.editor.file_path, target)
+    testing.expect_value(t, editor_pane.editor.cursor.row, 1)
+    testing.expect_value(t, editor_pane.editor.cursor.col, 2)
+    testing.expect_value(t, app.active_pane, editor_pane)
+    fmt.println("  ✓ [Compilation] jumps resolve relative compiler paths at the project root")
+}
+
+@(test)
+test_compilation_recompile_self_alias :: proc(t: ^testing.T) {
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+
+    compilation_run_command(&c, "printf 'alias-ok\\n'")
+    compilation_wait(&c)
+    testing.expect_value(t, c.finished, true)
+
+    // Recompile passes c.command back in; the old implementation freed it
+    // before cloning the argument (use-after-free).
+    compilation_run_command(&c, c.command)
+    compilation_wait(&c)
+
+    found := false
+    for line in c.lines {
+        if strings.trim_space(line.text) == "alias-ok" do found = true
+    }
+    testing.expect_value(t, found, true)
+    fmt.println("  ✓ [Compilation] recompile safely aliases its own command")
 }
