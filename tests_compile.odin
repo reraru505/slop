@@ -88,6 +88,7 @@ test_compilation_run_command_success :: proc(t: ^testing.T) {
     defer compilation_destroy(&c)
 
     compilation_run_command(&c, "printf 'hello world\\n'")
+    compilation_wait(&c)
     testing.expect_value(t, c.finished, true)
     testing.expect_value(t, c.exit_code, 0)
     testing.expect(t, strings.has_prefix(c.status, "Finished"), c.status)
@@ -106,6 +107,30 @@ test_compilation_run_command_success :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_compilation_run_command_is_async :: proc(t: ^testing.T) {
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+
+    compilation_run_command(&c, "sleep 0.5")
+    // Returns immediately: the subprocess is still running.
+    testing.expect_value(t, c.status, "Running...")
+    testing.expect(t, c.job != nil)
+    testing.expect_value(t, c.finished, false)
+
+    // A second build is refused while the first is in flight.
+    compilation_run_command(&c, "printf 'second\\n'")
+    testing.expect_value(t, c.status, "Compilation already running")
+    testing.expect(t, c.job != nil)
+
+    compilation_wait(&c)
+    testing.expect_value(t, c.finished, true)
+    testing.expect_value(t, c.exit_code, 0)
+    testing.expect(t, c.job == nil)
+    fmt.println("  ✓ [Compilation] commands run off-thread and concurrent starts are refused")
+}
+
+@(test)
 test_compilation_run_command_failure_parses_errors :: proc(t: ^testing.T) {
     c: Compilation
     compilation_init(&c)
@@ -113,6 +138,7 @@ test_compilation_run_command_failure_parses_errors :: proc(t: ^testing.T) {
 
     cmd := "printf 'src/main.odin(3:7) Error: boom\\n' >&2; exit 1"
     compilation_run_command(&c, cmd)
+    compilation_wait(&c)
 
     testing.expect_value(t, c.finished, true)
     testing.expect_value(t, c.exit_code, 1)

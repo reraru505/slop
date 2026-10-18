@@ -15,6 +15,25 @@ EditorMode :: enum {
     Command,
 }
 
+// Highlight results are cached per visible slot, keyed by row + content hash +
+// file/theme. This keeps per-frame cost to a cheap hash for unchanged lines.
+SYNTAX_CACHE_SLOTS :: 256
+
+Syntax_Cache_Entry :: struct {
+    valid:  bool,
+    row:    int,
+    hash:   u64,
+    colors: [dynamic]sdl.FColor,
+}
+
+syntax_cache_hash :: proc(line: string, seed: u64) -> u64 {
+    h := seed
+    for b in line {
+        h = (h ~ u64(b)) * 1099511628211
+    }
+    return h
+}
+
 CompletionState :: struct {
     active         : bool,
     items          : [dynamic]LspCompletionItem,
@@ -47,6 +66,7 @@ Editor :: struct {
     last_edit_time     : time.Time,
     completion         : CompletionState,
     read_only          : bool,
+    syntax_cache       : [SYNTAX_CACHE_SLOTS]Syntax_Cache_Entry,
 }
 
 // Odin's fmt zero-pads width-formatted numbers by default; the gutter needs
@@ -80,6 +100,7 @@ editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := ""
     e.last_action = time.now()
     e.pending_cmd = 0
     e.file_path = strings.clone(file_path)
+    e.syntax_cache = {}
     e.dirty = false
     e.command_buffer = make([dynamic]u8, context.allocator)
     editor_set_status_message(e, "")
@@ -93,6 +114,10 @@ editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := ""
 }
 
 editor_destroy :: proc(e: ^Editor) {
+    for entry in e.syntax_cache {
+        delete(entry.colors)
+    }
+    e.syntax_cache = {}
     pt_destroy(&e.table)
     delete(e.command_buffer)
     for c in e.completion.items {
@@ -2029,6 +2054,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
     inverted_cursor_char_color := theme.bg
     active_line_num_color := theme.gutter_active_fg
     normal_line_num_color := theme.gutter_fg
+    cache_seed := syntax_cache_hash(e.file_path, u64(theme.id) + 1)
 
     for i in 0 ..< visible_lines {
         line_idx := e.scroll_row + i
@@ -2058,9 +2084,16 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
                     hl_col = e.cursor.col - byte_start
                 }
 
-                line_colors := make([]sdl.FColor, len(line_str), context.temp_allocator)
-                syntax_highlight_line(e.file_path, line_str, theme, line_colors)
-                visible_colors := line_colors[byte_start:]
+                line_hash := syntax_cache_hash(line_str, cache_seed)
+                cache := &e.syntax_cache[line_idx % SYNTAX_CACHE_SLOTS]
+                if !cache.valid || cache.row != line_idx || cache.hash != line_hash || len(cache.colors) != len(line_str) {
+                    resize(&cache.colors, len(line_str))
+                    syntax_highlight_line(e.file_path, line_str, theme, cache.colors[:])
+                    cache.valid = true
+                    cache.row = line_idx
+                    cache.hash = line_hash
+                }
+                visible_colors := cache.colors[byte_start:]
 
                 push_editor_line(
                     font,

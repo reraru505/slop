@@ -756,6 +756,11 @@ update :: proc(app: ^App) {
         app_reload_font(app)
     }
 
+    // Collect finished background builds.
+    for p in app.panes {
+        if p.kind == .Compilation do compilation_poll(&p.compilation)
+    }
+
     event: sdl.Event
     for sdl.PollEvent(&event) {
         if event.type == .QUIT {

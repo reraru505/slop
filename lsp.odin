@@ -146,17 +146,37 @@ PendingRequest :: struct {
     end_row   : int,
 }
 
+Lsp_Out_Kind :: enum {
+    Raw,
+    Did_Change,
+}
+
+// Owned by the writer queue; strings use runtime.default_allocator().
+Lsp_Out_Message :: struct {
+    kind      : Lsp_Out_Kind,
+    raw       : string, // .Raw payload, already valid JSON
+    uri       : string, // .Did_Change target
+    file_path : string, // .Did_Change coalescing key
+    text      : string, // .Did_Change full document snapshot
+    version   : int,
+}
+
 LspClient :: struct {
     server_cmd       : string,
     process          : os.Process,
     stdin_file       : ^os.File,
     stdout_file      : ^os.File,
     reader_thread    : ^thread.Thread,
+    writer_thread    : ^thread.Thread,
+    writer_mutex     : sync.Mutex,
+    writer_cond      : sync.Cond,
+    writer_queue     : [dynamic]Lsp_Out_Message,
+    writer_running   : bool,
     running          : bool,
     initialized      : bool,
     next_id          : int,
     mutex            : sync.Mutex,
-    incoming_queue   : [dynamic]string,
+    incoming_queue   : [dynamic]json.Value,
     pending_requests : [dynamic]PendingRequest,
     // Diagnostics map: file_path -> [dynamic]LspDiagnostic
     diagnostics      : map[string][dynamic]LspDiagnostic,
@@ -256,14 +276,17 @@ lsp_reader_thread_proc :: proc(data: rawptr) {
 
             // Extract complete JSON payload
             json_bytes := accum[body_start : body_start + content_length]
-            json_str := strings.clone(string(json_bytes), runtime.default_allocator())
 
             // Remove processed message from accumulator
             remove_range(&accum, 0, body_start + content_length)
 
-            // Enqueue to incoming queue
+            // Parse here, off the main thread; the main thread only dispatches
+            // the resulting value and frees it.
+            val, err := json.parse_string(string(json_bytes), allocator = runtime.default_allocator())
+            if err != nil do continue
+
             sync.mutex_lock(&client.mutex)
-            append(&client.incoming_queue, json_str)
+            append(&client.incoming_queue, val)
             sync.mutex_unlock(&client.mutex)
         }
     }
@@ -291,7 +314,9 @@ lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> b
     client.running = false
     client.initialized = false
     client.next_id = 1
-    client.incoming_queue = make([dynamic]string, 0, 64)
+    client.incoming_queue = make([dynamic]json.Value, 0, 64)
+    client.writer_queue = make([dynamic]Lsp_Out_Message, 0, 16)
+    client.writer_running = false
     client.pending_requests = make([dynamic]PendingRequest, 0, 16)
     client.diagnostics = make(map[string][dynamic]LspDiagnostic)
     client.completions = make([dynamic]LspCompletionItem, 0, 32)
@@ -340,8 +365,12 @@ lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> b
     client.stdout_file = out_r
     client.running = true
 
-    // Start reader thread
+    // Start reader and writer threads
     client.reader_thread = thread.create_and_start_with_data(rawptr(client), lsp_reader_thread_proc)
+    sync.mutex_lock(&client.writer_mutex)
+    client.writer_running = true
+    sync.mutex_unlock(&client.writer_mutex)
+    client.writer_thread = thread.create_and_start_with_data(rawptr(client), lsp_writer_thread_proc)
 
     // Send initialize request
     root_uri := lsp_path_to_uri(root_dir)
@@ -361,16 +390,36 @@ lsp_start :: proc(client: ^LspClient, server_cmd: string, root_dir: string) -> b
 }
 
 lsp_stop :: proc(client: ^LspClient) {
-    if !client.running do return
-    client.running = false
+    if !client.running && client.stdin_file == nil && client.reader_thread == nil && client.writer_thread == nil {
+        return
+    }
 
+    // Queue the graceful shutdown before sends are disabled, then let the
+    // writer drain everything it has before closing the pipe.
     if client.stdin_file != nil {
         if client.initialized {
             shutdown_msg := fmt.tprintf(`{{"jsonrpc":"2.0","id":%d,"method":"shutdown","params":null}}`, client.next_id)
+            client.next_id += 1
             lsp_send_raw(client, shutdown_msg)
             exit_msg := `{"jsonrpc":"2.0","method":"exit","params":null}`
             lsp_send_raw(client, exit_msg)
         }
+    }
+
+    client.running = false
+
+    sync.mutex_lock(&client.writer_mutex)
+    client.writer_running = false
+    sync.mutex_unlock(&client.writer_mutex)
+    sync.cond_signal(&client.writer_cond)
+
+    if client.writer_thread != nil {
+        thread.join(client.writer_thread)
+        thread.destroy(client.writer_thread)
+        client.writer_thread = nil
+    }
+
+    if client.stdin_file != nil {
         os.close(client.stdin_file)
         client.stdin_file = nil
     }
@@ -390,7 +439,11 @@ lsp_stop :: proc(client: ^LspClient) {
     }
 
     // Free structures
-    for q in client.incoming_queue do delete(q, runtime.default_allocator())
+    for &m in client.writer_queue do lsp_destroy_out_message(&m)
+    delete(client.writer_queue)
+    client.writer_queue = nil
+
+    for q in client.incoming_queue do json.destroy_value(q, runtime.default_allocator())
     delete(client.incoming_queue)
     delete(client.pending_requests)
 
@@ -568,19 +621,77 @@ lsp_manager_stop_all :: proc(mgr: ^LspManager) {
     delete(mgr.working_dir)
 }
 
+lsp_destroy_out_message :: proc(m: ^Lsp_Out_Message) {
+    if m.raw != "" do delete(m.raw, runtime.default_allocator())
+    if m.uri != "" do delete(m.uri, runtime.default_allocator())
+    if m.file_path != "" do delete(m.file_path, runtime.default_allocator())
+    if m.text != "" do delete(m.text, runtime.default_allocator())
+    m^ = {}
+}
+
+// Called on the main thread; the writer thread owns the actual pipe writes.
 lsp_send_raw :: proc(client: ^LspClient, json_str: string) {
     if client.stdin_file == nil || !client.running do return
-    header := fmt.tprintf("Content-Length: %d\r\n\r\n", len(json_str))
+    sync.mutex_lock(&client.writer_mutex)
+    append(&client.writer_queue, Lsp_Out_Message{
+        kind = .Raw,
+        raw = strings.clone(json_str, runtime.default_allocator()),
+    })
+    sync.mutex_unlock(&client.writer_mutex)
+    sync.cond_signal(&client.writer_cond)
+}
 
-    _, err1 := os.write(client.stdin_file, transmute([]u8)header)
-    if err1 != nil {
+lsp_write_framed :: proc(client: ^LspClient, json_str: string) {
+    if client.stdin_file == nil do return
+    header_buf: [64]u8
+    header := fmt.bprintf(header_buf[:], "Content-Length: %d\r\n\r\n", len(json_str))
+
+    if _, err := os.write(client.stdin_file, transmute([]u8)header); err != nil {
         client.running = false
         return
     }
-    _, err2 := os.write(client.stdin_file, transmute([]u8)json_str)
-    if err2 != nil {
+    if _, err := os.write(client.stdin_file, transmute([]u8)json_str); err != nil {
         client.running = false
-        return
+    }
+}
+
+lsp_writer_thread_proc :: proc(data: rawptr) {
+    client := (^LspClient)(data)
+
+    for {
+        msg: Lsp_Out_Message
+
+        sync.mutex_lock(&client.writer_mutex)
+        for len(client.writer_queue) == 0 {
+            if !client.writer_running {
+                sync.mutex_unlock(&client.writer_mutex)
+                return
+            }
+            sync.cond_wait(&client.writer_cond, &client.writer_mutex)
+        }
+        msg = client.writer_queue[0]
+        ordered_remove(&client.writer_queue, 0)
+        sync.mutex_unlock(&client.writer_mutex)
+
+        switch msg.kind {
+        case .Raw:
+            lsp_write_framed(client, msg.raw)
+
+        case .Did_Change:
+            b: strings.Builder
+            strings.builder_init(&b, 0, len(msg.text) * 2 + 256, runtime.default_allocator())
+            strings.write_string(&b, `{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"`)
+            strings.write_string(&b, msg.uri)
+            strings.write_string(&b, `","version":`)
+            strings.write_int(&b, msg.version)
+            strings.write_string(&b, `},"contentChanges":[{"text":"`)
+            lsp_append_json_escaped(&b, msg.text)
+            strings.write_string(&b, `"}]}}`)
+            lsp_write_framed(client, strings.to_string(b))
+            strings.builder_destroy(&b)
+        }
+
+        lsp_destroy_out_message(&msg)
     }
 }
 
@@ -620,7 +731,6 @@ lsp_did_open :: proc(client: ^LspClient, file_path: string, text: string) {
 
 lsp_did_change :: proc(client: ^LspClient, file_path: string, text: string) {
     if !client.running || !client.initialized do return
-    uri := lsp_path_to_uri(file_path)
 
     ver := 2
     if v, ok := &client.file_versions[file_path]; ok {
@@ -630,16 +740,32 @@ lsp_did_change :: proc(client: ^LspClient, file_path: string, text: string) {
         client.file_versions[file_path] = 2
     }
 
-    b: strings.Builder
-    strings.builder_init(&b, 0, len(text) * 2 + 256, context.temp_allocator)
-    strings.write_string(&b, `{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"`)
-    strings.write_string(&b, uri)
-    strings.write_string(&b, `","version":`)
-    strings.write_int(&b, ver)
-    strings.write_string(&b, `},"contentChanges":[{"text":"`)
-    lsp_append_json_escaped(&b, text)
-    strings.write_string(&b, `"}]}}`)
-    lsp_send_raw(client, strings.to_string(b))
+    // Unit tests exercise version bookkeeping without a live pipe.
+    if client.stdin_file == nil do return
+
+    // Coalesce unsent changes: only the newest full-document snapshot matters.
+    sync.mutex_lock(&client.writer_mutex)
+    for &m in client.writer_queue {
+        if m.kind == .Did_Change && m.file_path == file_path {
+            if m.text != "" do delete(m.text, runtime.default_allocator())
+            m.text = strings.clone(text, runtime.default_allocator())
+            m.version = ver
+            sync.mutex_unlock(&client.writer_mutex)
+            sync.cond_signal(&client.writer_cond)
+            return
+        }
+    }
+
+    uri := lsp_path_to_uri(file_path, runtime.default_allocator())
+    append(&client.writer_queue, Lsp_Out_Message{
+        kind      = .Did_Change,
+        uri       = uri,
+        file_path = strings.clone(file_path, runtime.default_allocator()),
+        text      = strings.clone(text, runtime.default_allocator()),
+        version   = ver,
+    })
+    sync.mutex_unlock(&client.writer_mutex)
+    sync.cond_signal(&client.writer_cond)
 }
 
 lsp_did_save :: proc(client: ^LspClient, file_path: string) {
@@ -730,10 +856,10 @@ lsp_json_escape :: proc(s: string, allocator := context.temp_allocator) -> strin
 lsp_update :: proc(client: ^LspClient, app: ^App) {
     if !client.running do return
 
-    messages_to_process: [dynamic]string
+    messages_to_process: [dynamic]json.Value
     sync.mutex_lock(&client.mutex)
     if len(client.incoming_queue) > 0 {
-        messages_to_process = make([dynamic]string, len(client.incoming_queue), context.temp_allocator)
+        messages_to_process = make([dynamic]json.Value, len(client.incoming_queue), context.temp_allocator)
         for m, i in client.incoming_queue {
             messages_to_process[i] = m
         }
@@ -743,11 +869,8 @@ lsp_update :: proc(client: ^LspClient, app: ^App) {
 
     if len(messages_to_process) == 0 do return
 
-    for raw_json in messages_to_process {
-        defer delete(raw_json, runtime.default_allocator())
-
-        val, err := json.parse_string(raw_json, allocator = context.temp_allocator)
-        if err != nil do continue
+    for val in messages_to_process {
+        defer json.destroy_value(val, runtime.default_allocator())
 
         obj, is_obj := val.(json.Object)
         if !is_obj do continue

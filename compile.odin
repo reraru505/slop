@@ -1,11 +1,14 @@
 package main
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:text/regex"
+import "core:thread"
 import "core:time"
 import sdl "vendor:sdl3"
 
@@ -16,6 +19,19 @@ CompilationLine :: struct {
     col_num   : int,
     is_error  : bool,
     is_warn   : bool,
+}
+
+// A running build. The worker owns everything except the fields protected by
+// mutex; the main thread polls `done` and takes the results.
+Compilation_Job :: struct {
+    thread:     ^thread.Thread,
+    mutex:      sync.Mutex,
+    command:    string,
+    output:     string,
+    exit_code:  int,
+    failed:     bool,
+    error_text: string,
+    done:       bool,
 }
 
 Compilation :: struct {
@@ -29,6 +45,7 @@ Compilation :: struct {
     error_regex : regex.Regular_Expression,
     has_regex   : bool,
     last_action : time.Time,
+    job         : ^Compilation_Job,
 }
 
 compilation_init :: proc(c: ^Compilation) {
@@ -55,6 +72,24 @@ compilation_init :: proc(c: ^Compilation) {
 }
 
 compilation_destroy :: proc(c: ^Compilation) {
+    if c.job != nil {
+        job := c.job
+        done := false
+        sync.mutex_lock(&job.mutex)
+        done = job.done
+        sync.mutex_unlock(&job.mutex)
+        if done {
+            thread.join(job.thread)
+            thread.destroy(job.thread)
+            if job.output != "" do delete(job.output, runtime.default_allocator())
+            if job.error_text != "" do delete(job.error_text, runtime.default_allocator())
+            if job.command != "" do delete(job.command)
+            free(job)
+        }
+        // If the build is still running the worker owns the job; it finishes
+        // independently and the OS reclaims the memory at process exit.
+        c.job = nil
+    }
     if c.has_regex {
         regex.destroy(c.error_regex)
         c.has_regex = false
@@ -126,73 +161,75 @@ compilation_parse_line :: proc(c: ^Compilation, line: string) -> CompilationLine
     return result
 }
 
-compilation_run_command :: proc(c: ^Compilation, cmd_str: string) {
-    if c.command != "" {
-        delete(c.command)
-    }
-    c.command = strings.clone(cmd_str)
+// Runs the build off the main thread. Only the mutex-protected fields are
+// shared; everything else in Compilation stays main-thread-owned.
+compilation_worker :: proc(data: rawptr) {
+    job := (^Compilation_Job)(data)
+    // Results cross threads, so use a stable allocator rather than whatever
+    // context the worker or the test harness happens to use.
+    alloc := runtime.default_allocator()
+    desc := os.Process_Desc{command = []string{"sh", "-c", job.command}}
+    state, stdout, stderr, err := os.process_exec(desc, alloc)
 
-    // Clear previous output
-    for l in c.lines {
-        delete(l.text)
-        if l.file_path != "" do delete(l.file_path)
-    }
-    clear(&c.lines)
-
-    cwd, _ := os.get_working_directory(context.temp_allocator)
-    append(&c.lines, CompilationLine{
-        text = fmt.aprintf("-*- mode: compilation; default-directory: \"%s\" -*-", cwd),
-    })
-    append(&c.lines, CompilationLine{
-        text = fmt.aprintf("Compilation started: %s", cmd_str),
-    })
-    append(&c.lines, CompilationLine{text = strings.clone("")})
-
-    desc := os.Process_Desc{
-        command = []string{"sh", "-c", cmd_str},
-    }
-
-    state, stdout, stderr, err := os.process_exec(desc, context.allocator)
-    defer delete(stdout)
-    defer delete(stderr)
+    combined: strings.Builder
+    strings.builder_init(&combined, alloc)
+    exit_code := 0
+    failed := false
+    error_text := ""
 
     if err != nil {
+        failed = true
+        exit_code = -1
+        error_text = fmt.aprintf("%v", err, allocator = alloc)
+    } else {
+        exit_code = state.exit_code
+        if len(stdout) > 0 do strings.write_bytes(&combined, stdout)
+        if len(stderr) > 0 {
+            if len(stdout) > 0 && stdout[len(stdout) - 1] != '\n' {
+                strings.write_byte(&combined, '\n')
+            }
+            strings.write_bytes(&combined, stderr)
+        }
+    }
+    delete(stdout, alloc)
+    delete(stderr, alloc)
+
+    out := strings.to_string(combined) // ownership moves to the main thread
+
+    sync.mutex_lock(&job.mutex)
+    job.output = out
+    job.exit_code = exit_code
+    job.failed = failed
+    job.error_text = error_text
+    job.done = true
+    sync.mutex_unlock(&job.mutex)
+}
+
+compilation_finish :: proc(c: ^Compilation, output: string, exit_code: int, failed: bool, error_text: string) {
+    alloc := runtime.default_allocator()
+    defer if output != "" do delete(output, alloc)
+    defer if error_text != "" do delete(error_text, alloc)
+
+    if failed {
         c.exit_code = -1
         c.finished = true
         if c.status != "" do delete(c.status)
-        c.status = fmt.aprintf("Failed to start (%v)", err)
+        c.status = fmt.aprintf("Failed to start (%s)", error_text)
         append(&c.lines, CompilationLine{
-            text = fmt.aprintf("Compilation failed to execute: %v", err),
+            text = fmt.aprintf("Compilation failed to execute: %s", error_text),
             is_error = true,
         })
         return
     }
 
-    c.exit_code = state.exit_code
+    c.exit_code = exit_code
     c.finished = true
 
-    // Process output lines
-    combined: strings.Builder
-    strings.builder_init(&combined, context.allocator)
-    defer strings.builder_destroy(&combined)
-
-    if len(stdout) > 0 {
-        strings.write_bytes(&combined, stdout)
-    }
-    if len(stderr) > 0 {
-        if len(stdout) > 0 && stdout[len(stdout)-1] != '\n' {
-            strings.write_string(&combined, "\n")
-        }
-        strings.write_bytes(&combined, stderr)
-    }
-
-    out_str := strings.to_string(combined)
-    lines := strings.split(out_str, "\n", context.allocator)
+    lines := strings.split(output, "\n", context.allocator)
     defer delete(lines)
 
     error_count := 0
     warn_count := 0
-
     first_error_idx := -1
 
     for line in lines {
@@ -232,6 +269,83 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string) {
     }
     c.scroll = max(0, c.cursor - 5)
     c.last_action = time.now()
+}
+
+compilation_poll :: proc(c: ^Compilation) {
+    job := c.job
+    if job == nil do return
+
+    done := false
+    output: string
+    exit_code := 0
+    failed := false
+    error_text := ""
+
+    sync.mutex_lock(&job.mutex)
+    done = job.done
+    if done {
+        output = job.output
+        job.output = ""
+        exit_code = job.exit_code
+        failed = job.failed
+        error_text = job.error_text
+        job.error_text = ""
+    }
+    sync.mutex_unlock(&job.mutex)
+
+    if !done do return
+
+    thread.join(job.thread)
+    thread.destroy(job.thread)
+    c.job = nil
+    compilation_finish(c, output, exit_code, failed, error_text)
+    if job.command != "" do delete(job.command)
+    free(job)
+}
+
+// Blocking wait used by tests and any caller that needs the final state.
+compilation_wait :: proc(c: ^Compilation) {
+    for c.job != nil {
+        compilation_poll(c)
+        if c.job != nil do time.sleep(1 * time.Millisecond)
+    }
+}
+
+compilation_run_command :: proc(c: ^Compilation, cmd_str: string) {
+    compilation_poll(c)
+    if c.job != nil {
+        if c.status != "" do delete(c.status)
+        c.status = strings.clone("Compilation already running")
+        return
+    }
+
+    if c.command != "" do delete(c.command)
+    c.command = strings.clone(cmd_str)
+
+    // Clear previous output
+    for l in c.lines {
+        delete(l.text)
+        if l.file_path != "" do delete(l.file_path)
+    }
+    clear(&c.lines)
+
+    cwd, _ := os.get_working_directory(context.temp_allocator)
+    append(&c.lines, CompilationLine{
+        text = fmt.aprintf("-*- mode: compilation; default-directory: \"%s\" -*-", cwd),
+    })
+    append(&c.lines, CompilationLine{
+        text = fmt.aprintf("Compilation started: %s", cmd_str),
+    })
+    append(&c.lines, CompilationLine{text = strings.clone("")})
+
+    c.finished = false
+    if c.status != "" do delete(c.status)
+    c.status = strings.clone("Running...")
+
+    job := new(Compilation_Job)
+    job.command = strings.clone(cmd_str)
+    job.thread = thread.create_and_start_with_data(rawptr(job), compilation_worker)
+    c.job = job
 }
 
 paths_match :: proc(p1, p2: string) -> bool {

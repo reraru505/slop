@@ -2,6 +2,7 @@ package main
 
 import "core:testing"
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:path/filepath"
 import "core:encoding/json"
@@ -506,4 +507,47 @@ test_lsp_uri_roundtrip :: proc(t: ^testing.T) {
 
     testing.expect_value(t, back_path, orig_path)
     fmt.println("  ✓ [LSP Unit] file:// URI encoding/decoding roundtrip verified")
+}
+
+@(test)
+test_lsp_did_change_queue_coalescing :: proc(t: ^testing.T) {
+    client: LspClient
+    client.running = true
+    client.initialized = true
+    client.writer_queue = make([dynamic]Lsp_Out_Message, 0, 4)
+    defer {
+        for &m in client.writer_queue do lsp_destroy_out_message(&m)
+        delete(client.writer_queue)
+        delete(client.file_versions)
+    }
+
+    // A pipe stands in for the server's stdin; nothing reads it because the
+    // writer thread is not started in this unit test.
+    r, w, pipe_err := os.pipe()
+    testing.expect_value(t, pipe_err, nil)
+    client.stdin_file = w
+    defer os.close(r)
+    defer os.close(w)
+
+    lsp_did_change(&client, "/tmp/coalesce.odin", "one")
+    testing.expect_value(t, len(client.writer_queue), 1)
+
+    // A newer snapshot for the same file replaces the unsent one.
+    lsp_did_change(&client, "/tmp/coalesce.odin", "two")
+    testing.expect_value(t, len(client.writer_queue), 1)
+    msg := client.writer_queue[0]
+    testing.expect_value(t, msg.kind, Lsp_Out_Kind.Did_Change)
+    testing.expect_value(t, msg.text, "two")
+    testing.expect_value(t, msg.version, 3)
+    testing.expect_value(t, msg.uri, "file:///tmp/coalesce.odin")
+
+    // A different file gets its own entry.
+    lsp_did_change(&client, "/tmp/other.odin", "other")
+    testing.expect_value(t, len(client.writer_queue), 2)
+
+    // Raw messages stay separate and ordered after pending changes.
+    lsp_send_raw(&client, `{"jsonrpc":"2.0","method":"initialized","params":{}}`)
+    testing.expect_value(t, len(client.writer_queue), 3)
+    testing.expect_value(t, client.writer_queue[2].kind, Lsp_Out_Kind.Raw)
+    fmt.println("  ✓ [LSP Unit] unsent didChange snapshots coalesce per file")
 }
