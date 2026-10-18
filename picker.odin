@@ -7,6 +7,7 @@ import "core:path/filepath"
 import "core:slice"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 import sdl "vendor:sdl3"
 
@@ -31,6 +32,7 @@ FilePicker :: struct {
 // Self-contained walk state. The worker never touches FilePicker; a canceled
 // job can be abandoned and freed once its thread has finished.
 File_Picker_Scan_Job :: struct {
+    thread     : ^thread.Thread,
     mutex      : sync.Mutex,
     cancel     : bool,
     done       : bool,
@@ -211,6 +213,11 @@ file_picker_scan_worker :: proc(data: rawptr) {
 
 file_picker_free_job :: proc(job: ^File_Picker_Scan_Job) {
     if job == nil do return
+    if job.thread != nil {
+        thread.join(job.thread)
+        thread.destroy(job.thread)
+        job.thread = nil
+    }
     for it in job.items {
         delete(it.rel_path, runtime.default_allocator())
         delete(it.full_path, runtime.default_allocator())
@@ -340,7 +347,7 @@ file_picker_open :: proc(fp: ^FilePicker, root: string, window: ^sdl.Window = ni
     job.cancel = false
     job.done = false
     fp.scan_job = job
-    background_thread_detached(rawptr(job), file_picker_scan_worker)
+    job.thread = background_thread(rawptr(job), file_picker_scan_worker)
 
     if window != nil {
         _ = sdl.StartTextInput(window)

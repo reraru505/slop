@@ -93,7 +93,7 @@ COMPILATION BUFFER
   {compile_next_error} / {compile_prev_error} ................ next / previous error
   Enter or {compile_jump} ........... jump to the error location
   {compile_recompile} or {compile_recompile_alt} ............... recompile
-  {compile_yank} .................... copy the current line
+  {compile_yank} or Ctrl+C ............. copy the current line
   {compile_yank_all} .................... copy the whole buffer
   {compile_quit} .................... close the pane
 

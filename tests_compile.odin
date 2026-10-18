@@ -196,6 +196,12 @@ test_compilation_dispatch_uses_config_keys :: proc(t: ^testing.T) {
     ev.key.key = KEY_COMPILE_UP
     testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
     testing.expect_value(t, c.cursor, 0)
+
+    // Ctrl+C follows the conventional terminal copy binding.
+    ev.key.key = sdl.K_C
+    ev.key.mod = sdl.KMOD_CTRL
+    testing.expect_value(t, compilation_handle_event(&c, &ev, &app, pane), true)
+    ev.key.mod = {}
     fmt.println("  ✓ [Compilation] dispatch follows configured key constants")
 }
 
@@ -349,4 +355,83 @@ test_compilation_destroy_cancels_without_blocking :: proc(t: ^testing.T) {
     testing.expect(t, elapsed < 500 * time.Millisecond, "destroy blocked on a running build")
     compilation_poll_orphans()
     fmt.println("  ✓ [Compilation] destroying a pane cancels its build without blocking")
+}
+
+@(test)
+test_compilation_focuses_output_pane :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    app_run_compile(&app, "printf 'one\\ntwo\\n'")
+    comp: ^Pane
+    for p in app.panes {
+        if p.kind == .Compilation {
+            comp = p
+            break
+        }
+    }
+    testing.expect(t, comp != nil)
+    if comp == nil do return
+    testing.expect_value(t, app.active_pane, comp)
+
+    compilation_wait(&comp.compilation)
+    c := &comp.compilation
+    testing.expect(t, len(c.lines) >= 3)
+    if len(c.lines) >= 3 {
+        c.cursor = 0
+        ev: sdl.Event
+        ev.type = .KEY_DOWN
+        ev.key.key = KEY_COMPILE_DOWN
+        ev.key.mod = {}
+        compilation_handle_event(c, &ev, &app, comp)
+        testing.expect_value(t, c.cursor, 1)
+    }
+    fmt.println("  ✓ [Compilation] starting a build focuses its output buffer")
+}
+
+RUN_SDL_CLIPBOARD_TESTS :: #config(ODIN_TEST_SDL_CLIPBOARD, false)
+
+when RUN_SDL_CLIPBOARD_TESTS {
+@(test)
+test_compilation_copy_sets_clipboard :: proc(t: ^testing.T) {
+    if !sdl.Init({.VIDEO}) do return
+    defer sdl.Quit()
+
+    window: ^sdl.Window
+    renderer: ^sdl.Renderer
+    if !sdl.CreateWindowAndRenderer("clipboard-test", 320, 240, {.HIDDEN}, &window, &renderer) {
+        fmt.println("SDL video unavailable, skipping clipboard test")
+        return
+    }
+    defer {
+        sdl.DestroyRenderer(renderer)
+        sdl.DestroyWindow(window)
+    }
+
+    c: Compilation
+    compilation_init(&c)
+    defer compilation_destroy(&c)
+    append(&c.lines, CompilationLine{text = strings.clone("first line")})
+    append(&c.lines, CompilationLine{text = strings.clone("second line")})
+    c.cursor = 1
+
+    app: App
+    app.window = window
+    compilation_copy(&c, &app, false)
+    raw := sdl.GetClipboardText()
+    testing.expect(t, raw != nil)
+    if raw != nil {
+        defer sdl.free(rawptr(raw))
+        testing.expect_value(t, string(cstring(raw)), "second line")
+    }
+
+    compilation_copy(&c, &app, true)
+    raw_all := sdl.GetClipboardText()
+    testing.expect(t, raw_all != nil)
+    if raw_all != nil {
+        defer sdl.free(rawptr(raw_all))
+        testing.expect_value(t, string(cstring(raw_all)), "first line\nsecond line")
+    }
+    fmt.println("  ✓ [Compilation] y/Y copy current line and whole buffer to the clipboard")
+}
 }

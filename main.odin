@@ -556,6 +556,9 @@ app_run_compile :: proc(app: ^App, cmd_str: string) {
     }
 
     compilation_run_command(&comp_pane.compilation, owned_cmd, workdir)
+    // Focus the output buffer so j/k, y/Y, and error navigation work
+    // immediately, including when a previous compilation pane already exists.
+    app.active_pane = comp_pane
     app_set_message(app, fmt.tprintf("Compilation: %s", comp_pane.compilation.status))
 }
 

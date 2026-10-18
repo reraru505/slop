@@ -317,6 +317,10 @@ dired_poll_orphans :: proc() {
         job := dired_orphan_jobs[i]
         if sync.atomic_load(&job.done) {
             ordered_remove(&dired_orphan_jobs, i)
+            if job.thread != nil {
+                thread.join(job.thread)
+                thread.destroy(job.thread)
+            }
             if job.ok {
                 for e in job.entries do delete(e.name, runtime.default_allocator())
                 delete(job.entries)
@@ -348,7 +352,7 @@ dired_request_load :: proc(d: ^Dired, dir_path: string, sort_by: DiredSortBy, or
     d.job = job
     d.loading = true
     d.load_failed = false
-    background_thread_detached(rawptr(job), dired_job_worker)
+    job.thread = background_thread(rawptr(job), dired_job_worker)
 }
 
 // Blocking wait used by tests and one-shot callers that need the listing.
@@ -366,6 +370,11 @@ dired_poll :: proc(d: ^Dired) {
 
     if !sync.atomic_load(&job.done) do return
 
+    if job.thread != nil {
+        thread.join(job.thread)
+        thread.destroy(job.thread)
+        job.thread = nil
+    }
     entries: [dynamic]DiredEntry
     ok := false
     generation: u64 = 0

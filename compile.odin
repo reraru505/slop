@@ -92,6 +92,11 @@ compilation_job_done :: proc(job: ^Compilation_Job) -> bool {
 
 compilation_free_job :: proc(job: ^Compilation_Job) {
     if job == nil do return
+    if job.thread != nil {
+        thread.join(job.thread)
+        thread.destroy(job.thread)
+        job.thread = nil
+    }
     if job.output != "" do delete(job.output, runtime.default_allocator())
     if job.error_text != "" do delete(job.error_text, runtime.default_allocator())
     if job.command != "" do delete(job.command, runtime.default_allocator())
@@ -546,7 +551,7 @@ compilation_run_command :: proc(c: ^Compilation, cmd_str: string, working_dir :=
     job := new(Compilation_Job, runtime.default_allocator())
     job.command = strings.clone(new_command, runtime.default_allocator())
     if working_dir != "" do job.working_dir = strings.clone(working_dir, runtime.default_allocator())
-    background_thread_detached(rawptr(job), compilation_worker)
+    job.thread = background_thread(rawptr(job), compilation_worker)
     c.job = job
 }
 
@@ -701,9 +706,16 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
         key := event.key.key
         mod := event.key.mod
         is_shift := (mod & sdl.KMOD_SHIFT) != {}
+        is_ctrl := (mod & sdl.KMOD_CTRL) != {}
 
         if key == KEY_CMD_PROMPT || (key == KEY_CMD_PROMPT_ALT && is_shift) {
             app_open_command_prompt(app)
+            return true
+        }
+
+        // Ctrl+C is the conventional terminal-style copy; y is the modal one.
+        if is_ctrl && key == sdl.K_C {
+            compilation_copy(c, app, false)
             return true
         }
 
@@ -863,13 +875,14 @@ compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font
 
     focus_badge := "[ACTIVE] " if is_focused else ""
     status_info := fmt.tprintf(
-        "%s-- COMPILATION --  [%s]   <Enter> jump, <%s/%s> next/prev, <%s> recompile, <%s> copy",
+        "%s-- COMPILATION --  [%s]   <Enter> jump, <%s/%s> next/prev, <%s> recompile, <%s> or Ctrl+C copy line, <%s> all",
         focus_badge,
         c.status,
         key_label(KEY_COMPILE_NEXT_ERROR, {}, .Plain),
         key_label(KEY_COMPILE_PREV_ERROR, {}, .Plain),
         key_label(KEY_COMPILE_RECOMPILE, {}, .Plain),
         key_label(KEY_COMPILE_YANK, {}, .Plain),
+        key_label(KEY_COMPILE_YANK_ALL, sdl.KMOD_SHIFT, .Shift_Letter),
     )
     status_color := sdl.FColor{0.45, 0.85, 0.55, 1.0} if (c.finished && c.exit_code == 0) else sdl.FColor{0.95, 0.5, 0.45, 1.0}
     push_line(font, status_info, Vec2{rect.x + 10.0, rect.y + rect.h - status_bar_h + 4.0}, status_color, .HALF)

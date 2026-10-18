@@ -20,12 +20,3 @@ background_thread :: proc(data: rawptr, fn: proc(data: rawptr)) -> ^thread.Threa
     context = saved
     return t
 }
-
-// Fire-and-forget workers own no joinable OS handle. They must publish their
-// result (and set done) as their final action; the owner then frees the job.
-background_thread_detached :: proc(data: rawptr, fn: proc(data: rawptr)) {
-    saved := context
-    context.allocator = runtime.default_allocator()
-    _ = thread.create_and_start_with_data(data, fn, nil, .Normal, true)
-    context = saved
-}
