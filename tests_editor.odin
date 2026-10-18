@@ -409,6 +409,16 @@ send_key_event :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod = {}) {
 }
 
 @(test)
+test_editor_line_number_format :: proc(t: ^testing.T) {
+    testing.expect_value(t, format_line_number(1, 1), "1 ")
+    testing.expect_value(t, format_line_number(1, 3), "  1 ")
+    testing.expect_value(t, format_line_number(9, 3), "  9 ")
+    testing.expect_value(t, format_line_number(10, 3), " 10 ")
+    testing.expect_value(t, format_line_number(100, 3), "100 ")
+    fmt.println("  ✓ [Editor] gutter line numbers are space-padded, not zero-padded")
+}
+
+@(test)
 test_editor_line_brace_delta :: proc(t: ^testing.T) {
     cases := []struct {
         line: string,

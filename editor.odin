@@ -46,6 +46,13 @@ Editor :: struct {
     needs_lsp_sync     : bool,
     last_edit_time     : time.Time,
     completion         : CompletionState,
+    read_only          : bool,
+}
+
+// Odin's fmt zero-pads width-formatted numbers by default; the gutter needs
+// space padding so line numbers stay right-aligned without becoming "0001".
+format_line_number :: proc(line_number, digits: int) -> string {
+    return fmt.tprintf("% *d ", digits, line_number)
 }
 
 editor_set_status_message :: proc(e: ^Editor, msg: string) {
@@ -56,11 +63,7 @@ editor_set_status_message :: proc(e: ^Editor, msg: string) {
 
 editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := "") {
     pt_init(&e.table, initial_text)
-    if font != nil {
-        e.char_advance = find_biggest_advance(font)
-    } else {
-        e.char_advance = 10.0
-    }
+    e.char_advance = font_cell_width(font)
     e.font_scale = .HALF
     e.mode = .Normal
     e.cursor = Cursor{
@@ -81,6 +84,7 @@ editor_init :: proc(e: ^Editor, font: ^Font, initial_text := "", file_path := ""
     editor_set_status_message(e, "")
     e.needs_lsp_sync = false
     e.last_edit_time = time.now()
+    e.read_only = false
     e.completion.active = false
     e.completion.items = make([dynamic]LspCompletionItem, 0, 32)
     e.completion.all_items = make([dynamic]LspCompletionItem, 0, 64)
@@ -855,6 +859,7 @@ editor_open_completion_doc :: proc(e: ^Editor, app: ^App) {
         doc_pane.kind = .Editor
         editor_destroy(&doc_pane.editor)
         editor_init(&doc_pane.editor, &app.font, doc_text, doc_title)
+        doc_pane.editor.read_only = true
         doc_pane.editor.dirty = false
     }
 
@@ -1543,6 +1548,10 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
 editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, app: ^App) -> bool {
     #partial switch event.type {
     case .TEXT_INPUT:
+        if e.read_only {
+            editor_set_status_message(e, "Buffer is read-only")
+            return true
+        }
         if e.mode == .Insert {
             text_str := string(event.text.text)
             if len(text_str) == 1 {
@@ -1701,6 +1710,29 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
         mod := event.key.mod
         is_ctrl := (mod & sdl.KMOD_CTRL) != {}
         is_alt  := (mod & sdl.KMOD_ALT) != {}
+
+        // Read-only buffers still support navigation, command mode and the
+        // mouse wheel, but reject any key that could modify the buffer.
+        if e.read_only {
+            if key == sdl.K_ESCAPE {
+                editor_set_mode(e, .Normal, window)
+                return true
+            }
+            allowed := false
+            switch key {
+            case sdl.K_LEFT, sdl.K_RIGHT, sdl.K_UP, sdl.K_DOWN,
+                 sdl.K_H, sdl.K_J, sdl.K_K, sdl.K_L,
+                 sdl.K_0, sdl.K_4, sdl.K_G,
+                 sdl.K_COLON, sdl.K_SEMICOLON:
+                allowed = true
+            case:
+            }
+            if !allowed {
+                e.pending_cmd = 0
+                editor_set_status_message(e, "Buffer is read-only")
+                return true
+            }
+        }
 
         // A-j: Move line or selection down
         if is_alt && key == sdl.K_J {
@@ -1936,7 +1968,7 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
         y_pos := rect.y + f32(i) * line_h
 
         // Line number in gutter
-        line_num_str := fmt.tprintf("%*d ", digits, line_idx + 1)
+        line_num_str := format_line_number(line_idx + 1, digits)
         ln_color := normal_line_num_color
         if is_focused && line_idx == e.cursor.row {
             ln_color = active_line_num_color

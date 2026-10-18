@@ -1,0 +1,96 @@
+Odin Text Editor - Help
+========================
+
+MODES
+  Normal / Insert / Visual / Command
+  Esc .......... Insert -> Normal, Visual -> Normal, Normal -> Insert
+  i, I ......... insert before cursor / at start of line
+  a, A ......... insert after cursor / at end of line
+  o, O ......... open a new line below / above
+  Ctrl+X ....... toggle Visual mode
+  X ............ select the current line (press again to extend)
+
+MOVEMENT
+  h j k l ...... left / down / up / right (arrow keys work too)
+  H, L ......... left / right one character
+  Shift+H ...... start of line
+  Shift+L ...... end of line
+  0, $ ......... start / end of line
+  gg, G ........ top / bottom of file
+  Ctrl+L ....... next word
+  Ctrl+H ....... previous word
+  Ctrl+J ....... next scope / paragraph
+  Ctrl+K ....... previous scope / paragraph
+  Mouse wheel .. scroll the active pane
+
+EDITING
+  d ............ delete character; at end of line, join the next line
+  X then D ..... delete selected line(s)
+  Ctrl+Y ....... paste the clipboard
+  Visual D ..... delete selection
+  Visual C ..... change selection (delete, then Insert mode)
+  Visual Y ..... yank selection to the clipboard (also Alt+W)
+  u, Ctrl+Z .... undo
+  Ctrl+R ....... redo
+  Alt+J, Alt+K . move line or selection down / up
+  Tab .......... insert four spaces (Insert mode)
+  Enter ........ keep indentation; inside () [] {} it expands the pair
+  ( [ { ' " .... auto-pair; typing the closing character steps over it
+  Backspace .... removes an empty pair; at column 0 it joins with above
+
+LSP (when a language server is available)
+  Ctrl+Space ... trigger completion
+  Tab/Shift+Tab  cycle completion items
+  Enter ........ accept completion
+  Shift+Enter .. open documentation in a split
+  Esc .......... dismiss completion
+  gd ........... go to definition
+  K ............ hover documentation
+  == ........... format the current line
+  Visual = ..... format the selected lines
+  Diagnostics are underlined; the message appears in the status bar
+
+COMMANDS  (type ':' in Normal mode)
+  :w  :q  :wq  :x       write / quit / write and quit
+  :qa  :q!              quit all / force quit
+  :e <path>             edit a file or directory
+  :sp [file]            horizontal split (also Ctrl+W s)
+  :vs [file]            vertical split (also Ctrl+W v)
+  :dired                open the directory browser
+  :files                open the file picker (also Space f)
+  :compile [command]    run a build command
+  :recompile            repeat the last build
+  :cnext  :cprev        next / previous compiler error
+  :cfirst               jump to the first compiler error
+  :theme [name]         cycle themes or set one by name
+  :sort [name|size|time|rev]  sort the current dired listing
+  :cd <dir>  :pwd       change / show the working directory
+  :zoom <0.5-2.5>       UI scale (Ctrl+= / Ctrl+- / Ctrl+0)
+  :linespace <1.0-2.0>  line-height multiplier (default 1.0 = font metrics)
+  :help                 this screen
+  Tab / Shift+Tab ..... complete command names and arguments
+
+PANES
+  Ctrl+W h j k l ....... focus the pane left / down / up / right
+  Ctrl+W s / v ......... split horizontally / vertically
+  Ctrl+W w ............. cycle panes
+  Ctrl+W q / c ......... close the focused pane
+
+DIRED  (directory browser)
+  j k, Ctrl+J/K ........ move by one / five entries
+  Enter or L ........... open a file or enter a directory
+  h or - ............... go to the parent directory
+  i or Esc ............. edit the listing (wdired)
+                         :w applies changes, :q cancels
+  s / S ................ cycle sort order / reverse it
+  q .................... return to the previous buffer or close the pane
+
+COMPILATION BUFFER
+  j k .................. move through output
+  n / p ................ next / previous error
+  Enter or L ........... jump to the error location
+  r or g ............... recompile
+  q .................... close the pane
+
+Help buffers and LSP documentation splits are read-only; navigation and
+command mode still work. Close this buffer with :q

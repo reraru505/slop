@@ -54,6 +54,7 @@ App :: struct {
     current_theme_id : ThemeId,
     theme            : Theme,
     running          : bool,
+    font_density     : f32,
     lsp_manager      : LspManager,
 }
 
@@ -154,7 +155,7 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
                 "cnext", "cn", "cprev", "cp", "cfirst", "crewind",
                 "bnext", "bn",
                 "theme", "colorscheme",
-                "sort", "cd",
+                "sort", "cd", "pwd", "files", "zoom", "linespace", "lineheight", "help",
             }
             for cmd in ALL_COMMANDS {
                 if strings.has_prefix(cmd, curr_str) {
@@ -231,6 +232,44 @@ app_open_file :: proc(app: ^App, file_path: string) {
 
 app_open_dired :: proc(app: ^App, dir_path: string) {
     app_pane_open_dired(app, app.active_pane, dir_path)
+}
+
+// Re-bake the font atlas at the current UI scale. Glyphs are rasterized at
+// native pixel size, so this keeps text sharp when zooming.
+app_reload_font :: proc(app: ^App) {
+    if app == nil || app.renderer == nil do return
+    font_reload(&app.font, app.renderer, app.window)
+    for p in app.panes {
+        p.editor.char_advance = font_cell_width(&app.font)
+    }
+}
+
+app_open_help :: proc(app: ^App) {
+    if app == nil || app.active_pane == nil do return
+
+    // Focus an existing help buffer instead of opening another split.
+    for p in app.panes {
+        if p.kind == .Editor && p.editor.file_path == HELP_FILE_PATH {
+            app.active_pane = p
+            return
+        }
+    }
+
+    // app_split_pane copies according to the target's kind. Temporarily present
+    // it as an editor so :help from a compilation/dired pane has no side effects.
+    target := app.active_pane
+    original_kind := target.kind
+    target.kind = .Editor
+    app_split_pane(app, target, .Horizontal)
+    target.kind = original_kind
+
+    help_pane := app.active_pane
+    if help_pane == nil do return
+    help_pane.kind = .Editor
+    editor_destroy(&help_pane.editor)
+    editor_init(&help_pane.editor, &app.font, HELP_TEXT, HELP_FILE_PATH)
+    help_pane.editor.read_only = true
+    help_pane.editor.dirty = false
 }
 
 app_run_compile :: proc(app: ^App, cmd_str: string) {
@@ -447,6 +486,8 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         }
     } else if cmd == "pwd" {
         app_set_message(app, fmt.tprintf("Working dir: %s", app.working_dir))
+    } else if cmd == "help" || cmd == "h" || cmd == "?" {
+        app_open_help(app)
     } else if cmd == "files" || cmd == "find" || cmd == "picker" {
         file_picker_open(&app.file_picker, app.working_dir, app.window)
     } else if strings.has_prefix(cmd, "zoom ") || strings.has_prefix(cmd, "scale ") {
@@ -454,10 +495,22 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         scale_val, ok := strconv.parse_f32(val_str)
         if ok && scale_val >= 0.25 && scale_val <= 3.0 {
             global_ui_scale = scale_val
+            app_reload_font(app)
             app_set_message(app, fmt.tprintf("UI Scale: %.2f", global_ui_scale))
         } else {
             app_set_message(app, "Usage: :zoom <0.5 .. 2.5>")
         }
+    } else if strings.has_prefix(cmd, "linespace ") || strings.has_prefix(cmd, "lineheight ") {
+        val_str := strings.trim_space(cmd[10:] if strings.has_prefix(cmd, "linespace ") else cmd[11:])
+        spacing_val, ok := strconv.parse_f32(val_str)
+        if ok && spacing_val >= 1.0 && spacing_val <= 2.0 {
+            line_spacing = spacing_val
+            app_set_message(app, fmt.tprintf("Line spacing: %.2f", line_spacing))
+        } else {
+            app_set_message(app, "Usage: :linespace <1.0 .. 2.0>")
+        }
+    } else if cmd == "linespace" || cmd == "lineheight" {
+        app_set_message(app, fmt.tprintf("Line spacing: %.2f (usage: :linespace <1.0 .. 2.0>)", line_spacing))
     } else {
         app_set_message(app, fmt.tprintf("Unknown command: :%s", cmd))
     }
@@ -466,13 +519,23 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
 load :: proc(app: ^App) {
     sdl.SetHint(sdl.HINT_VIDEO_DRIVER, "wayland")
 
-    if !sdl.CreateWindowAndRenderer("Odin Text Editor", 1024, 768, sdl.WINDOW_RESIZABLE, &app.window, &app.renderer) {
+    // HIGH_PIXEL_DENSITY makes the backbuffer match the display scale; without
+    // it SDL renders at 1x and the compositor upscales, blurring all text.
+    flags := sdl.WINDOW_RESIZABLE | sdl.WINDOW_HIGH_PIXEL_DENSITY
+    if !sdl.CreateWindowAndRenderer("Odin Text Editor", 1024, 768, flags, &app.window, &app.renderer) {
         panic("Failed to create SDL window and renderer")
     }
 
+    // Keep drawing in logical (window) coordinates while SDL renders at the
+    // display's native pixel density.
+    win_w, win_h: i32
+    sdl.GetWindowSize(app.window, &win_w, &win_h)
+    _ = sdl.SetRenderLogicalPresentation(app.renderer, win_w, win_h, .LETTERBOX)
+
     app.current_theme_id = DEFAULT_THEME
     app.theme = theme_get(app.current_theme_id)
-    app.font = load_font(app.renderer)
+    app.font_density = sdl.GetWindowPixelDensity(app.window)
+    app.font = load_font(app.renderer, app.window)
     app.panes = make([dynamic]^Pane, context.allocator)
     app.cmd_prompt.buffer = make([dynamic]u8, context.allocator)
     app.cmd_prompt.matches = make([dynamic]string, context.allocator)
@@ -528,6 +591,14 @@ load :: proc(app: ^App) {
 }
 
 update :: proc(app: ^App) {
+    // Moving between displays with different scale factors changes the pixel
+    // density; re-bake so glyphs stay native-resolution.
+    density := sdl.GetWindowPixelDensity(app.window)
+    if density > 0 && abs(density - app.font_density) > 0.01 {
+        app.font_density = density
+        app_reload_font(app)
+    }
+
     event: sdl.Event
     for sdl.PollEvent(&event) {
         if event.type == .QUIT {
@@ -611,16 +682,19 @@ update :: proc(app: ^App) {
             // Zoom controls
             if is_ctrl && (key == sdl.K_EQUALS || key == sdl.K_KP_PLUS) {
                 global_ui_scale = min(2.5, global_ui_scale + 0.1)
+                app_reload_font(app)
                 app_set_message(app, fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0))
                 continue
             }
             if is_ctrl && (key == sdl.K_MINUS || key == sdl.K_KP_MINUS) {
                 global_ui_scale = max(0.5, global_ui_scale - 0.1)
+                app_reload_font(app)
                 app_set_message(app, fmt.tprintf("Zoom: %.0f%%", global_ui_scale * 100.0))
                 continue
             }
             if is_ctrl && (key == sdl.K_0 || key == sdl.K_KP_0) {
                 global_ui_scale = 1.0
+                app_reload_font(app)
                 app_set_message(app, "Zoom reset (100%)")
                 continue
             }
@@ -789,6 +863,7 @@ update :: proc(app: ^App) {
 draw :: proc(app: ^App) {
     w, h: i32
     sdl.GetWindowSize(app.window, &w, &h)
+    _ = sdl.SetRenderLogicalPresentation(app.renderer, w, h, .LETTERBOX)
 
     cmd_bar_h := get_line_height(.HALF) + 6.0
     main_area_h := f32(h) - cmd_bar_h

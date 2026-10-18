@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import sdl "vendor:sdl3"
 
 set_command_buffer :: proc(app: ^App, command: string) {
     clear(&app.cmd_prompt.buffer)
@@ -100,6 +101,31 @@ test_app_theme_commands :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_app_linespace_command :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    old_spacing := line_spacing
+    defer line_spacing = old_spacing
+
+    app_execute_command(&app, "linespace 1.25")
+    testing.expect_value(t, line_spacing, 1.25)
+    testing.expect_value(t, app.cmd_prompt.message, "Line spacing: 1.25")
+
+    // Out-of-range values are rejected and leave the setting unchanged
+    app_execute_command(&app, "lineheight 0.5")
+    testing.expect_value(t, line_spacing, 1.25)
+    testing.expect_value(t, app.cmd_prompt.message, "Usage: :linespace <1.0 .. 2.0>")
+
+    // Querying without an argument reports the current value
+    app_execute_command(&app, "lineheight")
+    testing.expect(t, strings.has_prefix(app.cmd_prompt.message, "Line spacing: 1.25"))
+
+    line_spacing = 1.0
+    fmt.println("  ✓ [App] :linespace adjusts and validates line-height multiplier")
+}
+
+@(test)
 test_app_misc_commands :: proc(t: ^testing.T) {
     app := make_test_app()
     defer destroy_test_app(&app)
@@ -171,6 +197,65 @@ test_app_open_file_and_dired :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_app_help_command :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    app_execute_command(&app, "help")
+    testing.expect_value(t, len(app.panes), 2)
+    help_pane := app.active_pane
+    testing.expect(t, help_pane != app.panes[0])
+    testing.expect_value(t, help_pane.kind, PaneKind.Editor)
+    testing.expect_value(t, help_pane.editor.file_path, HELP_FILE_PATH)
+    testing.expect_value(t, help_pane.editor.read_only, true)
+    testing.expect_value(t, help_pane.editor.dirty, false)
+
+    help_text := pt_full_text(&help_pane.editor.table)
+    defer delete(help_text)
+    testing.expect_value(t, help_text, HELP_TEXT)
+    testing.expect(t, strings.contains(help_text, "Odin Text Editor - Help"))
+    testing.expect(t, strings.contains(help_text, "Ctrl+Space"))
+    testing.expect(t, strings.contains(help_text, "wdired"))
+
+    // Repeating :help (or an alias) focuses the existing buffer
+    app_execute_command(&app, "help")
+    testing.expect_value(t, len(app.panes), 2)
+    testing.expect_value(t, app.active_pane, help_pane)
+    app_execute_command(&app, "h")
+    testing.expect_value(t, len(app.panes), 2)
+    app_execute_command(&app, "?")
+    testing.expect_value(t, len(app.panes), 2)
+
+    // Typing is ignored even if Insert mode is forced on the buffer
+    editor_set_mode(&help_pane.editor, .Insert, nil)
+    simulate_typing(&help_pane.editor, "x")
+    testing.expect_value(t, pt_get_length(&help_pane.editor.table), len(HELP_TEXT))
+    testing.expect_value(t, help_pane.editor.status_message, "Buffer is read-only")
+    editor_set_mode(&help_pane.editor, .Normal, nil)
+
+    // Navigation remains available
+    help_pane.editor.cursor.row = 0
+    send_key_event(&help_pane.editor, sdl.K_J)
+    testing.expect_value(t, help_pane.editor.cursor.row, 1)
+
+    // Destructive normal-mode keys are rejected
+    send_key_event(&help_pane.editor, sdl.K_D)
+    testing.expect_value(t, pt_get_length(&help_pane.editor.table), len(HELP_TEXT))
+    testing.expect_value(t, help_pane.editor.status_message, "Buffer is read-only")
+
+    // Closing the help pane restores the original pane
+    app_execute_command(&app, "q")
+    testing.expect_value(t, len(app.panes), 1)
+
+    // "help" participates in command completion
+    set_command_buffer(&app, "hel")
+    app_command_prompt_tab(&app, false)
+    testing.expect_value(t, string(app.cmd_prompt.buffer[:]), "help")
+    app_reset_command_completion(&app.cmd_prompt)
+    fmt.println("  ✓ [App] :help opens a read-only cheat sheet in a split")
+}
+
+@(test)
 test_app_open_completion_doc_split :: proc(t: ^testing.T) {
     app := make_test_app()
     defer destroy_test_app(&app)
@@ -191,6 +276,7 @@ test_app_open_completion_doc_split :: proc(t: ^testing.T) {
     testing.expect(t, doc_pane != orig)
     testing.expect_value(t, doc_pane.kind, PaneKind.Editor)
     testing.expect_value(t, doc_pane.editor.file_path, "*doc: foo*")
+    testing.expect_value(t, doc_pane.editor.read_only, true)
 
     doc_text := pt_full_text(&doc_pane.editor.table)
     defer delete(doc_text)
