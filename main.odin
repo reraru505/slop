@@ -1300,10 +1300,8 @@ update :: proc(app: ^App) {
                 show_hover = paths_match(app.active_pane.editor.buffer.file_path, active_lsp.last_hover_file)
             }
             if show_hover {
-                clean_hover := strings.trim_space(active_lsp.last_hover)
-                first_nl := strings.index(clean_hover, "\n")
-                display_line := clean_hover
-                if first_nl >= 0 do display_line = clean_hover[:first_nl]
+                display_line := lsp_hover_one_line(active_lsp.last_hover)
+                if display_line == "" do display_line = strings.trim_space(active_lsp.last_hover)
                 app_set_message(app, fmt.tprintf("Hover: %s", display_line))
             }
             delete(active_lsp.last_hover)

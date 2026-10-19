@@ -152,6 +152,9 @@ PendingRequest :: struct {
     kind      : LspRequestKind,
     file_path : string,
     start_row : int,
+    // Byte column of a hover request; start_row/end_row double as the range
+    // for formatting requests.
+    col       : int,
     end_row   : int,
     sent_at   : time.Time,
 }
@@ -1352,7 +1355,14 @@ lsp_request_hover :: proc(client: ^LspClient, file_path: string, row, col: int) 
     id := client.next_id
     client.next_id += 1
 
-    append(&client.pending_requests, PendingRequest{id = id, kind = .Hover, file_path = strings.clone(file_path, context.allocator), sent_at = time.now()})
+    append(&client.pending_requests, PendingRequest{
+        id        = id,
+        kind      = .Hover,
+        file_path = strings.clone(file_path, context.allocator),
+        start_row = row,
+        col       = col,
+        sent_at   = time.now(),
+    })
 
     character := lsp_byte_col_to_character(client, file_path, row, col)
     msg := fmt.tprintf(
@@ -1593,6 +1603,138 @@ lsp_handle_notification :: proc(client: ^LspClient, method: string, obj: json.Ob
     }
 }
 
+lsp_diagnostic_severity_name :: proc(sev: LspSeverity) -> string {
+    name := "LSP"
+    #partial switch sev {
+    case .Error:
+        name = "Error"
+    case .Warning:
+        name = "Warning"
+    case .Information:
+        name = "Info"
+    case .Hint:
+        name = "Hint"
+    }
+    return name
+}
+
+lsp_diagnostic_severity_rank :: proc(sev: LspSeverity) -> int {
+    rank := 5
+    #partial switch sev {
+    case .Error:
+        rank = 1
+    case .Warning:
+        rank = 2
+    case .Information:
+        rank = 3
+    case .Hint:
+        rank = 4
+    }
+    return rank
+}
+
+lsp_diagnostic_covers :: proc(d: LspDiagnostic, row, byte_col: int) -> bool {
+    if row < d.start_row || row > d.end_row do return false
+    if row == d.start_row && byte_col < d.start_col do return false
+    if row == d.end_row && byte_col > d.end_col do return false
+    return true
+}
+
+lsp_diagnostics_for_path :: proc(client: ^LspClient, file_path: string) -> ([dynamic]LspDiagnostic, bool) {
+    if client == nil || file_path == "" do return nil, false
+    key, err := filepath.abs(file_path, context.temp_allocator)
+    if err != nil do key, _ = filepath.clean(file_path, context.temp_allocator)
+    if diags, has := client.diagnostics[key]; has do return diags, true
+    // URI normalization and lexical fallbacks can leave keys spelled slightly
+    // differently; compare them the same way diagnostics rendering does.
+    for existing, diags in client.diagnostics {
+        if paths_match(existing, key) do return diags, true
+    }
+    return nil, false
+}
+
+// Hover text for a position when the server has no documentation. Errors and
+// warnings are what the user needs there, and servers generally return an
+// empty hover result for a symbol that does not type-check.
+lsp_hover_diagnostic_text :: proc(
+    client: ^LspClient,
+    file_path: string,
+    row, byte_col: int,
+    allocator: runtime.Allocator = context.temp_allocator,
+) -> string {
+    diags, has := lsp_diagnostics_for_path(client, file_path)
+    if !has do return ""
+
+    best: ^LspDiagnostic
+    best_rank := 99
+    for &d in diags {
+        if !lsp_diagnostic_covers(d, row, byte_col) do continue
+        rank := lsp_diagnostic_severity_rank(d.severity)
+        if best == nil || rank < best_rank {
+            best = &d
+            best_rank = rank
+        }
+    }
+    if best == nil do return ""
+    return fmt.aprintf(
+        "%s: %s",
+        lsp_diagnostic_severity_name(best.severity),
+        best.message,
+        allocator = allocator,
+    )
+}
+
+// The command bar is one line tall and hover payloads are markdown, so the
+// useful part is usually the first line inside a code fence. Without this,
+// "```odin" was shown as the hover text.
+lsp_hover_one_line :: proc(text: string) -> string {
+    rest := text
+    for len(rest) > 0 {
+        nl := strings.index_byte(rest, '\n')
+        line := rest if nl < 0 else rest[:nl]
+        rest = "" if nl < 0 else rest[nl + 1:]
+        line = strings.trim_space(line)
+        if line == "" do continue
+        if strings.has_prefix(line, "```") || strings.has_prefix(line, "~~~") do continue
+        // Markdown horizontal rules separate sections and carry no content.
+        if len(line) >= 3 && (line[0] == '-' || line[0] == '=') {
+            rule := true
+            for i in 0 ..< len(line) {
+                c := line[i]
+                if c != line[0] && c != ' ' && c != '\t' {
+                    rule = false
+                    break
+                }
+            }
+            if rule do continue
+        }
+        return line
+    }
+    return ""
+}
+
+lsp_finish_hover :: proc(client: ^LspClient, req: PendingRequest, content: string) {
+    diag_text := lsp_hover_diagnostic_text(client, req.file_path, req.start_row, req.col)
+    if client.last_hover != "" do delete(client.last_hover)
+    if client.last_hover_file != "" do delete(client.last_hover_file)
+    client.last_hover_file = ""
+    if req.file_path != "" {
+        client.last_hover_file = strings.clone(req.file_path, context.allocator)
+    }
+
+    if content == "" {
+        if diag_text != "" {
+            client.last_hover = strings.clone(diag_text, context.allocator)
+        } else {
+            client.last_hover = strings.clone("(No hover documentation)", context.allocator)
+        }
+    } else if diag_text != "" {
+        client.last_hover = fmt.aprintf("%s\n%s", diag_text, content, allocator = context.allocator)
+    } else {
+        client.last_hover = strings.clone(content, context.allocator)
+    }
+}
+
 lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, app: ^App) {
     // Find matching pending request
     req_idx := -1
@@ -1627,8 +1769,7 @@ lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, a
     if !has_res || res_val == nil {
         switch req.kind {
         case .Hover:
-            if client.last_hover != "" do delete(client.last_hover)
-            client.last_hover = strings.clone("(No hover documentation)", context.allocator)
+            lsp_finish_hover(client, req, "")
         case .Definition:
             if app != nil do app_set_message(app, "LSP: No definition found")
         case .RangeFormatting:
@@ -1755,17 +1896,7 @@ lsp_handle_response :: proc(client: ^LspClient, req_id: int, obj: json.Object, a
             }
         }
 
-        if client.last_hover != "" do delete(client.last_hover)
-        if client.last_hover_file != "" do delete(client.last_hover_file)
-        client.last_hover_file = ""
-        if req.file_path != "" {
-            client.last_hover_file = strings.clone(req.file_path, context.allocator)
-        }
-        if content_str != "" {
-            client.last_hover = strings.clone(content_str, context.allocator)
-        } else {
-            client.last_hover = strings.clone("(No hover documentation)", context.allocator)
-        }
+        lsp_finish_hover(client, req, content_str)
 
     case .Completion:
         if client.completions_file != "" do delete(client.completions_file)

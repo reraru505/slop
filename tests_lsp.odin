@@ -371,6 +371,68 @@ test_lsp_completion_response_parsing :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_lsp_hover_diagnostic_fallback_and_summary :: proc(t: ^testing.T) {
+    client: LspClient
+    defer lsp_test_cleanup(&client)
+
+    path := "/tmp/odin_lsp_hover_diag.odin"
+    diag_msg := `{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///tmp/odin_lsp_hover_diag.odin","diagnostics":[{"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":9}},"severity":1,"message":"Undeclared name: bogus"},{"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":9}},"severity":2,"message":"related warning"}]}}`
+    diag_obj, diag_ok := lsp_test_parse_object(diag_msg)
+    testing.expect_value(t, diag_ok, true)
+    lsp_handle_notification(&client, "textDocument/publishDiagnostics", diag_obj, nil)
+
+    // A null hover result on an error reports the most severe diagnostic.
+    append(&client.pending_requests, PendingRequest{
+        id        = 20,
+        kind      = .Hover,
+        file_path = strings.clone(path),
+        start_row = 2,
+        col       = 4,
+    })
+    null_hover, null_ok := lsp_test_parse_object(`{"jsonrpc":"2.0","id":20,"result":null}`)
+    testing.expect_value(t, null_ok, true)
+    lsp_handle_response(&client, 20, null_hover, nil)
+    testing.expect_value(t, client.last_hover, "Error: Undeclared name: bogus")
+
+    // Documentation is kept, but the diagnostic comes first.
+    append(&client.pending_requests, PendingRequest{
+        id        = 21,
+        kind      = .Hover,
+        file_path = strings.clone(path),
+        start_row = 2,
+        col       = 4,
+    })
+    hover_msg := `{"jsonrpc":"2.0","id":21,"result":{"contents":{"kind":"markdown","value":"same :: int"}}}`
+    hover_obj, hover_ok := lsp_test_parse_object(hover_msg)
+    testing.expect_value(t, hover_ok, true)
+    lsp_handle_response(&client, 21, hover_obj, nil)
+    testing.expect_value(t, client.last_hover, "Error: Undeclared name: bogus\nsame :: int")
+    // The one-line status view starts with the diagnostic.
+    testing.expect_value(t, lsp_hover_one_line(client.last_hover), "Error: Undeclared name: bogus")
+
+    // Outside the diagnostic range, only hover content is shown.
+    append(&client.pending_requests, PendingRequest{
+        id        = 22,
+        kind      = .Hover,
+        file_path = strings.clone(path),
+        start_row = 2,
+        col       = 20,
+    })
+    hover2_obj, hover2_ok := lsp_test_parse_object(hover_msg)
+    testing.expect_value(t, hover2_ok, true)
+    lsp_handle_response(&client, 22, hover2_obj, nil)
+    testing.expect_value(t, client.last_hover, "same :: int")
+    testing.expect_value(t, lsp_hover_one_line(client.last_hover), "same :: int")
+
+    // Markdown fences, rules, and blank lines never become the displayed hover.
+    testing.expect_value(t, lsp_hover_one_line("```odin\nsame :: int\n```"), "same :: int")
+    testing.expect_value(t, lsp_hover_one_line("---\n\nplain docs"), "plain docs")
+    testing.expect_value(t, lsp_hover_one_line("~~~\ncode\n~~~"), "code")
+    testing.expect_value(t, lsp_hover_one_line("   \n"), "")
+    fmt.println("  ✓ [LSP Unit] hover falls back to diagnostics and skips markdown noise")
+}
+
+@(test)
 test_lsp_hover_and_definition_parsing :: proc(t: ^testing.T) {
     client: LspClient
     defer lsp_test_cleanup(&client)
