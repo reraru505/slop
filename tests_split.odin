@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:strings"
 import "core:testing"
+import "core:os"
 import sdl "vendor:sdl3"
 
 // Builds a minimal App with one Editor pane and a matching split tree.
@@ -97,20 +98,26 @@ test_split_pane_lifecycle :: proc(t: ^testing.T) {
     testing.expect_value(t, orig.kind, PaneKind.Editor)
 
     // Content and cursor are copied into the new pane
-    pt_insert(&orig.editor.table, 0, "hello")
+    pt_insert(&orig.editor.buffer.table, 0, "hello")
     orig.editor.cursor.row = 0
     orig.editor.cursor.col = 2
-    orig.editor.dirty = true
+    orig.editor.buffer.dirty = true
 
     app_split_pane(&app, orig, .Vertical)
     testing.expect_value(t, len(app.panes), 2)
     new_pane := app.active_pane
     testing.expect(t, new_pane != orig)
-    copied := pt_full_text(&new_pane.editor.table)
+    copied := pt_full_text(&new_pane.editor.buffer.table)
     defer delete(copied)
     testing.expect_value(t, copied, "hello")
     testing.expect_value(t, new_pane.editor.cursor.col, 2)
-    testing.expect_value(t, new_pane.editor.dirty, false)
+    // Split views share the document and its dirty state.
+    testing.expect_value(t, new_pane.editor.buffer.dirty, true)
+    testing.expect_value(t, new_pane.editor.buffer, orig.editor.buffer)
+    pt_insert(&new_pane.editor.buffer.table, 5, " world")
+    shared := pt_full_text(&orig.editor.buffer.table)
+    defer delete(shared)
+    testing.expect_value(t, shared, "hello world")
     testing.expect_value(t, app.root_split.is_leaf, false)
     testing.expect_value(t, app.root_split.dir, SplitDir.Vertical)
 
@@ -135,6 +142,11 @@ test_split_pane_lifecycle :: proc(t: ^testing.T) {
     testing.expect_value(t, app.active_pane, orig)
     testing.expect_value(t, app.root_split.is_leaf, true)
     testing.expect_value(t, app.root_split.pane, orig)
+    // The surviving view keeps the shared document after its sibling closes.
+    surviving := pt_full_text(&orig.editor.buffer.table)
+    defer delete(surviving)
+    testing.expect_value(t, surviving, "hello world")
+    testing.expect_value(t, orig.editor.buffer.dirty, true)
 
     // Closing the only pane asks the app to quit but keeps the pane alive
     app.running = true
@@ -218,4 +230,68 @@ test_split_compilation_does_not_start_build :: proc(t: ^testing.T) {
     testing.expect_value(t, copy.compilation.command, "printf 'copy-only\\n'")
     testing.expect_value(t, copy.compilation.job, nil)
     fmt.println("  ✓ [Split] splitting a compilation pane does not start another build")
+}
+
+@(test)
+test_split_same_file_shares_buffer :: proc(t: ^testing.T) {
+    path := "/tmp/odin_editor_tests/shared_buffer.txt"
+    _ = os.remove(path)
+    testing.expect(t, os.write_entire_file_from_string(path, "abc") == nil)
+    defer os.remove(path)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    orig := app.active_pane
+    testing.expect_value(t, app_pane_open_file(&app, orig, path), true)
+    app_split_pane(&app, orig, .Horizontal)
+    other := app.active_pane
+    testing.expect(t, orig.editor.buffer == other.editor.buffer)
+
+    // Type in one view; the shared table and dirty flag change everywhere.
+    other.editor.mode = .Insert
+    other.editor.cursor.row = 0
+    other.editor.cursor.col = 3
+    simulate_typing(&other.editor, "d")
+
+    text_orig := pt_full_text(&orig.editor.buffer.table)
+    defer delete(text_orig)
+    text_other := pt_full_text(&other.editor.buffer.table)
+    defer delete(text_other)
+    testing.expect_value(t, text_orig, "abcd")
+    testing.expect_value(t, text_other, "abcd")
+    testing.expect_value(t, orig.editor.buffer.dirty, true)
+    testing.expect_value(t, other.editor.buffer.dirty, true)
+
+    // Undo is shared too.
+    testing.expect_value(t, pt_undo(&orig.editor.buffer.table), true)
+    undone := pt_full_text(&other.editor.buffer.table)
+    defer delete(undone)
+    testing.expect_value(t, undone, "abc")
+
+    // Saving from one view clears the shared dirty flag.
+    testing.expect_value(t, editor_save_file(&other.editor, &app), true)
+    testing.expect_value(t, orig.editor.buffer.dirty, false)
+
+    // Re-opening the same file attaches the existing buffer.
+    testing.expect_value(t, app_pane_open_file(&app, orig, path), true)
+    testing.expect(t, orig.editor.buffer == other.editor.buffer)
+
+    // A forced reload replaces the document under every view, not just one.
+    testing.expect(t, os.write_entire_file_from_string(path, "reloaded\nline") == nil)
+    testing.expect_value(t, app_pane_open_file(&app, orig, path, force = true), true)
+    testing.expect(t, orig.editor.buffer == other.editor.buffer)
+    reloaded := pt_full_text(&other.editor.buffer.table)
+    defer delete(reloaded)
+    testing.expect_value(t, reloaded, "reloaded\nline")
+    testing.expect_value(t, orig.editor.buffer.dirty, false)
+
+    // A view whose cursor predates another view's edit is clamped before use.
+    orig.editor.cursor.row = 1
+    orig.editor.cursor.col = 4
+    editor_replace_buffer_text(&other.editor, "x")
+    editor_sync_view(&orig.editor)
+    testing.expect_value(t, orig.editor.cursor.row, 0)
+    testing.expect_value(t, orig.editor.cursor.col, 1)
+    fmt.println("  ✓ [Split] same-file views share content, undo, dirty, and reload state")
 }

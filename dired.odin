@@ -455,7 +455,7 @@ dired_enter_edit_mode :: proc(d: ^Dired, e: ^Editor, font: ^Font, window: ^sdl.W
 
 dired_apply_edits :: proc(d: ^Dired, e: ^Editor) -> string {
     d.apply_ok = false
-    full_text := pt_full_text(&e.table)
+    full_text := pt_full_text(&e.buffer.table)
     defer delete(full_text)
 
     raw_lines := strings.split(full_text, "\n", context.allocator)
@@ -686,7 +686,7 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
         }
 
         if key == KEY_DIRED_QUIT {
-            if pane != nil && pane.editor.file_path != "" && !strings.has_prefix(pane.editor.file_path, "DIRED") {
+            if pane != nil && pane.editor.buffer.file_path != "" && !strings.has_prefix(pane.editor.buffer.file_path, "DIRED") {
                 pane.kind = .Editor
             } else if len(app.panes) > 1 {
                 app_close_pane(app, pane)

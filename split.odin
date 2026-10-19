@@ -135,16 +135,14 @@ app_split_pane :: proc(app: ^App, target: ^Pane, dir: SplitDir) {
     new_pane := pane_create(app, target.kind)
 
     if target.kind == .Editor {
-        text := pt_full_text(&target.editor.table)
-        defer delete(text)
         editor_destroy(&new_pane.editor)
-        editor_init(&new_pane.editor, &app.font, text, target.editor.file_path)
+        editor_init_shared(&new_pane.editor, &app.font, target.editor.buffer)
         new_pane.editor.cursor = target.editor.cursor
         new_pane.editor.scroll_row = target.editor.scroll_row
         new_pane.editor.scroll_col = target.editor.scroll_col
         new_pane.editor.desired_col = target.editor.desired_col
         new_pane.editor.read_only = target.editor.read_only
-        full := pt_full_text(&new_pane.editor.table)
+        full := pt_full_text(&new_pane.editor.buffer.table)
         defer delete(full)
         app_lsp_doc_open(app, &new_pane.editor, full)
     } else if target.kind == .Dired {

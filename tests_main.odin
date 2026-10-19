@@ -191,7 +191,7 @@ test_app_dirty_quit_guard :: proc(t: ^testing.T) {
     app := make_test_app()
     defer destroy_test_app(&app)
     app.running = true
-    app.active_pane.editor.dirty = true
+    app.active_pane.editor.buffer.dirty = true
 
     app_execute_command(&app, "q")
     testing.expect_value(t, len(app.panes), 1)
@@ -204,7 +204,7 @@ test_app_dirty_quit_guard :: proc(t: ^testing.T) {
 
     // :qa refuses while another buffer is dirty; :qa! forces it.
     app.running = true
-    app.active_pane.editor.dirty = true
+    app.active_pane.editor.buffer.dirty = true
     app_execute_command(&app, "qa")
     testing.expect_value(t, app.running, true)
     testing.expect(t, strings.contains(app.cmd_prompt.message, "E37"))
@@ -213,7 +213,7 @@ test_app_dirty_quit_guard :: proc(t: ^testing.T) {
 
     // :wq on an unnamed buffer does not close it.
     app.running = true
-    app.active_pane.editor.dirty = true
+    app.active_pane.editor.buffer.dirty = true
     app_execute_command(&app, "wq")
     testing.expect_value(t, len(app.panes), 1)
     testing.expect_value(t, app.running, true)
@@ -371,17 +371,17 @@ test_app_open_file_and_dired :: proc(t: ^testing.T) {
 
     app_pane_open_file(&app, pane, file_path)
     testing.expect_value(t, pane.kind, PaneKind.Editor)
-    testing.expect_value(t, pane.editor.file_path, file_path)
+    testing.expect_value(t, pane.editor.buffer.file_path, file_path)
     testing.expect_value(t, app.active_pane, pane)
-    text := pt_full_text(&pane.editor.table)
+    text := pt_full_text(&pane.editor.buffer.table)
     testing.expect_value(t, text, "file contents")
     delete(text)
 
     // Opening a nonexistent file yields an empty buffer with that path
     missing := "/tmp/odin_editor_tests/app_open/missing.txt"
     app_pane_open_file(&app, pane, missing)
-    testing.expect_value(t, pane.editor.file_path, missing)
-    testing.expect_value(t, pt_get_length(&pane.editor.table), 0)
+    testing.expect_value(t, pane.editor.buffer.file_path, missing)
+    testing.expect_value(t, pt_get_length(&pane.editor.buffer.table), 0)
 
     // Opening a directory switches the pane to Dired
     app_pane_open_dired(&app, pane, dir)
@@ -409,13 +409,13 @@ test_app_help_command :: proc(t: ^testing.T) {
     help_pane := app.active_pane
     testing.expect(t, help_pane != app.panes[0])
     testing.expect_value(t, help_pane.kind, PaneKind.Editor)
-    testing.expect_value(t, help_pane.editor.file_path, HELP_FILE_PATH)
+    testing.expect_value(t, help_pane.editor.buffer.file_path, HELP_FILE_PATH)
     testing.expect_value(t, help_pane.editor.read_only, true)
-    testing.expect_value(t, help_pane.editor.dirty, false)
+    testing.expect_value(t, help_pane.editor.buffer.dirty, false)
 
     want := help_render(context.allocator)
     defer delete(want)
-    help_text := pt_full_text(&help_pane.editor.table)
+    help_text := pt_full_text(&help_pane.editor.buffer.table)
     defer delete(help_text)
     testing.expect_value(t, help_text, want)
     help_title := fmt.tprintf("%s - Help", EDITOR_NAME)
@@ -436,7 +436,7 @@ test_app_help_command :: proc(t: ^testing.T) {
     // Typing is ignored even if Insert mode is forced on the buffer
     editor_set_mode(&help_pane.editor, .Insert, nil)
     simulate_typing(&help_pane.editor, "x")
-    testing.expect_value(t, pt_get_length(&help_pane.editor.table), len(want))
+    testing.expect_value(t, pt_get_length(&help_pane.editor.buffer.table), len(want))
     testing.expect_value(t, help_pane.editor.status_message, "Buffer is read-only")
     editor_set_mode(&help_pane.editor, .Normal, nil)
 
@@ -447,7 +447,7 @@ test_app_help_command :: proc(t: ^testing.T) {
 
     // Destructive normal-mode keys are rejected
     send_key_event(&help_pane.editor, KEY_DELETE_CHAR)
-    testing.expect_value(t, pt_get_length(&help_pane.editor.table), len(want))
+    testing.expect_value(t, pt_get_length(&help_pane.editor.buffer.table), len(want))
     testing.expect_value(t, help_pane.editor.status_message, "Buffer is read-only")
 
     // :w must not create a file for a read-only buffer (or close it via :wq)
@@ -487,10 +487,10 @@ test_app_open_completion_doc_split :: proc(t: ^testing.T) {
     doc_pane := app.active_pane
     testing.expect(t, doc_pane != orig)
     testing.expect_value(t, doc_pane.kind, PaneKind.Editor)
-    testing.expect_value(t, doc_pane.editor.file_path, "*doc: foo*")
+    testing.expect_value(t, doc_pane.editor.buffer.file_path, "*doc: foo*")
     testing.expect_value(t, doc_pane.editor.read_only, true)
 
-    doc_text := pt_full_text(&doc_pane.editor.table)
+    doc_text := pt_full_text(&doc_pane.editor.buffer.table)
     defer delete(doc_text)
     testing.expect(t, strings.contains(doc_text, "// Symbol: foo"))
     testing.expect(t, strings.contains(doc_text, "// Detail: fn foo()"))
@@ -586,13 +586,13 @@ test_app_dired_refuses_dirty_editor :: proc(t: ^testing.T) {
     app := make_test_app()
     defer destroy_test_app(&app)
     pane := app.active_pane
-    pane.editor.dirty = true
+    pane.editor.buffer.dirty = true
 
     app_pane_open_dired(&app, pane, dir)
     testing.expect_value(t, pane.kind, PaneKind.Editor)
     testing.expect(t, strings.contains(app.cmd_prompt.message, "E37"))
 
-    pane.editor.dirty = false
+    pane.editor.buffer.dirty = false
     app_pane_open_dired(&app, pane, dir)
     testing.expect_value(t, pane.kind, PaneKind.Dired)
     fmt.println("  ✓ [App] :dired refuses to hide a modified editor buffer")
@@ -609,8 +609,8 @@ test_app_edit_command_dispatches :: proc(t: ^testing.T) {
     defer destroy_test_app(&app)
 
     app_execute_command(&app, fmt.tprintf("edit %s", path))
-    testing.expect_value(t, app.active_pane.editor.file_path, path)
-    text := pt_full_text(&app.active_pane.editor.table)
+    testing.expect_value(t, app.active_pane.editor.buffer.file_path, path)
+    text := pt_full_text(&app.active_pane.editor.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "edit me")
     fmt.println("  ✓ [App] :edit dispatches like :e")
@@ -634,17 +634,17 @@ test_app_open_file_guards_dirty_and_read_only :: proc(t: ^testing.T) {
 
     // Dirty buffers are not silently replaced.
     set_editor_text(&pane.editor, "unsaved")
-    pane.editor.dirty = true
+    pane.editor.buffer.dirty = true
     testing.expect_value(t, app_pane_open_file(&app, pane, b), false)
     testing.expect(t, strings.contains(app.cmd_prompt.message, "E37"))
-    text := pt_full_text(&pane.editor.table)
+    text := pt_full_text(&pane.editor.buffer.table)
     testing.expect_value(t, text, "unsaved")
     delete(text)
 
     // Forced :e! replaces it.
     app_execute_command(&app, fmt.tprintf("e! %s", b))
-    testing.expect_value(t, pane.editor.file_path, b)
-    testing.expect_value(t, pane.editor.dirty, false)
+    testing.expect_value(t, pane.editor.buffer.file_path, b)
+    testing.expect_value(t, pane.editor.buffer.dirty, false)
 
     // Read-only buffers are not replaced, even when clean.
     pane.editor.read_only = true

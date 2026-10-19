@@ -618,7 +618,7 @@ compilation_jump_to_current :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
     target_pane: ^Pane = nil
     for p in app.panes {
         if p != pane && p.kind == .Editor {
-            if paths_match(p.editor.file_path, target_path) {
+            if paths_match(p.editor.buffer.file_path, target_path) {
                 target_pane = p
                 break
             }
@@ -651,7 +651,7 @@ compilation_jump_to_current :: proc(c: ^Compilation, app: ^App, pane: ^Pane) {
     }
 
     // Open file in target editor pane if not already opened
-    if !paths_match(target_pane.editor.file_path, target_path) {
+    if !paths_match(target_pane.editor.buffer.file_path, target_path) {
         app_pane_open_file(app, target_pane, target_path)
     }
 

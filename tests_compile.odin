@@ -285,7 +285,7 @@ test_compilation_jump_resolves_paths_against_root :: proc(t: ^testing.T) {
 
     compilation_jump_to_current(&c, &app, comp_pane)
 
-    testing.expect_value(t, editor_pane.editor.file_path, target)
+    testing.expect_value(t, editor_pane.editor.buffer.file_path, target)
     testing.expect_value(t, editor_pane.editor.cursor.row, 1)
     testing.expect_value(t, editor_pane.editor.cursor.col, 2)
     testing.expect_value(t, app.active_pane, editor_pane)

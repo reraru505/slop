@@ -39,7 +39,7 @@ app_set_message :: proc(app: ^App, msg: string) {
 }
 
 pane_has_unsaved_changes :: proc(p: ^Pane) -> bool {
-    return p != nil && p.kind == .Editor && p.editor.dirty && !p.editor.read_only
+    return p != nil && p.kind == .Editor && p.editor.buffer.dirty && !p.editor.read_only
 }
 
 app_has_unsaved_changes :: proc(app: ^App) -> bool {
@@ -119,14 +119,14 @@ app_get_lsp_for_file :: proc(app: ^App, file_path: string) -> ^LspClient {
 }
 
 app_lsp_doc_open :: proc(app: ^App, e: ^Editor, text: string) {
-    if app == nil || e == nil || e.file_path == "" || strings.has_prefix(e.file_path, "*") do return
-    lsp_manager_open_doc(&app.lsp_manager, e.file_path, text)
+    if app == nil || e == nil || e.buffer == nil || e.buffer.file_path == "" || strings.has_prefix(e.buffer.file_path, "*") do return
+    lsp_manager_open_doc(&app.lsp_manager, e.buffer.file_path, text)
     e.lsp_doc_open = true
 }
 
 app_lsp_doc_close :: proc(app: ^App, e: ^Editor) {
-    if app == nil || e == nil || !e.lsp_doc_open do return
-    lsp_manager_close_doc(&app.lsp_manager, e.file_path)
+    if app == nil || e == nil || e.buffer == nil || !e.lsp_doc_open do return
+    lsp_manager_close_doc(&app.lsp_manager, e.buffer.file_path)
     e.lsp_doc_open = false
 }
 
@@ -137,7 +137,7 @@ app_lsp_doc_change :: proc(app: ^App, file_path, text: string) {
 
 app_get_active_lsp :: proc(app: ^App) -> ^LspClient {
     if app == nil || app.active_pane == nil || app.active_pane.kind != .Editor do return nil
-    return app_get_lsp_for_file(app, app.active_pane.editor.file_path)
+    return app_get_lsp_for_file(app, app.active_pane.editor.buffer.file_path)
 }
 
 app_open_command_prompt :: proc(app: ^App) {
@@ -402,7 +402,7 @@ app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string, force := f
             app_set_message(app, "Buffer is read-only")
             return false
         }
-        if pane.editor.dirty && !force {
+        if pane.editor.buffer.dirty && !force {
             app_set_message(app, "E37: No write since last change (use :e! to override)")
             return false
         }
@@ -417,6 +417,18 @@ app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string, force := f
         initial_text = string(data)
     }
 
+    // :e / :e! on a file that is already open reloads the shared buffer in
+    // place so every split view sees the fresh contents. The dirty guard above
+    // has already refused a plain reload when there are unsaved changes.
+    if target_path != "" && pane.kind == .Editor && pane.editor.buffer != nil &&
+       pane.editor.buffer.file_path == target_path {
+        editor_replace_buffer_text(&pane.editor, initial_text)
+        pane.editor.buffer.needs_lsp_sync = true
+        pane.editor.buffer.last_edit_time = time.now()
+        if data != nil do delete(data)
+        return true
+    }
+
     app_lsp_doc_close(app, &pane.editor)
     editor_destroy(&pane.editor)
     editor_init(&pane.editor, &app.font, initial_text, target_path)
@@ -427,7 +439,7 @@ app_pane_open_file :: proc(app: ^App, pane: ^Pane, file_path: string, force := f
     pane.kind = .Editor
     app.active_pane = pane
 
-    full_text := pt_full_text(&pane.editor.table)
+    full_text := pt_full_text(&pane.editor.buffer.table)
     defer delete(full_text)
     app_lsp_doc_open(app, &pane.editor, full_text)
     return true
@@ -443,7 +455,7 @@ app_pane_open_dired :: proc(app: ^App, pane: ^Pane, dir_path: string) {
             app_set_message(app, "Buffer is read-only")
             return
         }
-        if pane.editor.dirty {
+        if pane.editor.buffer.dirty {
             app_set_message(app, "E37: No write since last change (save before :dired)")
             return
         }
@@ -490,7 +502,7 @@ app_open_help :: proc(app: ^App) {
 
     // Focus an existing help buffer instead of opening another split.
     for p in app.panes {
-        if p.kind == .Editor && p.editor.file_path == HELP_FILE_PATH {
+        if p.kind == .Editor && p.editor.buffer.file_path == HELP_FILE_PATH {
             app.active_pane = p
             return
         }
@@ -512,7 +524,7 @@ app_open_help :: proc(app: ^App) {
     defer delete(help_text)
     editor_init(&help_pane.editor, &app.font, help_text, HELP_FILE_PATH)
     help_pane.editor.read_only = true
-    help_pane.editor.dirty = false
+    help_pane.editor.buffer.dirty = false
 }
 
 app_run_compile :: proc(app: ^App, cmd_str: string) {
@@ -577,8 +589,8 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                 if e.read_only {
                     app_set_message(app, "Buffer is read-only")
                 } else if editor_save_file(e, app) {
-                    app_set_message(app, fmt.tprintf("\"%s\" written", e.file_path))
-                } else if e.file_path == "" {
+                    app_set_message(app, fmt.tprintf("\"%s\" written", e.buffer.file_path))
+                } else if e.buffer.file_path == "" {
                     app_set_message(app, "E32: No file name")
                 }
             } else {
@@ -610,7 +622,7 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                     app_set_message(app, "Buffer is read-only")
                 } else if editor_save_file(e, app) {
                     app_close_pane(app, app.active_pane)
-                } else if e.file_path == "" {
+                } else if e.buffer.file_path == "" {
                     app_set_message(app, "E32: No file name")
                 }
             }
@@ -651,8 +663,8 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
     } else if cmd == "dired" || cmd == "d" || cmd == "e ." {
         dir := app_picker_root(app)
         if dir == "" do dir = "."
-        if app.active_pane != nil && app.active_pane.kind == .Editor && app.active_pane.editor.file_path != "" {
-            dir = filepath.dir(app.active_pane.editor.file_path)
+        if app.active_pane != nil && app.active_pane.kind == .Editor && app.active_pane.editor.buffer.file_path != "" {
+            dir = filepath.dir(app.active_pane.editor.buffer.file_path)
             if dir == "" do dir = "."
         } else if app.active_pane != nil && app.active_pane.kind == .Dired && app.active_pane.dired.path != "" {
             dir = app.active_pane.dired.path
@@ -714,8 +726,8 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         target := strings.trim_space(cmd[2:] if strings.has_prefix(cmd, "e ") else cmd[5:])
         app_pane_open(app, app.active_pane, app_resolve_path(app, target))
     } else if cmd == "e" || cmd == "edit" {
-        if app.active_pane != nil && app.active_pane.kind == .Editor && app.active_pane.editor.file_path != "" {
-            _ = app_pane_open_file(app, app.active_pane, app.active_pane.editor.file_path)
+        if app.active_pane != nil && app.active_pane.kind == .Editor && app.active_pane.editor.buffer.file_path != "" {
+            _ = app_pane_open_file(app, app.active_pane, app.active_pane.editor.buffer.file_path)
         } else {
             app_set_message(app, "Usage: :e <path>")
         }
@@ -883,8 +895,8 @@ app_here_directory :: proc(app: ^App) -> string {
     if p.kind == .Dired {
         return p.dired.path
     }
-    if p.kind == .Editor && p.editor.file_path != "" && !strings.has_prefix(p.editor.file_path, "*") {
-        dir := filepath.dir(p.editor.file_path)
+    if p.kind == .Editor && p.editor.buffer.file_path != "" && !strings.has_prefix(p.editor.buffer.file_path, "*") {
+        dir := filepath.dir(p.editor.buffer.file_path)
         if dir != "" && dir != "." do return dir
     }
     return app.working_dir
@@ -1010,8 +1022,8 @@ load :: proc(app: ^App) {
     app.root_split = split_create_leaf(initial_pane)
     app.running = true
 
-    if initial_pane.kind == .Editor && initial_pane.editor.file_path != "" {
-        full_text := pt_full_text(&initial_pane.editor.table)
+    if initial_pane.kind == .Editor && initial_pane.editor.buffer.file_path != "" {
+        full_text := pt_full_text(&initial_pane.editor.buffer.table)
         defer delete(full_text)
         app_lsp_doc_open(app, &initial_pane.editor, full_text)
     }
@@ -1235,7 +1247,7 @@ update :: proc(app: ^App) {
         if len(active_lsp.completions) > 0 {
             if app.active_pane != nil && app.active_pane.kind == .Editor {
                 e := &app.active_pane.editor
-                file_matches := active_lsp.completions_file == "" || paths_match(e.file_path, active_lsp.completions_file)
+                file_matches := active_lsp.completions_file == "" || paths_match(e.buffer.file_path, active_lsp.completions_file)
                 if file_matches && e.mode == .Insert {
                     for c in e.completion.all_items {
                         delete(c.label); delete(c.detail); delete(c.documentation); delete(c.insert_text)
@@ -1268,7 +1280,7 @@ update :: proc(app: ^App) {
             active_lsp.last_definition = nil
             defer if loc.file_path != "" do delete(loc.file_path)
             if app.active_pane != nil && app.active_pane.kind == .Editor {
-                cur_abs, _ := filepath.abs(app.active_pane.editor.file_path, context.temp_allocator)
+                cur_abs, _ := filepath.abs(app.active_pane.editor.buffer.file_path, context.temp_allocator)
                 if cur_abs != loc.file_path {
                     app_pane_open_file(app, app.active_pane, loc.file_path)
                 }
@@ -1285,7 +1297,7 @@ update :: proc(app: ^App) {
         if active_lsp.last_hover != "" {
             show_hover := true
             if app.active_pane != nil && app.active_pane.kind == .Editor && active_lsp.last_hover_file != "" {
-                show_hover = paths_match(app.active_pane.editor.file_path, active_lsp.last_hover_file)
+                show_hover = paths_match(app.active_pane.editor.buffer.file_path, active_lsp.last_hover_file)
             }
             if show_hover {
                 clean_hover := strings.trim_space(active_lsp.last_hover)
@@ -1306,7 +1318,7 @@ update :: proc(app: ^App) {
         if len(active_lsp.last_edits) > 0 {
             if app.active_pane != nil && app.active_pane.kind == .Editor {
                 e := &app.active_pane.editor
-                file_matches := active_lsp.last_edits_file == "" || paths_match(e.file_path, active_lsp.last_edits_file)
+                file_matches := active_lsp.last_edits_file == "" || paths_match(e.buffer.file_path, active_lsp.last_edits_file)
                 if file_matches {
                     editor_apply_lsp_edits(e, active_lsp.last_edits[:])
                     app_set_message(app, fmt.tprintf("LSP: Formatted range (%d edits)", len(active_lsp.last_edits)))
@@ -1325,12 +1337,12 @@ update :: proc(app: ^App) {
     for pane in app.panes {
         if pane != nil && pane.kind == .Editor {
             e := &pane.editor
-            if e.needs_lsp_sync && time.since(e.last_edit_time) > 250 * time.Millisecond {
-                e.needs_lsp_sync = false
-                if e.file_path != "" {
-                    full_text := pt_full_text(&e.table)
+            if e.buffer.needs_lsp_sync && time.since(e.buffer.last_edit_time) > 250 * time.Millisecond {
+                e.buffer.needs_lsp_sync = false
+                if e.buffer.file_path != "" {
+                    full_text := pt_full_text(&e.buffer.table)
                     defer delete(full_text)
-                    app_lsp_doc_change(app, e.file_path, full_text)
+                    app_lsp_doc_change(app, e.buffer.file_path, full_text)
                 }
             }
         }
@@ -1358,10 +1370,12 @@ draw :: proc(app: ^App) {
         is_focused := (p == app.active_pane)
         switch p.kind {
         case .Editor:
-            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.file_path))
+            editor_sync_view(&p.editor)
+            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path))
         case .Dired:
             if p.dired.is_editing {
-                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.file_path))
+                editor_sync_view(&p.editor)
+                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path))
             } else {
                 dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused, &app.theme)
             }

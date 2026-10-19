@@ -65,7 +65,7 @@ test_editor_cursor_navigation :: proc(t: ^testing.T) {
     // Offset clamps column to line length
     e.cursor.col = 999
     off := editor_get_cursor_offset(&e)
-    line2_start := pt_line_to_offset(&e.table, 2)
+    line2_start := pt_line_to_offset(&e.buffer.table, 2)
     line2_len := editor_get_line_len(&e, 2)
     testing.expect_value(t, off, line2_start + line2_len)
     fmt.println("  ✓ [Editor] Navigation bounds & line clamping verified")
@@ -105,7 +105,7 @@ test_editor_delete_line :: proc(t: ^testing.T) {
     e.cursor.row = 1
     editor_delete_current_line(&e)
 
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "line 1\nline 3")
     fmt.println("  ✓ [Editor] 'dd' whole-line deletion verified")
@@ -147,7 +147,7 @@ test_editor_completion_filtering :: proc(t: ^testing.T) {
     testing.expect_value(t, len(e.completion.items), len(candidates))
 
     // 2. Type prefix "st"
-    pt_insert(&e.table, 4, "st")
+    pt_insert(&e.buffer.table, 4, "st")
     e.cursor.col = 6
     editor_filter_completions(&e)
     testing.expect_value(t, e.completion.active, true)
@@ -155,7 +155,7 @@ test_editor_completion_filtering :: proc(t: ^testing.T) {
     testing.expect_value(t, len(e.completion.items), 5)
 
     // 3. Type prefix "std"
-    pt_insert(&e.table, 6, "d")
+    pt_insert(&e.buffer.table, 6, "d")
     e.cursor.col = 7
     editor_filter_completions(&e)
     testing.expect_value(t, e.completion.active, true)
@@ -163,8 +163,8 @@ test_editor_completion_filtering :: proc(t: ^testing.T) {
     testing.expect_value(t, len(e.completion.items), 3)
 
     // 4. Case-insensitive test: type "al"
-    pt_delete_range(&e.table, 4, 3)
-    pt_insert(&e.table, 4, "al")
+    pt_delete_range(&e.buffer.table, 4, 3)
+    pt_insert(&e.buffer.table, 4, "al")
     e.cursor.col = 6
     editor_filter_completions(&e)
     testing.expect_value(t, e.completion.active, true)
@@ -186,7 +186,7 @@ test_editor_space_insertion_no_double_jump :: proc(t: ^testing.T) {
     // It returns false so that SDL's TEXT_INPUT event performs the single insertion.
     handled := editor_handle_insert_key(&e, sdl.K_SPACE, {}, nil, nil)
     testing.expect_value(t, handled, false)
-    testing.expect_value(t, pt_get_length(&e.table), 5)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 5)
 
     // Simulate SDL TEXT_INPUT event inserting a single space
     space_str: cstring = " "
@@ -196,8 +196,8 @@ test_editor_space_insertion_no_double_jump :: proc(t: ^testing.T) {
     editor_handle_event(&e, &text_ev, nil, nil)
 
     // Total length must be 6 (exactly one space added, not two)
-    testing.expect_value(t, pt_get_length(&e.table), 6)
-    full := pt_full_text(&e.table)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 6)
+    full := pt_full_text(&e.buffer.table)
     defer delete(full)
     testing.expect_value(t, full, "hello ")
     testing.expect_value(t, e.cursor.col, 6)
@@ -284,47 +284,47 @@ test_editor_autopairs_brackets_and_quotes :: proc(t: ^testing.T) {
 
     // 1. Typing '(' autopairs to '()'
     simulate_typing(&e, "(")
-    testing.expect_value(t, pt_get_length(&e.table), 2)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 2)
     testing.expect_value(t, e.cursor.col, 1)
 
     // 2. Inside '()', typing '[' autopairs to '[]' -> '([])'
     simulate_typing(&e, "[")
-    testing.expect_value(t, pt_get_length(&e.table), 4)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 4)
     testing.expect_value(t, e.cursor.col, 2)
 
     // 3. Inside '([])', typing '{' autopairs to '{}' -> '([{}])'
     simulate_typing(&e, "{")
-    testing.expect_value(t, pt_get_length(&e.table), 6)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 6)
     testing.expect_value(t, e.cursor.col, 3)
 
     // 4. Inside '([{}])', typing '"' autopairs to '""' -> '([{" "}])'
     simulate_typing(&e, "\"")
-    testing.expect_value(t, pt_get_length(&e.table), 8)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 8)
     testing.expect_value(t, e.cursor.col, 4)
 
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "([{\"\"}])")
 
     // 5. Test step-over (overtyping closing characters)
     // Step over '"'
     simulate_typing(&e, "\"")
-    testing.expect_value(t, pt_get_length(&e.table), 8)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 8)
     testing.expect_value(t, e.cursor.col, 5)
 
     // Step over '}'
     simulate_typing(&e, "}")
-    testing.expect_value(t, pt_get_length(&e.table), 8)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 8)
     testing.expect_value(t, e.cursor.col, 6)
 
     // Step over ']'
     simulate_typing(&e, "]")
-    testing.expect_value(t, pt_get_length(&e.table), 8)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 8)
     testing.expect_value(t, e.cursor.col, 7)
 
     // Step over ')'
     simulate_typing(&e, ")")
-    testing.expect_value(t, pt_get_length(&e.table), 8)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 8)
     testing.expect_value(t, e.cursor.col, 8)
 
     fmt.println("  ✓ [Editor] Autopairs '()', '[]', '{}', '\"\"' and closing step-over verified")
@@ -339,23 +339,23 @@ test_editor_autopairs_smart_backspace :: proc(t: ^testing.T) {
 
     // Test parenthesis pair backspace
     simulate_typing(&e, "(")
-    testing.expect_value(t, pt_get_length(&e.table), 2)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 2)
     editor_handle_insert_key(&e, sdl.K_BACKSPACE, {}, nil, nil)
-    testing.expect_value(t, pt_get_length(&e.table), 0)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 0)
     testing.expect_value(t, e.cursor.col, 0)
 
     // Test double-quote pair backspace
     simulate_typing(&e, "\"")
-    testing.expect_value(t, pt_get_length(&e.table), 2)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 2)
     editor_handle_insert_key(&e, sdl.K_BACKSPACE, {}, nil, nil)
-    testing.expect_value(t, pt_get_length(&e.table), 0)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 0)
     testing.expect_value(t, e.cursor.col, 0)
 
     // Test single-quote pair backspace
     simulate_typing(&e, "'")
-    testing.expect_value(t, pt_get_length(&e.table), 2)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 2)
     editor_handle_insert_key(&e, sdl.K_BACKSPACE, {}, nil, nil)
-    testing.expect_value(t, pt_get_length(&e.table), 0)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 0)
     testing.expect_value(t, e.cursor.col, 0)
 
     fmt.println("  ✓ [Editor] Smart backspace deletion of empty autopairs verified")
@@ -371,7 +371,7 @@ test_editor_autopairs_no_pair_before_alnum_and_ident :: proc(t: ^testing.T) {
 
     // Typing '(' before an alphanumeric character should NOT autopair
     simulate_typing(&e, "(")
-    t1 := pt_full_text(&e.table)
+    t1 := pt_full_text(&e.buffer.table)
     defer delete(t1)
     testing.expect_value(t, t1, "(word")
 
@@ -383,7 +383,7 @@ test_editor_autopairs_no_pair_before_alnum_and_ident :: proc(t: ^testing.T) {
     e2.cursor.col = 3
 
     simulate_typing(&e2, "'")
-    t2 := pt_full_text(&e2.table)
+    t2 := pt_full_text(&e2.buffer.table)
     defer delete(t2)
     testing.expect_value(t, t2, "don'")
 
@@ -391,13 +391,13 @@ test_editor_autopairs_no_pair_before_alnum_and_ident :: proc(t: ^testing.T) {
 }
 
 set_editor_text :: proc(e: ^Editor, text: string) {
-    pt_delete_range(&e.table, 0, pt_get_length(&e.table))
-    pt_insert(&e.table, 0, text)
+    pt_delete_range(&e.buffer.table, 0, pt_get_length(&e.buffer.table))
+    pt_insert(&e.buffer.table, 0, text)
     e.cursor.row = 0
     e.cursor.col = 0
     e.selection_anchor = e.cursor
     e.desired_col = 0
-    e.dirty = false
+    e.buffer.dirty = false
 }
 
 send_key_event :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod = {}) {
@@ -497,11 +497,11 @@ test_editor_line_len_and_virtual_space :: proc(t: ^testing.T) {
 
     // ...and become real spaces when an edit needs an offset
     editor_realize_virtual_spaces(&e)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "ab        \ncd")
     testing.expect_value(t, editor_get_cursor_offset(&e), 10)
-    testing.expect_value(t, e.dirty, true)
+    testing.expect_value(t, e.buffer.dirty, true)
     fmt.println("  ✓ [Editor] virtual spaces are realized on demand")
 }
 
@@ -588,13 +588,13 @@ test_editor_delete_selection :: proc(t: ^testing.T) {
     e.selection_anchor = Cursor{row = 0, col = 0}
     e.cursor = Cursor{row = 0, col = 4}
     editor_delete_selection(&e)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, " world")
     testing.expect_value(t, e.mode, EditorMode.Normal)
     testing.expect_value(t, e.cursor.row, 0)
     testing.expect_value(t, e.cursor.col, 0)
-    testing.expect_value(t, e.dirty, true)
+    testing.expect_value(t, e.buffer.dirty, true)
 
     // Whole-line selection removes the trailing newline as well
     e2: Editor
@@ -604,7 +604,7 @@ test_editor_delete_selection :: proc(t: ^testing.T) {
     e2.selection_anchor = Cursor{row = 0, col = 0}
     e2.cursor = Cursor{row = 1, col = 3}
     editor_delete_selection(&e2)
-    text2 := pt_full_text(&e2.table)
+    text2 := pt_full_text(&e2.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "ccc")
     testing.expect_value(t, e2.cursor.row, 0)
@@ -626,7 +626,7 @@ test_editor_visual_line_select_and_delete :: proc(t: ^testing.T) {
     testing.expect_value(t, e.cursor.col, 3)
 
     testing.expect_value(t, editor_handle_normal_key(&e, KEY_DELETE_SELECTION, {}, nil, nil), true)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "aaa\nccc")
     testing.expect_value(t, e.mode, EditorMode.Normal)
@@ -636,7 +636,7 @@ test_editor_visual_line_select_and_delete :: proc(t: ^testing.T) {
     e.cursor.col = 0
     editor_handle_normal_key(&e, KEY_SELECT_LINE, {}, nil, nil)
     editor_handle_normal_key(&e, KEY_DELETE_SELECTION, {}, nil, nil)
-    text2 := pt_full_text(&e.table)
+    text2 := pt_full_text(&e.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "aaa")
     fmt.println("  ✓ [Editor] X line-selection + D deletion verified")
@@ -650,14 +650,14 @@ test_editor_delete_char_forward :: proc(t: ^testing.T) {
 
     // Mid-line d deletes the character under the cursor
     testing.expect_value(t, editor_handle_normal_key(&e, KEY_DELETE_CHAR, {}, nil, nil), true)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "b\ncd")
 
     // At EOL d joins the next line
     e.cursor.col = 1
     editor_handle_normal_key(&e, KEY_DELETE_CHAR, {}, nil, nil)
-    text2 := pt_full_text(&e.table)
+    text2 := pt_full_text(&e.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "bcd")
     fmt.println("  ✓ [Editor] d deletes a char and joins at EOL")
@@ -670,7 +670,7 @@ test_editor_move_lines :: proc(t: ^testing.T) {
     editor_init(&e, nil, "aaa\nbbb\nccc")
     defer editor_destroy(&e)
     editor_move_lines(&e, 1)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "bbb\naaa\nccc\n")
     testing.expect_value(t, e.cursor.row, 1)
@@ -681,7 +681,7 @@ test_editor_move_lines :: proc(t: ^testing.T) {
     defer editor_destroy(&e2)
     e2.cursor.row = 1
     editor_move_lines(&e2, -1)
-    text2 := pt_full_text(&e2.table)
+    text2 := pt_full_text(&e2.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "bbb\naaa\nccc\n")
     testing.expect_value(t, e2.cursor.row, 0)
@@ -691,12 +691,12 @@ test_editor_move_lines :: proc(t: ^testing.T) {
     editor_init(&e3, nil, "aaa\nbbb")
     defer editor_destroy(&e3)
     editor_move_lines(&e3, -1)
-    text3 := pt_full_text(&e3.table)
+    text3 := pt_full_text(&e3.buffer.table)
     defer delete(text3)
     testing.expect_value(t, text3, "aaa\nbbb")
     e3.cursor.row = 1
     editor_move_lines(&e3, 1)
-    text4 := pt_full_text(&e3.table)
+    text4 := pt_full_text(&e3.buffer.table)
     defer delete(text4)
     testing.expect_value(t, text4, "aaa\nbbb")
 
@@ -708,7 +708,7 @@ test_editor_move_lines :: proc(t: ^testing.T) {
     e4.selection_anchor = Cursor{row = 0, col = 0}
     e4.cursor = Cursor{row = 1, col = 0}
     editor_move_lines(&e4, 1)
-    text5 := pt_full_text(&e4.table)
+    text5 := pt_full_text(&e4.buffer.table)
     defer delete(text5)
     testing.expect_value(t, text5, "c\na\nb\n")
     testing.expect_value(t, e4.cursor.row, 2)
@@ -722,7 +722,7 @@ test_editor_move_lines :: proc(t: ^testing.T) {
     e5.selection_anchor = Cursor{row = 1, col = 0}
     e5.cursor = Cursor{row = 2, col = 0}
     editor_move_lines(&e5, -1)
-    text6 := pt_full_text(&e5.table)
+    text6 := pt_full_text(&e5.buffer.table)
     defer delete(text6)
     testing.expect_value(t, text6, "b\nc\na\n")
     testing.expect_value(t, e5.cursor.row, 1)
@@ -748,7 +748,7 @@ test_editor_delete_current_line_variants :: proc(t: ^testing.T) {
         defer editor_destroy(&e)
         e.cursor.row = tc.row
         editor_delete_current_line(&e)
-        text := pt_full_text(&e.table)
+        text := pt_full_text(&e.buffer.table)
         testing.expect_value(t, text, tc.want)
         delete(text)
     }
@@ -841,7 +841,7 @@ test_editor_open_line_keys :: proc(t: ^testing.T) {
     defer editor_destroy(&e)
     e.cursor.col = 1
     editor_handle_normal_key(&e, KEY_OPEN_BELOW, {}, nil, nil)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "abc\n")
     testing.expect_value(t, e.cursor.row, 1)
@@ -854,7 +854,7 @@ test_editor_open_line_keys :: proc(t: ^testing.T) {
     defer editor_destroy(&e2)
     e2.cursor.col = 1
     editor_handle_normal_key(&e2, KEY_OPEN_ABOVE, sdl.KMOD_SHIFT, nil, nil)
-    text2 := pt_full_text(&e2.table)
+    text2 := pt_full_text(&e2.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "\nabc")
     testing.expect_value(t, e2.cursor.row, 0)
@@ -873,7 +873,7 @@ test_editor_insert_backspace_join :: proc(t: ^testing.T) {
     e.cursor.row = 1
     e.cursor.col = 0
     editor_handle_insert_key(&e, sdl.K_BACKSPACE, {}, nil, nil)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "abcd")
     testing.expect_value(t, e.cursor.row, 0)
@@ -887,7 +887,7 @@ test_editor_insert_backspace_join :: proc(t: ^testing.T) {
     e2.cursor.row = 1
     e2.cursor.col = 0
     editor_handle_insert_key(&e2, sdl.K_BACKSPACE, {}, nil, nil)
-    text2 := pt_full_text(&e2.table)
+    text2 := pt_full_text(&e2.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "abcd")
     testing.expect_value(t, e2.cursor.row, 0)
@@ -900,7 +900,7 @@ test_editor_insert_backspace_join :: proc(t: ^testing.T) {
     editor_set_mode(&e3, .Insert, nil)
     e3.cursor.col = 2
     editor_handle_insert_key(&e3, sdl.K_BACKSPACE, {}, nil, nil)
-    text3 := pt_full_text(&e3.table)
+    text3 := pt_full_text(&e3.buffer.table)
     defer delete(text3)
     testing.expect_value(t, text3, "ac")
     testing.expect_value(t, e3.cursor.col, 1)
@@ -915,7 +915,7 @@ test_editor_insert_delete_key :: proc(t: ^testing.T) {
     editor_set_mode(&e, .Insert, nil)
     e.cursor.col = 1
     editor_handle_insert_key(&e, sdl.K_DELETE, {}, nil, nil)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "ac")
     testing.expect_value(t, e.cursor.col, 1)
@@ -927,7 +927,7 @@ test_editor_insert_delete_key :: proc(t: ^testing.T) {
     editor_set_mode(&e2, .Insert, nil)
     e2.cursor.col = 2
     editor_handle_insert_key(&e2, sdl.K_DELETE, {}, nil, nil)
-    text2 := pt_full_text(&e2.table)
+    text2 := pt_full_text(&e2.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "abcd")
 
@@ -938,7 +938,7 @@ test_editor_insert_delete_key :: proc(t: ^testing.T) {
     editor_set_mode(&e3, .Insert, nil)
     e3.cursor.col = 2
     editor_handle_insert_key(&e3, sdl.K_DELETE, {}, nil, nil)
-    text3 := pt_full_text(&e3.table)
+    text3 := pt_full_text(&e3.buffer.table)
     defer delete(text3)
     testing.expect_value(t, text3, "abcd")
     fmt.println("  ✓ [Editor] insert-mode Delete (incl. CRLF) verified")
@@ -953,7 +953,7 @@ test_editor_insert_tab_and_enter_indent :: proc(t: ^testing.T) {
     editor_set_mode(&e, .Insert, nil)
     e.cursor.col = 3
     editor_handle_insert_key(&e, sdl.K_TAB, {}, nil, nil)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "a      ")
     testing.expect_value(t, e.cursor.col, 7)
@@ -965,7 +965,7 @@ test_editor_insert_tab_and_enter_indent :: proc(t: ^testing.T) {
     editor_set_mode(&e2, .Insert, nil)
     e2.cursor.col = 5
     editor_handle_insert_key(&e2, sdl.K_RETURN, {}, nil, nil)
-    text2 := pt_full_text(&e2.table)
+    text2 := pt_full_text(&e2.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "  foo\n  ")
     testing.expect_value(t, e2.cursor.row, 1)
@@ -985,7 +985,7 @@ test_editor_insert_tab_and_enter_indent :: proc(t: ^testing.T) {
         editor_set_mode(&ep, .Insert, nil)
         ep.cursor.col = 1
         editor_handle_insert_key(&ep, sdl.K_RETURN, {}, nil, nil)
-        got := pt_full_text(&ep.table)
+        got := pt_full_text(&ep.buffer.table)
         testing.expect_value(t, got, pair.want)
         delete(got)
     }
@@ -997,7 +997,7 @@ test_editor_insert_tab_and_enter_indent :: proc(t: ^testing.T) {
     editor_set_mode(&e3, .Insert, nil)
     e3.cursor.col = 3
     editor_handle_insert_key(&e3, sdl.K_RETURN, {}, nil, nil)
-    text3 := pt_full_text(&e3.table)
+    text3 := pt_full_text(&e3.buffer.table)
     defer delete(text3)
     testing.expect_value(t, text3, "  {\n      \n  }")
     testing.expect_value(t, e3.cursor.col, 6)
@@ -1031,23 +1031,23 @@ test_editor_undo_redo_keys :: proc(t: ^testing.T) {
     editor_set_mode(&e, .Insert, nil)
 
     simulate_typing(&e, "hello")
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "hello")
 
     editor_set_mode(&e, .Normal, nil)
     send_key_event(&e, KEY_UNDO)
-    undone := pt_full_text(&e.table)
+    undone := pt_full_text(&e.buffer.table)
     defer delete(undone)
     testing.expect_value(t, undone, "")
 
     send_key_event(&e, KEY_REDO, sdl.KMOD_CTRL)
-    redone := pt_full_text(&e.table)
+    redone := pt_full_text(&e.buffer.table)
     defer delete(redone)
     testing.expect_value(t, redone, "hello")
 
     send_key_event(&e, KEY_UNDO_ALT, sdl.KMOD_CTRL)
-    undone2 := pt_full_text(&e.table)
+    undone2 := pt_full_text(&e.buffer.table)
     defer delete(undone2)
     testing.expect_value(t, undone2, "")
     fmt.println("  ✓ [Editor] u, Ctrl+Z and Ctrl+R undo/redo verified")
@@ -1084,7 +1084,7 @@ test_editor_completion_substring_and_apply :: proc(t: ^testing.T) {
     // Apply replaces the typed prefix with insert_text
     e.completion.selected = 0
     editor_apply_completion(&e)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "static")
     testing.expect_value(t, e.cursor.col, 6)
@@ -1124,7 +1124,7 @@ test_editor_apply_completion_fallback_insert_text :: proc(t: ^testing.T) {
     // "fo" is a prefix of "foo()", so the item survives; empty insertText falls back to label
     e.completion.active = true
     editor_apply_completion(&e)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "foo()")
     fmt.println("  ✓ [Editor] completion falls back to label when insertText is empty")
@@ -1141,11 +1141,11 @@ test_editor_apply_lsp_edits :: proc(t: ^testing.T) {
         {start_row = 2, start_col = 0, end_row = 2, end_col = 3, new_text = "CCC"},
     }
     editor_apply_lsp_edits(&e, edits)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "AAA\nbbb\nCCC")
-    testing.expect_value(t, e.dirty, true)
-    testing.expect_value(t, e.needs_lsp_sync, true)
+    testing.expect_value(t, e.buffer.dirty, true)
+    testing.expect_value(t, e.buffer.needs_lsp_sync, true)
 
     // Insertion, deletion and multi-line replacement
     e2: Editor
@@ -1155,7 +1155,7 @@ test_editor_apply_lsp_edits :: proc(t: ^testing.T) {
         {start_row = 0, start_col = 0, end_row = 1, end_col = 1, new_text = "X"},
     }
     editor_apply_lsp_edits(&e2, edits2)
-    text2 := pt_full_text(&e2.table)
+    text2 := pt_full_text(&e2.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "X\nc")
 
@@ -1166,7 +1166,7 @@ test_editor_apply_lsp_edits :: proc(t: ^testing.T) {
         {start_row = 0, start_col = 1, end_row = 0, end_col = 4, new_text = ""},
     }
     editor_apply_lsp_edits(&e3, edits3)
-    text3 := pt_full_text(&e3.table)
+    text3 := pt_full_text(&e3.buffer.table)
     defer delete(text3)
     testing.expect_value(t, text3, "aef")
 
@@ -1177,7 +1177,7 @@ test_editor_apply_lsp_edits :: proc(t: ^testing.T) {
         {start_row = 0, start_col = 1, end_row = 0, end_col = 1, new_text = "\n"},
     }
     editor_apply_lsp_edits(&e4, edits4)
-    text4 := pt_full_text(&e4.table)
+    text4 := pt_full_text(&e4.buffer.table)
     defer delete(text4)
     testing.expect_value(t, text4, "a\nb")
 
@@ -1191,7 +1191,7 @@ test_editor_apply_lsp_edits :: proc(t: ^testing.T) {
         {start_row = 99, start_col = 0, end_row = 99, end_col = 0, new_text = "!"},
     }
     editor_apply_lsp_edits(&e5, edits5)
-    text5 := pt_full_text(&e5.table)
+    text5 := pt_full_text(&e5.buffer.table)
     defer delete(text5)
     testing.expect_value(t, text5, "abc!")
     testing.expect_value(t, e5.cursor.row <= 0, true)
@@ -1211,13 +1211,13 @@ test_editor_undo_grouping_typing_burst :: proc(t: ^testing.T) {
     simulate_typing(&e, "l")
     simulate_typing(&e, "l")
     simulate_typing(&e, "o")
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "hello")
 
     editor_set_mode(&e, .Normal, nil)
     send_key_event(&e, KEY_UNDO)
-    undone := pt_full_text(&e.table)
+    undone := pt_full_text(&e.buffer.table)
     defer delete(undone)
     testing.expect_value(t, undone, "")
     send_key_event(&e, KEY_LINE_START_ZERO)
@@ -1232,7 +1232,7 @@ test_editor_undo_grouping_typing_burst :: proc(t: ^testing.T) {
     editor_set_mode(&e, .Normal, nil)
 
     send_key_event(&e, KEY_UNDO)
-    after_undo := pt_full_text(&e.table)
+    after_undo := pt_full_text(&e.buffer.table)
     defer delete(after_undo)
     testing.expect_value(t, after_undo, "ab")
     fmt.println("  ✓ [Editor] typing bursts group; motions break the group")
@@ -1263,9 +1263,9 @@ test_editor_save_file :: proc(t: ^testing.T) {
     editor_init(&e, nil, "hello\nworld", path)
     defer editor_destroy(&e)
 
-    e.dirty = true
+    e.buffer.dirty = true
     testing.expect_value(t, editor_save_file(&e, nil), true)
-    testing.expect_value(t, e.dirty, false)
+    testing.expect_value(t, e.buffer.dirty, false)
 
     data, err := os.read_entire_file(path, context.temp_allocator)
     testing.expect(t, err == nil)
@@ -1292,7 +1292,7 @@ test_editor_enter_between_braces :: proc(t: ^testing.T) {
     // Press Enter
     editor_handle_insert_key(&e, sdl.K_RETURN, {}, nil, nil)
 
-    t1 := pt_full_text(&e.table)
+    t1 := pt_full_text(&e.buffer.table)
     defer delete(t1)
     testing.expect_value(t, t1, "fn main() {\n    \n}")
     testing.expect_value(t, e.cursor.row, 1)
@@ -1313,7 +1313,7 @@ test_editor_insert_text_at_cursor_multiline :: proc(t: ^testing.T) {
     e.cursor.row = 0
     e.cursor.col = 1
     editor_insert_text_at_cursor(&e, "X\nY\nZ")
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "aX\nY\nZbc\ndef")
     testing.expect_value(t, e.cursor.row, 2)
@@ -1324,7 +1324,7 @@ test_editor_insert_text_at_cursor_multiline :: proc(t: ^testing.T) {
     e.cursor.row = 2
     e.cursor.col = 1
     editor_insert_text_at_cursor(&e, "Q\n")
-    text2 := pt_full_text(&e.table)
+    text2 := pt_full_text(&e.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "aX\nY\nZQ\nbc\ndef")
     testing.expect_value(t, e.cursor.row, 3)
@@ -1335,7 +1335,7 @@ test_editor_insert_text_at_cursor_multiline :: proc(t: ^testing.T) {
     e.cursor.row = 0
     e.cursor.col = 0
     editor_insert_text_at_cursor(&e, "hi")
-    text3 := pt_full_text(&e.table)
+    text3 := pt_full_text(&e.buffer.table)
     defer delete(text3)
     testing.expect_value(t, text3, "hiaX\nY\nZQ\nbc\ndef")
     testing.expect_value(t, e.cursor.row, 0)
@@ -1369,27 +1369,27 @@ test_editor_mutations_schedule_lsp_sync :: proc(t: ^testing.T) {
     e: Editor
     editor_init(&e, nil, "abc\ndef")
     defer editor_destroy(&e)
-    e.dirty = false
-    e.needs_lsp_sync = false
+    e.buffer.dirty = false
+    e.buffer.needs_lsp_sync = false
 
     // Paste/text insertion
     editor_insert_text_at_cursor(&e, "X")
-    testing.expect_value(t, e.dirty, true)
-    testing.expect_value(t, e.needs_lsp_sync, true)
+    testing.expect_value(t, e.buffer.dirty, true)
+    testing.expect_value(t, e.buffer.needs_lsp_sync, true)
 
     // Undo
-    e.dirty = false
-    e.needs_lsp_sync = false
+    e.buffer.dirty = false
+    e.buffer.needs_lsp_sync = false
     send_key_event(&e, KEY_UNDO)
-    testing.expect_value(t, e.dirty, true)
-    testing.expect_value(t, e.needs_lsp_sync, true)
+    testing.expect_value(t, e.buffer.dirty, true)
+    testing.expect_value(t, e.buffer.needs_lsp_sync, true)
 
     // Line moves
-    e.dirty = false
-    e.needs_lsp_sync = false
+    e.buffer.dirty = false
+    e.buffer.needs_lsp_sync = false
     editor_move_lines(&e, 1)
-    testing.expect_value(t, e.dirty, true)
-    testing.expect_value(t, e.needs_lsp_sync, true)
+    testing.expect_value(t, e.buffer.dirty, true)
+    testing.expect_value(t, e.buffer.needs_lsp_sync, true)
     fmt.println("  ✓ [Editor] paste/undo/line-move schedule LSP sync")
 }
 
@@ -1400,13 +1400,13 @@ test_editor_autopair_step_over_stays_clean :: proc(t: ^testing.T) {
     defer editor_destroy(&e)
     editor_set_mode(&e, .Insert, nil)
     e.cursor.col = 1
-    e.dirty = false
-    e.needs_lsp_sync = false
+    e.buffer.dirty = false
+    e.buffer.needs_lsp_sync = false
 
     simulate_typing(&e, ")")
     testing.expect_value(t, e.cursor.col, 2)
-    testing.expect_value(t, e.dirty, false)
-    testing.expect_value(t, e.needs_lsp_sync, false)
+    testing.expect_value(t, e.buffer.dirty, false)
+    testing.expect_value(t, e.buffer.needs_lsp_sync, false)
     fmt.println("  ✓ [Editor] auto-pair step-over does not dirty the buffer")
 }
 
@@ -1433,7 +1433,7 @@ test_editor_dollar_vertical_and_append_eol :: proc(t: ^testing.T) {
     e.desired_col = 3
     send_key_event(&e, KEY_APPEND)
     simulate_typing(&e, "d")
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "abcd")
     fmt.println("  ✓ [Editor] sticky $ and append-at-EOL stay within the line")
@@ -1450,13 +1450,13 @@ test_editor_undo_resnaps_cursor :: proc(t: ^testing.T) {
     editor_set_mode(&e, .Normal, nil)
     send_key_event(&e, KEY_UNDO)
 
-    testing.expect_value(t, pt_get_length(&e.table), 0)
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 0)
     testing.expect_value(t, e.cursor.col, 0)
     testing.expect_value(t, e.desired_col, 0)
 
     editor_set_mode(&e, .Insert, nil)
     simulate_typing(&e, "x")
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "x")
     fmt.println("  ✓ [Editor] undo re-snaps the cursor instead of materializing spaces")
@@ -1479,13 +1479,13 @@ test_editor_completion_is_single_undo_step :: proc(t: ^testing.T) {
     })
 
     editor_apply_completion(&e)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "static")
 
     // Prefix replacement is one pt_replace edit, so one undo restores "sta".
-    testing.expect_value(t, pt_undo(&e.table), true)
-    text2 := pt_full_text(&e.table)
+    testing.expect_value(t, pt_undo(&e.buffer.table), true)
+    text2 := pt_full_text(&e.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "sta")
     fmt.println("  ✓ [Editor] completion replacement is a single undo step")
@@ -1508,7 +1508,7 @@ test_editor_completion_multiline_cursor :: proc(t: ^testing.T) {
     })
 
     editor_apply_completion(&e)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "static\nfn")
     testing.expect_value(t, e.cursor.row, 1)
@@ -1535,7 +1535,7 @@ test_editor_completion_ignores_stale_trigger_row :: proc(t: ^testing.T) {
     })
 
     editor_apply_completion(&e)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "pri\nxyzQ")
     testing.expect_value(t, e.cursor.row, 1)
@@ -1552,7 +1552,7 @@ test_editor_read_only_blocks_line_moves :: proc(t: ^testing.T) {
     e.cursor.row = 0
 
     send_key_event(&e, KEY_MOVE_LINE_DOWN, sdl.KMOD_ALT)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "aa\nbb")
     testing.expect_value(t, e.status_message, "Buffer is read-only")
@@ -1569,7 +1569,7 @@ test_editor_crlf_join_and_line_delete :: proc(t: ^testing.T) {
     e.cursor.row = 0
     e.cursor.col = editor_get_line_len(&e, 0)
     send_key_event(&e, KEY_DELETE_CHAR)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "abcd")
 
@@ -1579,7 +1579,7 @@ test_editor_crlf_join_and_line_delete :: proc(t: ^testing.T) {
     e.cursor.col = 0
     send_key_event(&e, KEY_SELECT_LINE)
     send_key_event(&e, KEY_DELETE_SELECTION)
-    text2 := pt_full_text(&e.table)
+    text2 := pt_full_text(&e.buffer.table)
     defer delete(text2)
     testing.expect_value(t, text2, "aaa")
     fmt.println("  ✓ [Editor] CRLF join and final-line deletion handle both bytes")
@@ -1597,7 +1597,7 @@ test_editor_visual_delete_clamps_virtual_start :: proc(t: ^testing.T) {
     e.desired_col = 5
 
     editor_delete_selection(&e)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "ab")
     fmt.println("  ✓ [Editor] visual delete clamps a virtual start column to its line")
@@ -1622,7 +1622,7 @@ test_editor_unicode_columns_and_motions :: proc(t: ^testing.T) {
     testing.expect_value(t, editor_byte_col_for_visual(&e, 0, 10), 13)
 
     // Combining mark contributes no cell: 12 cells over 17 bytes.
-    total := pt_get_length(&e.table)
+    total := pt_get_length(&e.buffer.table)
     testing.expect_value(t, editor_visual_col(&e, 0, total), 12)
 
     // Right/Left move over whole runes.
@@ -1639,7 +1639,7 @@ test_editor_unicode_columns_and_motions :: proc(t: ^testing.T) {
     e.mode = .Insert
     e.cursor.col = 10
     send_key_event(&e, sdl.K_BACKSPACE)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "héllo 本 é")
     testing.expect_value(t, e.cursor.col, 7)
@@ -1682,12 +1682,12 @@ test_editor_line_move_is_single_undo :: proc(t: ^testing.T) {
 
     e.cursor = Cursor{row = 1, col = 0}
     editor_move_lines(&e, 1)
-    moved := pt_full_text(&e.table)
+    moved := pt_full_text(&e.buffer.table)
     defer delete(moved)
     testing.expect_value(t, moved, "one\nthree\ntwo\n")
 
-    testing.expect_value(t, pt_undo(&e.table), true)
-    restored := pt_full_text(&e.table)
+    testing.expect_value(t, pt_undo(&e.buffer.table), true)
+    restored := pt_full_text(&e.buffer.table)
     defer delete(restored)
     testing.expect_value(t, restored, "one\ntwo\nthree\n")
     fmt.println("  ✓ [Editor] Alt+J/K line move is one undo step")
@@ -1704,12 +1704,12 @@ test_editor_multi_lsp_edit_is_single_undo :: proc(t: ^testing.T) {
         {start_row = 2, start_col = 0, end_row = 2, end_col = 3, new_text = "CCC"},
     }
     editor_apply_lsp_edits(&e, edits)
-    changed := pt_full_text(&e.table)
+    changed := pt_full_text(&e.buffer.table)
     defer delete(changed)
     testing.expect_value(t, changed, "AAA\nbbb\nCCC")
 
-    testing.expect_value(t, pt_undo(&e.table), true)
-    restored := pt_full_text(&e.table)
+    testing.expect_value(t, pt_undo(&e.buffer.table), true)
+    restored := pt_full_text(&e.buffer.table)
     defer delete(restored)
     testing.expect_value(t, restored, "aaa\nbbb\nccc")
     fmt.println("  ✓ [Editor] multi-edit LSP formatting is one undo step")
@@ -1720,13 +1720,13 @@ test_editor_crlf_insertions_and_save :: proc(t: ^testing.T) {
     e: Editor
     editor_init(&e, nil, "a\r\nb", "crlf.txt")
     defer editor_destroy(&e)
-    testing.expect_value(t, e.line_ending, Line_Ending.CRLF)
+    testing.expect_value(t, e.buffer.line_ending, Line_Ending.CRLF)
 
     e.mode = .Insert
     e.cursor = Cursor{row = 0, col = 1}
     e.desired_col = 1
     send_key_event(&e, sdl.K_RETURN)
-    text := pt_full_text(&e.table)
+    text := pt_full_text(&e.buffer.table)
     defer delete(text)
     testing.expect_value(t, text, "a\r\n\r\nb")
 
@@ -1734,7 +1734,7 @@ test_editor_crlf_insertions_and_save :: proc(t: ^testing.T) {
     e.mode = .Normal
     e.cursor = Cursor{row = 0, col = 0}
     send_key_event(&e, KEY_OPEN_BELOW)
-    opened := pt_full_text(&e.table)
+    opened := pt_full_text(&e.buffer.table)
     defer delete(opened)
     testing.expect(t, strings.has_prefix(opened, "a\r\n\r\n"), opened)
 
@@ -1745,7 +1745,7 @@ test_editor_crlf_insertions_and_save :: proc(t: ^testing.T) {
     // LSP edits and pasted text are normalized as well.
     edits := []LspTextEdit{{start_row = 0, start_col = 0, end_row = 0, end_col = 1, new_text = "Q\nR"}}
     editor_apply_lsp_edits(&e, edits)
-    edited := pt_full_text(&e.table)
+    edited := pt_full_text(&e.buffer.table)
     defer delete(edited)
     testing.expect(t, strings.contains(edited, "Q\r\nR"))
     for i in 0 ..< len(edited) {
@@ -1758,8 +1758,8 @@ test_editor_crlf_insertions_and_save :: proc(t: ^testing.T) {
     path := "/tmp/odin_editor_tests/crlf_save.txt"
     _ = os.remove(path)
     defer os.remove(path)
-    if e.file_path != "" do delete(e.file_path)
-    e.file_path = strings.clone(path, context.allocator)
+    if e.buffer.file_path != "" do delete(e.buffer.file_path)
+    e.buffer.file_path = strings.clone(path, context.allocator)
     testing.expect_value(t, editor_save_file(&e), true)
     data, read_err := os.read_entire_file(path, context.temp_allocator)
     testing.expect_value(t, read_err, nil)

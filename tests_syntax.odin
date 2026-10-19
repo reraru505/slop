@@ -514,7 +514,7 @@ test_editor_syntax_state_cache_invalidation :: proc(t: ^testing.T) {
     testing.expect_value(t, final_state.kind, Syntax_State_Kind.Normal)
 
     // Removing the opening delimiter on line 0 must invalidate lines below.
-    pt_replace(&e.table, 0, 2, "")
+    pt_replace(&e.buffer.table, 0, 2, "")
     editor_invalidate_syntax(&e, 0)
     changed := editor_ensure_syntax_state(&e, 1, &th)
     testing.expect_value(t, changed.kind, Syntax_State_Kind.Normal)

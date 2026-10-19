@@ -61,11 +61,11 @@ editor_rune_at :: proc(e: ^Editor, row, byte_col: int) -> (r: rune, size: int) {
     col := clamp(byte_col, 0, line_len)
     if col >= line_len do return utf8.RUNE_ERROR, 0
 
-    start := pt_line_to_offset(&e.table, row)
+    start := pt_line_to_offset(&e.buffer.table, row)
     buf: [4]u8
     n := min(len(buf), line_len - col)
     for i in 0 ..< n {
-        buf[i] = pt_byte_at(&e.table, start + col + i)
+        buf[i] = pt_byte_at(&e.buffer.table, start + col + i)
     }
     r, size = utf8.decode_rune(buf[:n])
     if size <= 0 do size = 1
@@ -77,8 +77,8 @@ editor_prev_rune_start :: proc(e: ^Editor, row, byte_col: int) -> int {
     i := clamp(byte_col, 0, line_len)
     if i == 0 do return 0
     i -= 1
-    start := pt_line_to_offset(&e.table, row)
-    for i > 0 && !utf8.rune_start(pt_byte_at(&e.table, start + i)) {
+    start := pt_line_to_offset(&e.buffer.table, row)
+    for i > 0 && !utf8.rune_start(pt_byte_at(&e.buffer.table, start + i)) {
         i -= 1
     }
     return i
@@ -96,8 +96,8 @@ editor_next_rune_end :: proc(e: ^Editor, row, byte_col: int) -> int {
 editor_clamp_col_to_rune :: proc(e: ^Editor, row, byte_col: int) -> int {
     line_len := editor_get_line_len(e, row)
     col := clamp(byte_col, 0, line_len)
-    start := pt_line_to_offset(&e.table, row)
-    for col > 0 && col < line_len && !utf8.rune_start(pt_byte_at(&e.table, start + col)) {
+    start := pt_line_to_offset(&e.buffer.table, row)
+    for col > 0 && col < line_len && !utf8.rune_start(pt_byte_at(&e.buffer.table, start + col)) {
         col -= 1
     }
     return col

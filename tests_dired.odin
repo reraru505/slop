@@ -179,7 +179,7 @@ test_dired_enter_edit_mode_listing :: proc(t: ^testing.T) {
     testing.expect_value(t, d.is_editing, true)
     testing.expect_value(t, e.mode, EditorMode.Insert)
 
-    listing := pt_full_text(&e.table)
+    listing := pt_full_text(&e.buffer.table)
     defer delete(listing)
     testing.expect_value(t, listing, "mid/\nalpha.txt\nzeta.txt\n")
     fmt.println("  ✓ [Dired] edit mode renders dirs with '/' and enters Insert")
