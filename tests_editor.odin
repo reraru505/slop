@@ -216,26 +216,28 @@ test_command_prompt_completion :: proc(t: ^testing.T) {
         delete(app.cmd_prompt.buffer)
     }
 
-    // Test 1: Complete "w" -> matches "w", "wq"
+    // Test 1: Complete "w" -> matches "w", "wa", "wq", "wqa"
     clear(&app.cmd_prompt.buffer)
     append(&app.cmd_prompt.buffer, 'w')
     app_command_prompt_tab(&app, reverse = false)
 
     testing.expect_value(t, app.cmd_prompt.in_completion, true)
-    testing.expect_value(t, len(app.cmd_prompt.matches), 2)
+    testing.expect_value(t, len(app.cmd_prompt.matches), 4)
     testing.expect_value(t, string(app.cmd_prompt.buffer[:]), "w")
 
-    // Tab again -> cycles to "wq"
+    // Tab cycles through the write commands and wraps back to "w"
+    app_command_prompt_tab(&app, reverse = false)
+    testing.expect_value(t, string(app.cmd_prompt.buffer[:]), "wa")
     app_command_prompt_tab(&app, reverse = false)
     testing.expect_value(t, string(app.cmd_prompt.buffer[:]), "wq")
-
-    // Tab again -> wraps back to "w"
+    app_command_prompt_tab(&app, reverse = false)
+    testing.expect_value(t, string(app.cmd_prompt.buffer[:]), "wqa")
     app_command_prompt_tab(&app, reverse = false)
     testing.expect_value(t, string(app.cmd_prompt.buffer[:]), "w")
 
-    // Shift-Tab -> cycles backwards to "wq"
+    // Shift-Tab -> cycles backwards to "wqa"
     app_command_prompt_tab(&app, reverse = true)
-    testing.expect_value(t, string(app.cmd_prompt.buffer[:]), "wq")
+    testing.expect_value(t, string(app.cmd_prompt.buffer[:]), "wqa")
 
     // Test 2: Reset completion
     app_reset_command_completion(&app.cmd_prompt)

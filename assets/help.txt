@@ -53,6 +53,7 @@ LSP (when a language server is available)
 
 COMMANDS  (type '{cmd_prompt}' in Normal mode)
   :w  :q  :wq  :x       write / quit / write and quit
+  :wa  :wqa             write all changed buffers / write all and quit
   :q!  :qa  :qa!        force-close buffer / quit all / force quit all
   :<n>  :goto <n>       jump to line n
   :e[!] <path>          edit a file or directory (:e! discards changes)

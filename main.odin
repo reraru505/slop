@@ -352,7 +352,7 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
         } else {
             // 2. Completing base command
             ALL_COMMANDS := []string{
-                "w", "wq", "q", "qa", "q!", "x",
+                "w", "wa", "wq", "wqa", "q", "qa", "q!", "x",
                 "split", "sp", "vsplit", "vs",
                 "dired", "edit", "e",
                 "compile", "recompile", "make",
@@ -574,6 +574,59 @@ app_run_compile :: proc(app: ^App, cmd_str: string) {
     app_set_message(app, fmt.tprintf("Compilation: %s", comp_pane.compilation.status))
 }
 
+// Write every modified, named editor buffer. Shared split views are written
+// once, and wdired listings in progress are applied first. Returns false when
+// any write failed, in which case the caller must not quit.
+app_write_all :: proc(app: ^App) -> bool {
+    if app == nil do return false
+
+    written := 0
+    seen: [dynamic]^Buffer
+    defer delete(seen)
+
+    for p in app.panes {
+        if p == nil do continue
+        if p.kind == .Dired && p.dired.is_editing {
+            msg := dired_apply_edits(&p.dired, &p.editor)
+            _ = sdl.StopTextInput(app.window)
+            if !p.dired.apply_ok {
+                app_set_message(app, msg)
+                return false
+            }
+            written += 1
+            continue
+        }
+        if p.kind != .Editor do continue
+        e := &p.editor
+        b := e.buffer
+        if b == nil || b.file_path == "" || !b.dirty do continue
+        if e.read_only do continue
+
+        already := false
+        for existing in seen {
+            if existing == b {
+                already = true
+                break
+            }
+        }
+        if already do continue
+        append(&seen, b)
+
+        if !editor_save_file(e, app) {
+            app_set_message(app, fmt.tprintf("Failed to write %s", b.file_path))
+            return false
+        }
+        written += 1
+    }
+
+    if written == 0 {
+        app_set_message(app, "No modified buffers to write")
+    } else {
+        app_set_message(app, fmt.tprintf("%d buffer(s) written", written))
+    }
+    return true
+}
+
 app_execute_command :: proc(app: ^App, raw_cmd: string) {
     cmd := strings.trim_space(raw_cmd)
     if cmd == "" do return
@@ -597,6 +650,8 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                 app_set_message(app, "Cannot write non-file buffer")
             }
         }
+    } else if cmd == "wa" || cmd == "wall" {
+        _ = app_write_all(app)
     } else if cmd == "q" {
         if app.active_pane != nil && app.active_pane.kind == .Dired && app.active_pane.dired.is_editing {
             app.active_pane.dired.is_editing = false
@@ -626,6 +681,10 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
                     app_set_message(app, "E32: No file name")
                 }
             }
+        }
+    } else if cmd == "wqa" || cmd == "wqall" || cmd == "xa" {
+        if app_write_all(app) && !app_has_unsaved_changes(app) {
+            app.running = false
         }
     } else if strings.has_prefix(cmd, "sort ") || cmd == "sort" {
         sub := strings.trim_space(cmd[4:] if strings.has_prefix(cmd, "sort ") else "")

@@ -740,3 +740,76 @@ test_app_wq_wdired_applies_and_closes :: proc(t: ^testing.T) {
 
     fmt.println("  ✓ [App] :wq/:x applies wdired then closes; failures stay open")
 }
+
+@(test)
+test_app_write_all_and_wqa :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/write_all"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+
+    a := fmt.tprintf("%s/a.txt", dir)
+    b := fmt.tprintf("%s/b.txt", dir)
+    testing.expect(t, os.write_entire_file_from_string(a, "aaa") == nil)
+    testing.expect(t, os.write_entire_file_from_string(b, "bbb") == nil)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    first := app.active_pane
+    testing.expect_value(t, app_pane_open_file(&app, first, a), true)
+    app_split_pane(&app, first, .Vertical)
+    second := app.active_pane
+    testing.expect_value(t, app_pane_open_file(&app, second, b), true)
+
+    set_editor_text(&first.editor, "alpha")
+    first.editor.buffer.dirty = true
+    set_editor_text(&second.editor, "beta")
+    second.editor.buffer.dirty = true
+
+    // :wa writes every changed file and leaves the app running.
+    app.running = true
+    app_execute_command(&app, "wa")
+    testing.expect_value(t, app.running, true)
+    testing.expect_value(t, first.editor.buffer.dirty, false)
+    testing.expect_value(t, second.editor.buffer.dirty, false)
+    testing.expect_value(t, app.cmd_prompt.message, "2 buffer(s) written")
+
+    on_disk_a, _ := os.read_entire_file(a, context.temp_allocator)
+    on_disk_b, _ := os.read_entire_file(b, context.temp_allocator)
+    testing.expect_value(t, string(on_disk_a), "alpha")
+    testing.expect_value(t, string(on_disk_b), "beta")
+
+    // A second :wa has nothing left to write.
+    app_execute_command(&app, "wa")
+    testing.expect_value(t, app.cmd_prompt.message, "No modified buffers to write")
+
+    // :wqa writes all changes before quitting.
+    set_editor_text(&first.editor, "alpha2")
+    first.editor.buffer.dirty = true
+    set_editor_text(&second.editor, "beta2")
+    second.editor.buffer.dirty = true
+    app.running = true
+    app_execute_command(&app, "wqa")
+    testing.expect_value(t, app.running, false)
+    on_disk_a, _ = os.read_entire_file(a, context.temp_allocator)
+    on_disk_b, _ = os.read_entire_file(b, context.temp_allocator)
+    testing.expect_value(t, string(on_disk_a), "alpha2")
+    testing.expect_value(t, string(on_disk_b), "beta2")
+    fmt.println("  ✓ [App] :wa/:wqa write all changed buffers before quitting")
+}
+
+@(test)
+test_app_wqa_blocks_on_unnamed_dirty_buffer :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    set_editor_text(&app.active_pane.editor, "scratch")
+    app.active_pane.editor.buffer.dirty = true
+    app.running = true
+
+    app_execute_command(&app, "wqa")
+    testing.expect_value(t, app.running, true)
+    testing.expect_value(t, app.active_pane.editor.buffer.dirty, true)
+    fmt.println("  ✓ [App] :wqa refuses to quit with an unwritable dirty buffer")
+}
