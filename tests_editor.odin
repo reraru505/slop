@@ -1772,3 +1772,54 @@ test_editor_crlf_insertions_and_save :: proc(t: ^testing.T) {
     }
     fmt.println("  ✓ [Editor] CRLF buffers insert, normalize, and save CRLF only")
 }
+
+@(test)
+test_insert_escape_steps_cursor_left :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "héllo\nx\n")
+    defer editor_destroy(&e)
+
+    // Insert cursor at a character boundary: Esc lands on the previous rune.
+    editor_set_mode(&e, .Insert, nil)
+    e.cursor.row = 0
+    e.cursor.col = 3 // before the first 'l'; é occupies bytes 1..2
+    send_key_event(&e, sdl.K_ESCAPE)
+    testing.expect_value(t, e.mode, EditorMode.Normal)
+    testing.expect_value(t, e.cursor.col, 1)
+
+    // At end of line the cursor lands on the last rune, not past it.
+    editor_set_mode(&e, .Insert, nil)
+    e.cursor.col = 6
+    send_key_event(&e, sdl.K_ESCAPE)
+    testing.expect_value(t, e.cursor.col, 5)
+
+    // Column 0 has nowhere to step back to.
+    editor_set_mode(&e, .Insert, nil)
+    e.cursor.col = 0
+    send_key_event(&e, sdl.K_ESCAPE)
+    testing.expect_value(t, e.cursor.col, 0)
+
+    // Esc on a single-character line lands at column 0.
+    editor_set_mode(&e, .Insert, nil)
+    e.cursor.row = 1
+    e.cursor.col = 1
+    send_key_event(&e, sdl.K_ESCAPE)
+    testing.expect_value(t, e.cursor.row, 1)
+    testing.expect_value(t, e.cursor.col, 0)
+
+    // Entering Insert from Normal does not move; 'a' steps over one rune.
+    e.cursor.row = 0
+    e.cursor.col = 2
+    send_key_event(&e, sdl.K_ESCAPE)
+    testing.expect_value(t, e.mode, EditorMode.Insert)
+    testing.expect_value(t, e.cursor.col, 2)
+
+    editor_set_mode(&e, .Normal, nil)
+    e.cursor.col = 1
+    e.desired_col = 1
+    send_key_event(&e, KEY_APPEND)
+    testing.expect_value(t, e.mode, EditorMode.Insert)
+    testing.expect_value(t, e.cursor.col, 3)
+
+    fmt.println("  ✓ [Editor] Insert→Normal Escape steps back one rune; Normal→Insert does not")
+}

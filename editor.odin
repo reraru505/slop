@@ -532,6 +532,15 @@ editor_scroll_to_cursor :: proc(e: ^Editor, visible_lines: int, visible_cols: in
 
 editor_set_mode :: proc(e: ^Editor, new_mode: EditorMode, window: ^sdl.Window) {
     break_undo_group(&e.buffer.table)
+
+    // Vim/Neovim leaves Insert mode by stepping the block cursor back onto the
+    // character before the insertion point. Column 0 stays put, and Esc on an
+    // empty line does not move.
+    if e.mode == .Insert && new_mode == .Normal && e.cursor.col > 0 {
+        e.cursor.col = editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
+        e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
+    }
+
     e.mode = new_mode
     e.last_action = time.now()
     e.pending_cmd = 0
