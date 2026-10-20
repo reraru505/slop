@@ -193,6 +193,9 @@ help_token_value :: proc(name: string) -> (string, bool) {
     case "scope_down":            return key_label(KEY_SCOPE_DOWN, ctrl, .Plain), true
     case "scope_up":              return key_label(KEY_SCOPE_UP, ctrl, .Plain), true
     case "hover":                 return key_label(KEY_HOVER, shift, .Shift_Letter), true
+    case "search":                return key_label(KEY_SEARCH, {}, .Plain), true
+    case "search_next":           return key_label(KEY_SEARCH_NEXT, {}, .Plain), true
+    case "search_prev":           return key_label(KEY_SEARCH_PREV, shift, .Shift_Letter), true
     case "format_line":           return help_sequence2(KEY_FORMAT_LINE, KEY_FORMAT_LINE), true
     case "format_selection":      return key_label(KEY_FORMAT_SELECTION, {}, .Plain), true
     case "delete_char":           return key_label(KEY_DELETE_CHAR, {}, .Plain), true

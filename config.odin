@@ -157,6 +157,9 @@ KEY_VISUAL_TOGGLE      :: sdl.K_X        // Ctrl+X
 KEY_FORMAT_LINE        :: sdl.K_EQUALS   // ==
 KEY_FORMAT_SELECTION   :: sdl.K_EQUALS   // = in Visual mode
 KEY_HOVER              :: sdl.K_K        // Shift+K
+KEY_SEARCH             :: sdl.K_SLASH    // / (search forward)
+KEY_SEARCH_NEXT        :: sdl.K_N        // n
+KEY_SEARCH_PREV        :: sdl.K_N        // Shift+N
 KEY_SELECT_LINE        :: sdl.K_X        // X
 
 KEY_DELETE_CHAR        :: sdl.K_D        // d in Normal mode

@@ -39,6 +39,10 @@ EDITING
   ( [ { ' " .... auto-pair; typing the closing character steps over it
   Backspace .... removes an empty pair; at column 0 it joins with above
 
+SEARCH
+  {search}<pattern> .... search forward (Enter runs it, Esc restores the cursor)
+  {search_next} / {search_prev} ......... next / previous match (wraps around)
+
 LSP (when a language server is available)
   {completion_trigger} ... trigger completion
   Tab/Shift+Tab  cycle completion items

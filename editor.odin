@@ -1763,6 +1763,20 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
 
+    // '/' opens the search prompt; n / N repeat the last search.
+    if key == KEY_SEARCH {
+        app_open_search_prompt(app)
+        return true
+    }
+    if key == KEY_SEARCH_NEXT || key == KEY_SEARCH_PREV {
+        reverse := is_shift
+        if KEY_SEARCH_NEXT != KEY_SEARCH_PREV {
+            reverse = key == KEY_SEARCH_PREV
+        }
+        app_search_repeat(app, reverse)
+        return true
+    }
+
     // ESC = Insert / Normal toggle
     if key == sdl.K_ESCAPE {
         if e.mode == .Visual {
@@ -2215,6 +2229,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                 key == KEY_GOTO || key == KEY_FILE_END || key == KEY_HOVER ||
                 key == KEY_WORD_FORWARD || key == KEY_WORD_BACKWARD ||
                 key == KEY_SCOPE_DOWN || key == KEY_SCOPE_UP ||
+                key == KEY_SEARCH || key == KEY_SEARCH_NEXT || key == KEY_SEARCH_PREV ||
                 key == KEY_CMD_PROMPT || key == KEY_CMD_PROMPT_ALT
             if !allowed {
                 e.pending_cmd = 0
@@ -2293,7 +2308,16 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
     return false
 }
 
-editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme, lsp: ^LspClient = nil) {
+editor_render :: proc(
+    e: ^Editor,
+    renderer: ^sdl.Renderer,
+    font: ^Font,
+    rect: sdl.FRect,
+    is_focused: bool,
+    theme: ^Theme,
+    lsp: ^LspClient = nil,
+    search_pattern := "",
+) {
     if rect.w < 50 || rect.h < 50 do return
 
     scale := get_font_scale_multiplier(e.font_scale)
@@ -2414,6 +2438,42 @@ editor_render :: proc(e: ^Editor, renderer: ^sdl.Renderer, font: ^Font, rect: sd
                 }
                 sdl.SetRenderDrawColorFloat(renderer, theme.selection_bg.r, theme.selection_bg.g, theme.selection_bg.b, theme.selection_bg.a)
                 sdl.RenderFillRect(renderer, &sel_rect)
+            }
+        }
+    }
+
+    // Search matches: a translucent band behind every visible occurrence.
+    // Text is batched and flushed after this, so these land behind the glyphs.
+    if search_pattern != "" {
+        sdl.SetRenderDrawColorFloat(renderer, 0.95, 0.78, 0.25, 0.35)
+        for i in 0 ..< visible_lines {
+            line_idx := e.scroll_row + i
+            if line_idx >= total_lines do break
+            line_str, ok := pt_line_text(&e.buffer.table, line_idx, context.temp_allocator)
+            if !ok do continue
+
+            from := 0
+            for from < len(line_str) {
+                idx := strings.index(line_str[from:], search_pattern)
+                if idx < 0 do break
+                abs := from + idx
+                from = abs + 1
+
+                vis_st := editor_visual_col(e, line_idx, abs)
+                vis_en := editor_visual_col(e, line_idx, min(len(line_str), abs + len(search_pattern)))
+                if vis_en <= vis_st do vis_en = vis_st + 1
+
+                x0 := max(0, vis_st - e.scroll_col)
+                x1 := min(visible_cols, vis_en - e.scroll_col)
+                if x1 <= x0 do continue
+
+                match_rect := sdl.FRect{
+                    x = rect.x + gutter_w + 4.0 + f32(x0) * char_w,
+                    y = rect.y + f32(i) * line_h,
+                    w = f32(x1 - x0) * char_w,
+                    h = line_h,
+                }
+                sdl.RenderFillRect(renderer, &match_rect)
             }
         }
     }

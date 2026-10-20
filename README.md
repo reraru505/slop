@@ -14,6 +14,7 @@ slop is an ultimate AI assisted config of neovim, somehow turned into a standalo
 - Character, line, and selection editing: delete, change, yank, paste.
 - Line and selection moves with `Alt+J` / `Alt+K`.
 - Auto-pairing for brackets and quotes, smart Enter indentation, four-space Tab.
+- Forward search with `/pattern`, `n` / `N` to repeat, wraparound, and highlighted matches.
 - Undo/redo with typing coalescing and explicit transactions, so compound edits undo as one step.
 - Rune-aware cursor movement and selection: wide characters, combining marks, and emoji do not split.
 - CRLF files stay CRLF on every edit path.

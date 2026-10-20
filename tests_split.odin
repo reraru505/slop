@@ -34,6 +34,7 @@ destroy_test_app :: proc(app: ^App) {
     if app.working_dir != "" do delete(app.working_dir)
     if app.root_dir != "" do delete(app.root_dir)
     if app.last_compile_cmd != "" do delete(app.last_compile_cmd)
+    if app.last_search != "" do delete(app.last_search)
 }
 
 @(test)

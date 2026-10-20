@@ -12,14 +12,26 @@ import sdl "vendor:sdl3"
 
 TARGET :: 16_660 * time.Microsecond
 
+CommandPromptKind :: enum {
+    Command,
+    Search,
+}
+
 CommandPrompt :: struct {
-    active        : bool,
-    buffer        : [dynamic]u8,
-    message       : string,
-    message_buf   : [512]u8,
-    matches       : [dynamic]string,
-    match_index   : int,
-    in_completion : bool,
+    active           : bool,
+    kind             : CommandPromptKind,
+    buffer           : [dynamic]u8,
+    message          : string,
+    message_buf      : [512]u8,
+    matches          : [dynamic]string,
+    match_index      : int,
+    in_completion    : bool,
+    // Search prompt origin, restored when the prompt is cancelled.
+    source_pane      : ^Pane,
+    origin_row       : int,
+    origin_col       : int,
+    origin_scroll_row: int,
+    origin_scroll_col: int,
 }
 
 app_reset_command_completion :: proc(prompt: ^CommandPrompt) {
@@ -73,6 +85,9 @@ App :: struct {
     root_dir         : string,
     file_picker      : FilePicker,
     last_compile_cmd : string,
+    // Last `/` pattern and the direction `n` continues in (+1 / -1).
+    last_search      : string,
+    search_direction : int,
     current_theme_id : ThemeId,
     theme            : Theme,
     running          : bool,
@@ -142,19 +157,60 @@ app_get_active_lsp :: proc(app: ^App) -> ^LspClient {
 
 app_open_command_prompt :: proc(app: ^App) {
     app.cmd_prompt.active = true
+    app.cmd_prompt.kind = .Command
+    app.cmd_prompt.source_pane = nil
     clear(&app.cmd_prompt.buffer)
     app_reset_command_completion(&app.cmd_prompt)
     app.cmd_prompt.message = ""
-    _ = sdl.StartTextInput(app.window) 
+    _ = sdl.StartTextInput(app.window)
+}
+
+// Opens the `/` prompt over the active editor pane and remembers where the
+// search started so Esc can restore it.
+app_open_search_prompt :: proc(app: ^App) {
+    if app == nil do return
+    p := app_search_pane(app)
+    if p == nil {
+        app_set_message(app, "Search is only available in editor buffers")
+        return
+    }
+
+    cp := &app.cmd_prompt
+    cp.active = true
+    cp.kind = .Search
+    cp.source_pane = p
+    cp.origin_row = p.editor.cursor.row
+    cp.origin_col = p.editor.cursor.col
+    cp.origin_scroll_row = p.editor.scroll_row
+    cp.origin_scroll_col = p.editor.scroll_col
+    clear(&cp.buffer)
+    app_reset_command_completion(cp)
+    cp.message = ""
+    _ = sdl.StartTextInput(app.window)
 }
 
 app_close_command_prompt :: proc(app: ^App) {
     app.cmd_prompt.active = false
+    app.cmd_prompt.kind = .Command
+    app.cmd_prompt.source_pane = nil
     clear(&app.cmd_prompt.buffer)
     app_reset_command_completion(&app.cmd_prompt)
     if app.active_pane == nil || app.active_pane.kind != .Editor || app.active_pane.editor.mode != .Insert {
         _ = sdl.StopTextInput(app.window)
     }
+}
+
+// Enter in the bottom prompt. Search needs its buffer before the prompt is
+// cleared; commands keep their existing dispatch path.
+app_submit_prompt :: proc(app: ^App) {
+    if app == nil do return
+    if app.cmd_prompt.kind == .Search {
+        app_submit_search(app)
+        return
+    }
+    cmd := string(app.cmd_prompt.buffer[:])
+    app_close_command_prompt(app)
+    app_execute_command(app, cmd)
 }
 
 completion_has :: proc(matches: ^[dynamic]string, candidate: string) -> bool {
@@ -1176,10 +1232,16 @@ update :: proc(app: ^App) {
             if app.cmd_prompt.active {
                 switch key {
                 case sdl.K_ESCAPE:
-                    app_close_command_prompt(app)
+                    if app.cmd_prompt.kind == .Search {
+                        app_cancel_search_prompt(app)
+                    } else {
+                        app_close_command_prompt(app)
+                    }
                 case sdl.K_TAB:
-                    is_shift := (mod & sdl.KMOD_SHIFT) != {}
-                    app_command_prompt_tab(app, reverse = is_shift)
+                    if app.cmd_prompt.kind == .Command {
+                        is_shift := (mod & sdl.KMOD_SHIFT) != {}
+                        app_command_prompt_tab(app, reverse = is_shift)
+                    }
                 case sdl.K_BACKSPACE:
                     if app.cmd_prompt.in_completion {
                         app_reset_command_completion(&app.cmd_prompt)
@@ -1191,13 +1253,11 @@ update :: proc(app: ^App) {
                             (app.cmd_prompt.buffer[len(app.cmd_prompt.buffer) - 1] & 0xC0) == 0x80 {
                             pop(&app.cmd_prompt.buffer)
                         }
-                    } else {
+                    } else if app.cmd_prompt.kind == .Command {
                         app_close_command_prompt(app)
                     }
                 case sdl.K_RETURN, sdl.K_KP_ENTER:
-                    cmd := string(app.cmd_prompt.buffer[:])
-                    app_close_command_prompt(app)
-                    app_execute_command(app, cmd)
+                    app_submit_prompt(app)
                 }
                 continue
             }
@@ -1428,11 +1488,11 @@ draw :: proc(app: ^App) {
         switch p.kind {
         case .Editor:
             editor_sync_view(&p.editor)
-            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path))
+            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app.last_search)
         case .Dired:
             if p.dired.is_editing {
                 editor_sync_view(&p.editor)
-                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path))
+                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app.last_search)
             } else {
                 dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused, &app.theme)
             }
@@ -1483,7 +1543,8 @@ draw :: proc(app: ^App) {
     sdl.RenderFillRect(app.renderer, &div_rect)
 
     if app.cmd_prompt.active {
-        cmd_str := fmt.tprintf(":%s", string(app.cmd_prompt.buffer[:]))
+        prefix := "/" if app.cmd_prompt.kind == .Search else ":"
+        cmd_str := fmt.tprintf("%s%s", prefix, string(app.cmd_prompt.buffer[:]))
         push_line(&app.font, cmd_str, Vec2{10.0, main_area_h + 3.0}, app.theme.keyword, .HALF)
 
         // Command cursor
@@ -1539,10 +1600,12 @@ draw :: proc(app: ^App) {
            .HALF ,
          )
     } else if app.cmd_prompt.message != "" {
-        msg_color := sdl.FColor{0.9, 0.45, 0.45, 1.0} if 
-        strings.has_prefix(app.cmd_prompt.message, "Unknown") || 
-        strings.has_prefix(app.cmd_prompt.message, "Cannot") || 
-        strings.has_prefix(app.cmd_prompt.message, "E32") else 
+        msg_color := sdl.FColor{0.9, 0.45, 0.45, 1.0} if
+        strings.has_prefix(app.cmd_prompt.message, "Unknown") ||
+        strings.has_prefix(app.cmd_prompt.message, "Cannot") ||
+        strings.has_prefix(app.cmd_prompt.message, "E32") ||
+        strings.has_prefix(app.cmd_prompt.message, "E35") ||
+        strings.has_prefix(app.cmd_prompt.message, "E486") else
         sdl.FColor{0.6, 0.85, 0.6, 1.0}
 
         push_line(&app.font, app.cmd_prompt.message, Vec2{10.0, main_area_h + 3.0}, msg_color, .HALF)
@@ -1584,6 +1647,10 @@ cleanup :: proc(app: ^App) {
     if app.last_compile_cmd != "" {
         delete(app.last_compile_cmd)
         app.last_compile_cmd = ""
+    }
+    if app.last_search != "" {
+        delete(app.last_search)
+        app.last_search = ""
     }
 
     font_destroy(&app.font)
