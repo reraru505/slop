@@ -402,3 +402,59 @@ test_dired_async_load_and_stale_results :: proc(t: ^testing.T) {
     testing.expect_value(t, found_two, true)
     fmt.println("  ✓ [Dired] async loads apply the latest generation only")
 }
+
+@(test)
+test_dired_selection_and_copy_text :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/dired_selection"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+    for name in ([]string{"a.txt", "b.txt", "c.txt"}) {
+        testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/%s", dir, name), "x") == nil)
+    }
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+    app_pane_open_dired(&app, pane, dir)
+    dired_wait_load(&pane.dired)
+    d := &pane.dired
+
+    a_idx := -1
+    for entry, i in d.entries {
+        if entry.name == "a.txt" do a_idx = i
+    }
+    testing.expect(t, a_idx >= 0)
+    d.cursor = a_idx
+
+    ev: sdl.Event
+    ev.type = .KEY_DOWN
+    ev.key.key = KEY_DIRED_VISUAL
+    ev.key.mod = sdl.KMOD_CTRL
+    dired_handle_event(d, &ev, &app, pane)
+    testing.expect_value(t, d.selecting, true)
+    testing.expect_value(t, d.anchor, a_idx)
+
+    ev.key.mod = {}
+    ev.key.key = KEY_DIRED_DOWN
+    dired_handle_event(d, &ev, &app, pane)
+    dired_handle_event(d, &ev, &app, pane)
+    testing.expect_value(t, d.cursor, a_idx + 2)
+    testing.expect_value(t, d.selecting, true)
+
+    text, count := dired_selected_text(d, false)
+    testing.expect_value(t, count, 3)
+    testing.expect_value(t, text, "a.txt\nb.txt\nc.txt\n")
+
+    // Esc clears the selection instead of entering wdired mode.
+    ev.key.key = sdl.K_ESCAPE
+    dired_handle_event(d, &ev, &app, pane)
+    testing.expect_value(t, d.selecting, false)
+    testing.expect_value(t, d.is_editing, false)
+
+    // Copy-all covers every entry, including "..".
+    _, all_count := dired_selected_text(d, true)
+    testing.expect_value(t, all_count, len(d.entries))
+
+    fmt.println("  ✓ [Dired] Ctrl+X selection, Esc clear, and linewise copy text verified")
+}

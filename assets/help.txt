@@ -90,7 +90,9 @@ DIRED  (directory browser)
   Enter or {dired_open} ........... open a file or enter a directory
   {dired_parent} or {dired_parent_alt} ............... go to the parent directory
   {dired_edit} or Esc ............. edit the listing (wdired)
-                         :w applies, :wq/:x applies and closes, :q cancels
+  wdired commands ................. :w applies, :wq/:x closes, :q cancels
+  {dired_visual} ................... select entries (Esc clears)
+  {dired_yank} / {dired_yank_alt} / {dired_yank_all} ..... copy selection / all entries
   {dired_sort} / {dired_sort_reverse} ................ cycle sort order / reverse it
   {dired_quit} .................... return to the previous buffer or close the pane
 

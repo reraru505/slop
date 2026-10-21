@@ -38,6 +38,9 @@ Dired :: struct {
     sort_by      : DiredSortBy,
     sort_order   : DiredSortOrder,
     is_editing   : bool,
+    // Linewise selection over entries (Ctrl+X), copy with y / Alt+W.
+    selecting    : bool,
+    anchor       : int,
     orig_entries : [dynamic]DiredEntry,
     // Async listing state; the worker never references the Dired itself.
     job          : ^Dired_Load_Job,
@@ -76,6 +79,8 @@ dired_init :: proc(d: ^Dired) {
     d.sort_by = .Name
     d.sort_order = .Asc
     d.is_editing = false
+    d.selecting = false
+    d.anchor = 0
     d.job = nil
     d.generation = 0
     d.loading = false
@@ -255,6 +260,8 @@ dired_install_entries :: proc(d: ^Dired, entries: [dynamic]DiredEntry, abs_path:
     for orig in d.orig_entries do delete(orig.name, context.allocator)
     clear(&d.orig_entries)
     d.is_editing = false
+    d.selecting = false
+    d.anchor = 0
 
     d.cursor = 0
     d.scroll = 0
@@ -335,6 +342,8 @@ dired_poll_orphans :: proc() {
 
 dired_request_load :: proc(d: ^Dired, dir_path: string, sort_by: DiredSortBy, order: DiredSortOrder) {
     dired_orphan_job(&d.job)
+    d.selecting = false
+    d.anchor = 0
 
     abs_path, abs_err := filepath.abs(dir_path, runtime.default_allocator())
     if abs_err != nil {
@@ -413,6 +422,7 @@ dired_format_size :: proc(size: i64) -> string {
 
 dired_enter_edit_mode :: proc(d: ^Dired, e: ^Editor, font: ^Font, window: ^sdl.Window) {
     d.is_editing = true
+    d.selecting = false
 
     for orig in d.orig_entries {
         delete(orig.name)
@@ -591,6 +601,49 @@ dired_apply_edits :: proc(d: ^Dired, e: ^Editor) -> string {
     return fmt.tprintf("Dired: applied changes (%d created, %d renamed, %d deleted)", created_count, renamed_count, deleted_count)
 }
 
+// Linewise text for the selected/current/all dired entries.
+dired_selected_text :: proc(
+    d: ^Dired,
+    all: bool,
+    allocator := context.temp_allocator,
+) -> (text: string, count: int) {
+    if d == nil || len(d.entries) == 0 do return "", 0
+
+    r0, r1 := 0, 0
+    if all {
+        r1 = len(d.entries) - 1
+    } else if d.selecting {
+        r0 = min(d.anchor, d.cursor)
+        r1 = max(d.anchor, d.cursor)
+    } else {
+        r0 = d.cursor
+        r1 = d.cursor
+    }
+    r0 = clamp(r0, 0, len(d.entries) - 1)
+    r1 = clamp(r1, 0, len(d.entries) - 1)
+    if r1 < r0 do return "", 0
+
+    b: strings.Builder
+    strings.builder_init(&b, 0, max(64, (r1 - r0 + 1) * 24), allocator)
+    for i in r0 ..= r1 {
+        entry := d.entries[i]
+        strings.write_string(&b, entry.name)
+        if entry.is_dir do strings.write_byte(&b, '/')
+        strings.write_byte(&b, '\n')
+    }
+    return strings.to_string(b), r1 - r0 + 1
+}
+
+// Copies selected/current/all dired entries to the clipboard as linewise
+// text. Returns the number of lines copied.
+dired_copy_entries :: proc(d: ^Dired, all: bool) -> int {
+    text, count := dired_selected_text(d, all, context.temp_allocator)
+    if count == 0 do return 0
+    c_text := strings.clone_to_cstring(text, context.temp_allocator)
+    _ = sdl.SetClipboardText(c_text)
+    return count
+}
+
 dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane) -> bool {
     #partial switch event.type {
     case .KEY_DOWN:
@@ -599,6 +652,30 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
         mod := event.key.mod
         is_shift := (mod & sdl.KMOD_SHIFT) != {}
         is_ctrl := (mod & sdl.KMOD_CTRL) != {}
+        is_alt := (mod & sdl.KMOD_ALT) != {}
+
+        // Ctrl+X selects entries; Esc clears the selection before it would
+        // enter wdired mode.
+        if is_ctrl && key == KEY_DIRED_VISUAL {
+            d.selecting = !d.selecting
+            d.anchor = d.cursor
+            return true
+        }
+        if d.selecting && key == sdl.K_ESCAPE {
+            d.selecting = false
+            return true
+        }
+        if is_shift && key == KEY_DIRED_YANK_ALL {
+            n := dired_copy_entries(d, true)
+            if app != nil do app_set_message(app, fmt.tprintf("Dired: copied %d line(s)", n))
+            return true
+        }
+        if key == KEY_DIRED_YANK || (is_alt && key == KEY_DIRED_YANK_ALT) {
+            n := dired_copy_entries(d, false)
+            d.selecting = false
+            if app != nil do app_set_message(app, fmt.tprintf("Dired: copied %d line(s)", n))
+            return true
+        }
 
         // Command mode trigger ':' from Dired
         if key == KEY_CMD_PROMPT || (key == KEY_CMD_PROMPT_ALT && is_shift) {
@@ -804,6 +881,22 @@ dired_render :: proc(
         entry := d.entries[idx]
         y_pos := rect.y + header_h + f32(i) * line_h
 
+        if d.selecting {
+            r0 := min(d.anchor, d.cursor)
+            r1 := max(d.anchor, d.cursor)
+            if idx >= r0 && idx <= r1 {
+                sel_rect := sdl.FRect{rect.x, y_pos, rect.w, line_h}
+                sdl.SetRenderDrawColorFloat(
+                    renderer,
+                    theme.selection_bg.r,
+                    theme.selection_bg.g,
+                    theme.selection_bg.b,
+                    0.9,
+                )
+                sdl.RenderFillRect(renderer, &sel_rect)
+            }
+        }
+
         if search_pattern != "" {
             display := entry.name
             if entry.is_dir do display = fmt.tprintf("%s/", entry.name)
@@ -871,9 +964,11 @@ dired_render :: proc(
     sdl.RenderFillRect(renderer, &status_bar_rect)
 
     focus_badge := "[ACTIVE] " if is_focused else ""
+    selection_badge := " [VISUAL]" if d.selecting else ""
     status_str := fmt.tprintf(
-        "%s-- DIRED --   %d / %d items   (<%s> to sort, <%s>/<Esc> to edit)",
+        "%s-- DIRED --%s   %d / %d items   (<%s> to sort, <%s>/<Esc> to edit)",
         focus_badge,
+        selection_badge,
         d.cursor + 1,
         len(d.entries),
         key_label(KEY_DIRED_SORT, {}, .Plain),

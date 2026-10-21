@@ -2260,6 +2260,8 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                 key == KEY_SCOPE_DOWN || key == KEY_SCOPE_UP ||
                 key == KEY_SEARCH || key == KEY_SEARCH_NEXT || key == KEY_SEARCH_PREV ||
                 key == KEY_SEARCH_PREV_ALT ||
+                key == KEY_VISUAL_TOGGLE || key == KEY_SELECT_LINE ||
+                key == KEY_YANK_SELECTION || key == KEY_YANK_ALT ||
                 key == KEY_CMD_PROMPT || key == KEY_CMD_PROMPT_ALT
             if !allowed {
                 e.pending_cmd = 0

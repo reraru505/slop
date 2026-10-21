@@ -253,6 +253,10 @@ help_token_value :: proc(name: string) -> (string, bool) {
     case "dired_sort":            return key_label(KEY_DIRED_SORT, {}, .Plain), true
     case "dired_sort_reverse":    return key_label(KEY_DIRED_SORT_REVERSE, shift, .Shift_Letter), true
     case "dired_quit":            return key_label(KEY_DIRED_QUIT, {}, .Plain), true
+    case "dired_visual":          return key_label(KEY_DIRED_VISUAL, ctrl, .Plain), true
+    case "dired_yank":            return key_label(KEY_DIRED_YANK, {}, .Plain), true
+    case "dired_yank_all":        return key_label(KEY_DIRED_YANK_ALL, shift, .Shift_Letter), true
+    case "dired_yank_alt":        return key_label(KEY_DIRED_YANK_ALT, alt, .Plain), true
     case "compile_down":          return key_label(KEY_COMPILE_DOWN, {}, .Plain), true
     case "compile_up":            return key_label(KEY_COMPILE_UP, {}, .Plain), true
     case "compile_next_error":    return key_label(KEY_COMPILE_NEXT_ERROR, {}, .Plain), true

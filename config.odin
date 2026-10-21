@@ -197,6 +197,10 @@ KEY_DIRED_PARENT        :: sdl.K_H       // h
 KEY_DIRED_PARENT_ALT    :: sdl.K_MINUS   // -
 KEY_DIRED_OPEN          :: sdl.K_L       // L (lowercase l on the keyboard)
 KEY_DIRED_QUIT          :: sdl.K_Q       // q
+KEY_DIRED_VISUAL        :: sdl.K_X       // Ctrl+X: select entries
+KEY_DIRED_YANK          :: sdl.K_Y       // y: copy selection / current entry
+KEY_DIRED_YANK_ALL      :: sdl.K_Y       // Shift+Y: copy all entries
+KEY_DIRED_YANK_ALT      :: sdl.K_W       // Alt+W: copy selection / current entry
 
 // ---- Compilation buffer ----------------------------------------------------
 

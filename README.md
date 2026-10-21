@@ -34,6 +34,7 @@ slop is an ultimate AI assisted config of neovim, somehow turned into a standalo
 - Async file picker with substring, fuzzy, and multi-token matching.
 - Picker skips VCS/build directories and editor backup files; scans are capped and report truncation.
 - Dired: async listings, name/size/time sorting, reverse sort, parent navigation.
+- Dired selection: `Ctrl+X` selects entries, `y` / `M-w` copies, `Shift+Y` copies all.
 - Wdired: edit the listing to rename, create, and delete files, then `:w` to apply or `:q` to cancel.
 - Project root and session working directory are independent (`:root`, `:cd`, `:pwd`).
 
@@ -67,6 +68,7 @@ slop is an ultimate AI assisted config of neovim, somehow turned into a standalo
 ### Help
 
 - `:help` opens a read-only cheat sheet rendered with the current key bindings.
+- Read-only help and LSP documentation buffers support Visual selection and clipboard copy.
 
 ## Screenshots
 

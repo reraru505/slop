@@ -1955,3 +1955,26 @@ test_replace_command_dispatch :: proc(t: ^testing.T) {
 
     fmt.println("  ✓ [Editor] :replace dispatch, deletion, and error paths verified")
 }
+
+@(test)
+test_read_only_editor_allows_selection :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "hello\nworld")
+    defer editor_destroy(&e)
+    e.read_only = true
+
+    send_key_event(&e, KEY_VISUAL_TOGGLE, sdl.KMOD_CTRL)
+    testing.expect_value(t, e.mode, EditorMode.Visual)
+
+    send_key_event(&e, KEY_MOVE_RIGHT)
+    testing.expect_value(t, e.cursor.col, 1)
+
+    send_key_event(&e, sdl.K_ESCAPE)
+    testing.expect_value(t, e.mode, EditorMode.Normal)
+
+    // Line selection is navigation-only and stays available when read-only.
+    send_key_event(&e, KEY_SELECT_LINE)
+    testing.expect_value(t, e.mode, EditorMode.Visual)
+
+    fmt.println("  ✓ [Editor] read-only buffers allow Visual selection and movement")
+}
