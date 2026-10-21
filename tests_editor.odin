@@ -1823,3 +1823,135 @@ test_insert_escape_steps_cursor_left :: proc(t: ^testing.T) {
 
     fmt.println("  ✓ [Editor] Insert→Normal Escape steps back one rune; Normal→Insert does not")
 }
+
+@(test)
+test_command_parse_replacement :: proc(t: ^testing.T) {
+    text, ok := command_parse_replacement(`"hello"`)
+    testing.expect_value(t, ok, true)
+    testing.expect_value(t, text, "hello")
+
+    text, ok = command_parse_replacement(`"a\nb\tc"`)
+    testing.expect_value(t, ok, true)
+    testing.expect_value(t, text, "a\nb\tc")
+
+    text, ok = command_parse_replacement(`'it\'s'`)
+    testing.expect_value(t, ok, true)
+    testing.expect_value(t, text, "it's")
+
+    text, ok = command_parse_replacement("plain text")
+    testing.expect_value(t, ok, true)
+    testing.expect_value(t, text, "plain text")
+
+    _, ok = command_parse_replacement(`"unterminated`)
+    testing.expect_value(t, ok, false)
+    _, ok = command_parse_replacement("")
+    testing.expect_value(t, ok, false)
+
+    fmt.println("  ✓ [Editor] :replace argument quoting and escapes verified")
+}
+
+@(test)
+test_editor_replace_selection :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "hello world")
+    defer editor_destroy(&e)
+
+    editor_set_mode(&e, .Visual, nil)
+    e.selection_anchor = Cursor{row = 0, col = 6}
+    e.cursor = Cursor{row = 0, col = 10}
+
+    testing.expect_value(t, editor_replace_selection(&e, "there"), true)
+    text := pt_full_text(&e.buffer.table)
+    defer delete(text)
+    testing.expect_value(t, text, "hello there")
+    testing.expect_value(t, e.mode, EditorMode.Normal)
+    testing.expect_value(t, e.cursor.row, 0)
+    testing.expect_value(t, e.cursor.col, 6)
+    testing.expect_value(t, e.buffer.dirty, true)
+
+    // The replacement is one undo step.
+    testing.expect_value(t, pt_undo(&e.buffer.table), true)
+    undone := pt_full_text(&e.buffer.table)
+    defer delete(undone)
+    testing.expect_value(t, undone, "hello world")
+
+    // Without a Visual selection the helper refuses.
+    testing.expect_value(t, editor_replace_selection(&e, "x"), false)
+
+    fmt.println("  ✓ [Editor] selection replacement is atomic and rune-safe")
+}
+
+@(test)
+test_editor_replace_selection_multiline_and_crlf :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "one\r\ntwo")
+    defer editor_destroy(&e)
+
+    editor_set_mode(&e, .Visual, nil)
+    e.selection_anchor = Cursor{row = 1, col = 0}
+    e.cursor = Cursor{row = 1, col = 2}
+
+    testing.expect_value(t, editor_replace_selection(&e, "a\nb"), true)
+    text := pt_full_text(&e.buffer.table)
+    defer delete(text)
+    testing.expect_value(t, text, "one\r\na\r\nb")
+    testing.expect_value(t, e.buffer.line_ending, Line_Ending.CRLF)
+
+    // An empty replacement deletes the selection.
+    editor_set_mode(&e, .Visual, nil)
+    e.selection_anchor = Cursor{row = 2, col = 0}
+    e.cursor = Cursor{row = 2, col = 0}
+    testing.expect_value(t, editor_replace_selection(&e, ""), true)
+    deleted := pt_full_text(&e.buffer.table)
+    defer delete(deleted)
+    testing.expect_value(t, deleted, "one\r\na\r\n")
+
+    fmt.println("  ✓ [Editor] replacement normalizes newlines to the buffer EOL")
+}
+
+@(test)
+test_replace_command_dispatch :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    e := &app.active_pane.editor
+    set_editor_text(e, "hello world")
+    editor_set_mode(e, .Visual, nil)
+    e.selection_anchor = Cursor{row = 0, col = 6}
+    e.cursor = Cursor{row = 0, col = 10}
+
+    app_execute_command(&app, `replace "there"`)
+    text := pt_full_text(&e.buffer.table)
+    defer delete(text)
+    testing.expect_value(t, text, "hello there")
+    testing.expect_value(t, app.cmd_prompt.message, "Replaced selection")
+
+    // Deleting with an empty quoted argument.
+    editor_set_mode(e, .Visual, nil)
+    e.selection_anchor = Cursor{row = 0, col = 5}
+    e.cursor = Cursor{row = 0, col = 10}
+    app_execute_command(&app, `replace ""`)
+    trimmed := pt_full_text(&e.buffer.table)
+    defer delete(trimmed)
+    testing.expect_value(t, trimmed, "hello")
+
+    // Errors leave the buffer untouched and report an E: message.
+    app_execute_command(&app, `replace "oops`)
+    testing.expect(t, strings.has_prefix(app.cmd_prompt.message, "E:"))
+    app_execute_command(&app, "replace")
+    testing.expect(t, strings.has_prefix(app.cmd_prompt.message, "E:"))
+    unchanged := pt_full_text(&e.buffer.table)
+    defer delete(unchanged)
+    testing.expect_value(t, unchanged, "hello")
+
+    e.read_only = true
+    editor_set_mode(e, .Visual, nil)
+    e.selection_anchor = Cursor{row = 0, col = 0}
+    e.cursor = Cursor{row = 0, col = 4}
+    app_execute_command(&app, `replace "x"`)
+    testing.expect_value(t, app.cmd_prompt.message, "Buffer is read-only")
+    testing.expect_value(t, pt_get_length(&e.buffer.table), 5)
+    e.read_only = false
+
+    fmt.println("  ✓ [Editor] :replace dispatch, deletion, and error paths verified")
+}

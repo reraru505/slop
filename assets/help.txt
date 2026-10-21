@@ -68,6 +68,7 @@ COMMANDS  (type '{cmd_prompt}' in Normal mode)
   :recompile            repeat the last build
   :cnext  :cprev        next / previous compiler error
   :cfirst               jump to the first compiler error
+  :replace "text"       replace the Visual selection ("" deletes it)
   :theme [name]         cycle themes or set one by name
   :sort [name|size|time|rev]  sort the current dired listing
   :cd <dir>  :pwd       change / show the session working directory

@@ -430,7 +430,7 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
         } else {
             // 2. Completing base command
             ALL_COMMANDS := []string{
-                "w", "wa", "wq", "wqa", "q", "qa", "q!", "x",
+                "w", "wa", "wq", "wqa", "q", "qa", "q!", "x", "replace",
                 "split", "sp", "vsplit", "vs",
                 "dired", "edit", "e",
                 "compile", "recompile", "make",
@@ -652,6 +652,79 @@ app_run_compile :: proc(app: ^App, cmd_str: string) {
     app_set_message(app, fmt.tprintf("Compilation: %s", comp_pane.compilation.status))
 }
 
+// Parses the argument of `:replace`. Surrounding quotes are optional; quoted
+// arguments understand \n, \r, \t, \\, \" and \'.
+command_parse_replacement :: proc(arg: string) -> (text: string, ok: bool) {
+    if arg == "" do return "", false
+    quote := arg[0]
+    if quote != '"' && quote != '\'' do return arg, true
+    if len(arg) < 2 || arg[len(arg) - 1] != quote do return "", false
+
+    inner := arg[1 : len(arg) - 1]
+    b: strings.Builder
+    strings.builder_init(&b, 0, len(inner), context.temp_allocator)
+    i := 0
+    for i < len(inner) {
+        c := inner[i]
+        if c == '\\' && i + 1 < len(inner) {
+            switch inner[i + 1] {
+            case 'n':
+                strings.write_byte(&b, '\n')
+            case 'r':
+                strings.write_byte(&b, '\r')
+            case 't':
+                strings.write_byte(&b, '\t')
+            case '\\':
+                strings.write_byte(&b, '\\')
+            case '"':
+                strings.write_byte(&b, '"')
+            case '\'':
+                strings.write_byte(&b, '\'')
+            case:
+                strings.write_byte(&b, inner[i + 1])
+            }
+            i += 2
+            continue
+        }
+        strings.write_byte(&b, c)
+        i += 1
+    }
+    return strings.to_string(b), true
+}
+
+app_replace_command :: proc(app: ^App, arg: string) {
+    if app == nil || app.active_pane == nil do return
+    p := app.active_pane
+    if p.kind != .Editor {
+        app_set_message(app, "E: :replace needs an editor buffer")
+        return
+    }
+    e := &p.editor
+    if e.read_only {
+        app_set_message(app, "Buffer is read-only")
+        return
+    }
+    if e.mode != .Visual {
+        app_set_message(app, "E: Select text before :replace")
+        return
+    }
+    if arg == "" {
+        app_set_message(app, "E: :replace needs text (\"\" deletes the selection)")
+        return
+    }
+
+    replacement, ok := command_parse_replacement(arg)
+    if !ok {
+        app_set_message(app, "E: Unterminated string in :replace")
+        return
+    }
+    if editor_replace_selection(e, replacement) {
+        app_set_message(app, "Replaced selection")
+    } else {
+        app_set_message(app, "E: No selection to replace")
+    }
+}
+
 // Write every modified, named editor buffer. Shared split views are written
 // once, and wdired listings in progress are applied first. Returns false when
 // any write failed, in which case the caller must not quit.
@@ -764,6 +837,9 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         if app_write_all(app) && !app_has_unsaved_changes(app) {
             app.running = false
         }
+    } else if cmd == "replace" || strings.has_prefix(cmd, "replace ") {
+        arg := strings.trim_space(cmd[len("replace"):])
+        app_replace_command(app, arg)
     } else if strings.has_prefix(cmd, "sort ") || cmd == "sort" {
         sub := strings.trim_space(cmd[4:] if strings.has_prefix(cmd, "sort ") else "")
         if app.active_pane != nil && app.active_pane.kind == .Dired {
@@ -1627,7 +1703,8 @@ draw :: proc(app: ^App) {
         strings.has_prefix(app.cmd_prompt.message, "Cannot") ||
         strings.has_prefix(app.cmd_prompt.message, "E32") ||
         strings.has_prefix(app.cmd_prompt.message, "E35") ||
-        strings.has_prefix(app.cmd_prompt.message, "E486") else
+        strings.has_prefix(app.cmd_prompt.message, "E486") ||
+        strings.has_prefix(app.cmd_prompt.message, "E:") else
         sdl.FColor{0.6, 0.85, 0.6, 1.0}
 
         push_line(&app.font, app.cmd_prompt.message, Vec2{10.0, main_area_h + 3.0}, msg_color, .HALF)

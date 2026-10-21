@@ -966,6 +966,27 @@ editor_delete_selection :: proc(e: ^Editor) {
     editor_set_mode(e, .Normal, nil)
 }
 
+// Replaces the active Visual selection with `text` as one undo step. Returns
+// false when there is no non-empty selection or the editor is not in Visual
+// mode.
+editor_replace_selection :: proc(e: ^Editor, text: string) -> bool {
+    if e == nil || e.buffer == nil || e.mode != .Visual do return false
+
+    start_sel, _ := editor_get_selection_range(e)
+    start_off, end_off := editor_selection_offsets(e)
+    if end_off <= start_off do return false
+
+    insertion := editor_normalize_newlines(e, text, context.temp_allocator)
+    editor_begin_undo_transaction(e)
+    pt_replace(&e.buffer.table, start_off, end_off - start_off, insertion)
+    editor_mark_dirty(e, start_sel.row)
+    editor_set_mode(e, .Normal, nil)
+    e.cursor = start_sel
+    editor_snap_cursor(e)
+    editor_end_undo_transaction(e)
+    return true
+}
+
 editor_yank_selection :: proc(e: ^Editor) {
     start_sel, _ := editor_get_selection_range(e)
     start_off, end_off := editor_selection_offsets(e)
