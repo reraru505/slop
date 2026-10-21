@@ -25,8 +25,7 @@ MOVEMENT
 EDITING
   {delete_char} ............ delete character; at end of line, join the next line
   {select_line} then {delete_selection} ..... delete selected line(s)
-  {paste} ....... paste the clipboard
-  {paste_normal} ....... paste in Normal / Visual mode
+  {paste} ....... paste the clipboard (Normal / Insert / Visual)
   {save} ....... save the file
   Visual {delete_selection} ..... delete selection
   Visual {change_selection} ..... change selection (delete, then Insert mode)
@@ -41,7 +40,7 @@ EDITING
 
 SEARCH
   {search}<pattern> .... search editor, dired, or compilation (Esc restores the cursor)
-  {search_next} / {search_prev} ......... next / previous match (wraps around)
+  {search_next} / {search_prev} / {search_prev_alt} .... next / previous match (wraps around)
 
 LSP (when a language server is available)
   {completion_trigger} ... trigger completion

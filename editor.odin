@@ -1785,6 +1785,10 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         app_search_repeat(app, reverse)
         return true
     }
+    if key == KEY_SEARCH_PREV_ALT {
+        app_search_repeat(app, true)
+        return true
+    }
 
     // ESC = Insert / Normal toggle
     if key == sdl.K_ESCAPE {
@@ -2034,11 +2038,6 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
 
-    if key == KEY_PASTE_NORMAL {
-        editor_paste(e)
-        return true
-    }
-
     if e.mode == .Visual && key == KEY_YANK_SELECTION {
         editor_yank_selection(e)
         return true
@@ -2239,6 +2238,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                 key == KEY_WORD_FORWARD || key == KEY_WORD_BACKWARD ||
                 key == KEY_SCOPE_DOWN || key == KEY_SCOPE_UP ||
                 key == KEY_SEARCH || key == KEY_SEARCH_NEXT || key == KEY_SEARCH_PREV ||
+                key == KEY_SEARCH_PREV_ALT ||
                 key == KEY_CMD_PROMPT || key == KEY_CMD_PROMPT_ALT
             if !allowed {
                 e.pending_cmd = 0
@@ -2454,13 +2454,6 @@ editor_render :: proc(
     // Search matches: a translucent band behind every visible occurrence.
     // Text is batched and flushed after this, so these land behind the glyphs.
     if search_pattern != "" {
-        sdl.SetRenderDrawColorFloat(
-            renderer,
-            SEARCH_HIGHLIGHT.r,
-            SEARCH_HIGHLIGHT.g,
-            SEARCH_HIGHLIGHT.b,
-            SEARCH_HIGHLIGHT.a,
-        )
         for i in 0 ..< visible_lines {
             line_idx := e.scroll_row + i
             if line_idx >= total_lines do break
@@ -2482,13 +2475,13 @@ editor_render :: proc(
                 x1 := min(visible_cols, vis_en - e.scroll_col)
                 if x1 <= x0 do continue
 
-                match_rect := sdl.FRect{
-                    x = rect.x + gutter_w + 4.0 + f32(x0) * char_w,
-                    y = rect.y + f32(i) * line_h,
-                    w = f32(x1 - x0) * char_w,
-                    h = line_h,
-                }
-                sdl.RenderFillRect(renderer, &match_rect)
+                draw_search_match(
+                    renderer,
+                    rect.x + gutter_w + 4.0 + f32(x0) * char_w,
+                    rect.y + f32(i) * line_h,
+                    f32(x1 - x0) * char_w,
+                    line_h,
+                )
             }
         }
     }

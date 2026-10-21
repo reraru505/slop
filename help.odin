@@ -196,6 +196,7 @@ help_token_value :: proc(name: string) -> (string, bool) {
     case "search":                return key_label(KEY_SEARCH, {}, .Plain), true
     case "search_next":           return key_label(KEY_SEARCH_NEXT, {}, .Plain), true
     case "search_prev":           return key_label(KEY_SEARCH_PREV, shift, .Shift_Letter), true
+    case "search_prev_alt":       return key_label(KEY_SEARCH_PREV_ALT, {}, .Plain), true
     case "format_line":           return help_sequence2(KEY_FORMAT_LINE, KEY_FORMAT_LINE), true
     case "format_selection":      return key_label(KEY_FORMAT_SELECTION, {}, .Plain), true
     case "delete_char":           return key_label(KEY_DELETE_CHAR, {}, .Plain), true
@@ -204,7 +205,6 @@ help_token_value :: proc(name: string) -> (string, bool) {
     case "yank_selection":        return key_label(KEY_YANK_SELECTION, {}, .Upper), true
     case "yank_alt":              return key_label(KEY_YANK_ALT, alt, .Plain), true
     case "paste":                 return key_label(KEY_PASTE_CLIPBOARD, ctrl, .Plain), true
-    case "paste_normal":          return key_label(KEY_PASTE_NORMAL, {}, .Plain), true
     case "save":                  return key_label(KEY_SAVE, ctrl, .Plain), true
     case "undo":                  return key_label(KEY_UNDO, {}, .Plain), true
     case "undo_alt":              return key_label(KEY_UNDO_ALT, ctrl, .Plain), true

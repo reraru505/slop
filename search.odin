@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:strings"
 import "core:time"
+import sdl "vendor:sdl3"
 
 // Plain-text search across editor, dired, and compilation buffers. Patterns
 // are literal (no regex) and case-sensitive.
@@ -75,6 +76,29 @@ search_find_in_text :: proc(
     }
     if last >= 0 do return last, true, true
     return 0, false, false
+}
+
+// Shared match styling used by every buffer renderer.
+draw_search_match :: proc(renderer: ^sdl.Renderer, x, y, w, h: f32) {
+    band := sdl.FRect{x, y, w, h}
+    sdl.SetRenderDrawColorFloat(
+        renderer,
+        SEARCH_HIGHLIGHT.r,
+        SEARCH_HIGHLIGHT.g,
+        SEARCH_HIGHLIGHT.b,
+        SEARCH_HIGHLIGHT.a,
+    )
+    sdl.RenderFillRect(renderer, &band)
+
+    edge := sdl.FRect{x, y + max(0.0, h - 1.5), w, 1.5}
+    sdl.SetRenderDrawColorFloat(
+        renderer,
+        SEARCH_HIGHLIGHT_EDGE.r,
+        SEARCH_HIGHLIGHT_EDGE.g,
+        SEARCH_HIGHLIGHT_EDGE.b,
+        SEARCH_HIGHLIGHT_EDGE.a,
+    )
+    sdl.RenderFillRect(renderer, &edge)
 }
 
 search_row_and_start :: proc(text: string, offset: int) -> (row, line_start: int) {
@@ -286,6 +310,14 @@ app_search_repeat :: proc(app: ^App, reverse: bool) {
     if reverse do direction = -direction
 
     start := app_search_cursor_offset(p)
+    // A dired cursor identifies an entry, not the matched bytes within it.
+    // Move forward from the end of that entry so `n` cannot match it again.
+    if direction > 0 && p.kind == .Dired && !p.dired.is_editing {
+        if p.dired.cursor >= 0 && p.dired.cursor < len(p.dired.entries) {
+            entry := p.dired.entries[p.dired.cursor]
+            start += len(entry.name) + (1 if entry.is_dir else 0)
+        }
+    }
     _ = app_search_apply(app, app.last_search, direction, start, false)
 }
 

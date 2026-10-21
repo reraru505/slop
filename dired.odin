@@ -618,6 +618,10 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
             app_search_repeat(app, reverse)
             return true
         }
+        if key == KEY_SEARCH_PREV_ALT {
+            app_search_repeat(app, true)
+            return true
+        }
 
         // Toggle edit mode via 'i' or 'Esc'
         if key == KEY_DIRED_EDIT || key == sdl.K_ESCAPE {
@@ -813,20 +817,13 @@ dired_render :: proc(
                 v0 := text_visual_col(display, abs)
                 v1 := text_visual_col(display, min(len(display), abs + len(search_pattern)))
                 if v1 <= v0 do v1 = v0 + 1
-                match_rect := sdl.FRect{
-                    x = rect.x + 24.0 + f32(v0) * cell_w,
-                    y = y_pos,
-                    w = f32(v1 - v0) * cell_w,
-                    h = line_h,
-                }
-                sdl.SetRenderDrawColorFloat(
+                draw_search_match(
                     renderer,
-                    SEARCH_HIGHLIGHT.r,
-                    SEARCH_HIGHLIGHT.g,
-                    SEARCH_HIGHLIGHT.b,
-                    SEARCH_HIGHLIGHT.a,
+                    rect.x + 24.0 + f32(v0) * cell_w,
+                    y_pos,
+                    f32(v1 - v0) * cell_w,
+                    line_h,
                 )
-                sdl.RenderFillRect(renderer, &match_rect)
             }
         }
 

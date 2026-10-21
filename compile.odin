@@ -1248,20 +1248,13 @@ compilation_render :: proc(
                 v0 := compilation_visual_col(c, idx, abs)
                 v1 := compilation_visual_col(c, idx, min(len(line.text), abs + len(search_pattern)))
                 if v1 <= v0 do v1 = v0 + 1
-                match_rect := sdl.FRect{
-                    x = text_x + f32(v0) * cell_w,
-                    y = y_pos,
-                    w = f32(v1 - v0) * cell_w,
-                    h = line_h,
-                }
-                sdl.SetRenderDrawColorFloat(
+                draw_search_match(
                     renderer,
-                    SEARCH_HIGHLIGHT.r,
-                    SEARCH_HIGHLIGHT.g,
-                    SEARCH_HIGHLIGHT.b,
-                    SEARCH_HIGHLIGHT.a,
+                    text_x + f32(v0) * cell_w,
+                    y_pos,
+                    f32(v1 - v0) * cell_w,
+                    line_h,
                 )
-                sdl.RenderFillRect(renderer, &match_rect)
             }
         }
 

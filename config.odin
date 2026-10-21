@@ -50,9 +50,10 @@ DEFAULT_THEME :: ThemeId.GruberDarker
 DEFAULT_LINE_SPACING :: 1.0
 DEFAULT_UI_SCALE     :: 1.0
 
-// Background band behind `/` matches. Kept translucent so syntax colors stay
-// readable underneath.
-SEARCH_HIGHLIGHT :: sdl.FColor{0.90, 0.75, 0.30, 0.16}
+// `/` match highlight: a barely-there wash so glyphs keep full contrast, plus
+// a thin underline that makes the match easy to locate.
+SEARCH_HIGHLIGHT      :: sdl.FColor{0.90, 0.75, 0.30, 0.10}
+SEARCH_HIGHLIGHT_EDGE :: sdl.FColor{0.95, 0.78, 0.30, 0.55}
 
 WINDOW_TITLE  :: EDITOR_NAME
 WINDOW_WIDTH  :: 1024
@@ -170,7 +171,7 @@ KEY_DELETE_CHAR        :: sdl.K_D        // d in Normal mode
 KEY_DELETE_SELECTION   :: sdl.K_D        // D in Visual mode
 KEY_CHANGE_SELECTION   :: sdl.K_C        // C in Visual mode
 KEY_YANK_SELECTION     :: sdl.K_Y        // Y in Visual mode
-KEY_PASTE_NORMAL       :: sdl.K_P        // p in Normal/Visual mode
+KEY_SEARCH_PREV_ALT    :: sdl.K_P        // p: previous search match
 
 KEY_OPEN_BELOW         :: sdl.K_O        // o
 KEY_OPEN_ABOVE         :: sdl.K_O        // Shift+O

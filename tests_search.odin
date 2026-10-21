@@ -109,6 +109,12 @@ test_search_prompt_navigation :: proc(t: ^testing.T) {
     testing.expect_value(t, app.search_direction, -1)
     testing.expect(t, strings.contains(app.cmd_prompt.message, "wrapped to bottom"))
 
+    // p is the alternate backwards binding (Ctrl+Y remains paste).
+    editor_handle_normal_key(e, KEY_SEARCH_PREV_ALT, {}, nil, &app)
+    testing.expect_value(t, e.cursor.row, 0)
+    testing.expect_value(t, e.cursor.col, 4)
+    testing.expect(t, strings.contains(app.cmd_prompt.message, "wrapped to top"))
+
     // An empty prompt repeats the previous pattern from the current cursor.
     e.cursor.row = 2
     e.cursor.col = 0
@@ -248,4 +254,50 @@ test_search_in_compilation_buffer :: proc(t: ^testing.T) {
     testing.expect_value(t, c.scroll, 1)
 
     fmt.println("  ✓ [Search] compilation output search and restore verified")
+}
+
+@(test)
+test_dired_search_cycles_three_matches :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/search_dired_cycle"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+    for name in ([]string{"a-hit.txt", "b.txt", "c-hit.txt", "d.txt", "e-hit.txt"}) {
+        testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/%s", dir, name), "x") == nil)
+    }
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+    app_pane_open_dired(&app, pane, dir)
+    dired_wait_load(&pane.dired)
+
+    hit_rows: [dynamic]int
+    defer delete(hit_rows)
+    for entry, i in pane.dired.entries {
+        if strings.contains(entry.name, "hit") do append(&hit_rows, i)
+    }
+    testing.expect_value(t, len(hit_rows), 3)
+
+    app_open_search_prompt(&app)
+    for b in transmute([]u8)string("hit") do append(&app.cmd_prompt.buffer, b)
+    app_submit_prompt(&app)
+    testing.expect_value(t, pane.dired.cursor, hit_rows[0])
+
+    app_search_repeat(&app, false)
+    testing.expect_value(t, pane.dired.cursor, hit_rows[1])
+    app_search_repeat(&app, false)
+    testing.expect_value(t, pane.dired.cursor, hit_rows[2])
+    app_search_repeat(&app, false)
+    testing.expect_value(t, pane.dired.cursor, hit_rows[0])
+    testing.expect(t, strings.contains(app.cmd_prompt.message, "wrapped to top"))
+
+    // p cycles backwards through dired matches.
+    key_event: sdl.Event
+    key_event.type = .KEY_DOWN
+    key_event.key.key = KEY_SEARCH_PREV_ALT
+    dired_handle_event(&pane.dired, &key_event, &app, pane)
+    testing.expect_value(t, pane.dired.cursor, hit_rows[2])
+
+    fmt.println("  ✓ [Search] dired cycles through all three matches")
 }
