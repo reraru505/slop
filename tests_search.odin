@@ -309,7 +309,7 @@ test_dired_search_cycles_three_matches :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_search_selection_cleared_on_enter :: proc(t: ^testing.T) {
+test_search_highlight_until_next_search :: proc(t: ^testing.T) {
     path := "/tmp/odin_editor_search_highlight.txt"
     _ = os.remove(path)
     testing.expect(t, os.write_entire_file_from_string(path, "needle one\nneedle two\n") == nil)
@@ -321,23 +321,34 @@ test_search_selection_cleared_on_enter :: proc(t: ^testing.T) {
     testing.expect_value(t, app_pane_open_file(&app, pane, path), true)
     e := &pane.editor
 
-    // Searching from Visual mode clears the selection and enters Normal.
-    editor_set_mode(e, .Visual, nil)
-    e.selection_anchor = Cursor{row = 0, col = 0}
+    // Enter leaves the matches highlighted.
     app_open_search_prompt(&app)
     for b in transmute([]u8)string("needle") do append(&app.cmd_prompt.buffer, b)
-    // While typing, the prompt's pattern is what gets painted.
-    testing.expect_value(t, app_search_pattern(&app), "needle")
     app_submit_prompt(&app)
-    testing.expect_value(t, e.mode, EditorMode.Normal)
-    testing.expect_value(t, e.selection_anchor, e.cursor)
-    testing.expect_value(t, app_search_pattern(&app), "")
+    testing.expect_value(t, app.search_highlight, true)
+    testing.expect_value(t, app_search_pattern(&app), "needle")
     testing.expect_value(t, app.last_search, "needle")
 
-    // n continues to navigate but leaves no selection or highlight behind.
+    // n keeps navigating with the highlight still visible.
     app_search_repeat(&app, false)
-    testing.expect_value(t, app_search_pattern(&app), "")
-    testing.expect_value(t, app.last_search, "needle")
+    testing.expect_value(t, app.search_highlight, true)
+    testing.expect_value(t, app_search_pattern(&app), "needle")
 
-    fmt.println("  ✓ [Search] Enter clears the selection and all highlighting")
+    // Opening `/` again clears the previous highlighting immediately.
+    app_open_search_prompt(&app)
+    testing.expect_value(t, app.search_highlight, false)
+    testing.expect_value(t, app_search_pattern(&app), "")
+
+    // Cancelling leaves it cleared.
+    app_cancel_search_prompt(&app)
+    testing.expect_value(t, app.search_highlight, false)
+
+    // The next completed search highlights its own matches.
+    app_open_search_prompt(&app)
+    for b in transmute([]u8)string("two") do append(&app.cmd_prompt.buffer, b)
+    app_submit_prompt(&app)
+    testing.expect_value(t, app.search_highlight, true)
+    testing.expect_value(t, app_search_pattern(&app), "two")
+
+    fmt.println("  ✓ [Search] Enter highlights matches; the next / clears them")
 }

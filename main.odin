@@ -89,6 +89,8 @@ App :: struct {
     // Last `/` pattern and the direction `n` continues in (+1 / -1).
     last_search      : string,
     search_direction : int,
+    // Whether the last search's matches are painted. Opening `/` clears it.
+    search_highlight : bool,
     current_theme_id : ThemeId,
     theme            : Theme,
     running          : bool,
@@ -180,6 +182,8 @@ app_open_search_prompt :: proc(app: ^App) {
     cp.active = true
     cp.kind = .Search
     cp.source_pane = p
+    // Starting a new search clears the previous search's highlighting.
+    app.search_highlight = false
     switch p.kind {
     case .Editor:
         cp.origin_row = p.editor.cursor.row

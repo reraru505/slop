@@ -41,7 +41,7 @@ EDITING
 SEARCH
   {search}<pattern> .... search editor, dired, or compilation (Esc restores the cursor)
   {search_next} / {search_prev} / {search_prev_alt} .... next / previous match (wraps around)
-  Matches highlight while typing; Enter or Esc clears the selection
+  Enter highlights matches; typing {search} again clears them
 
 LSP (when a language server is available)
   {completion_trigger} ... trigger completion

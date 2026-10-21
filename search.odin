@@ -78,12 +78,10 @@ search_find_in_text :: proc(
     return 0, false, false
 }
 
-// Matches are painted only while the `/` prompt is open. Enter or Esc closes
-// it, which clears the selection and all highlighting immediately.
+// Matches stay painted after Enter until the next `/` clears them.
 app_search_pattern :: proc(app: ^App) -> string {
-    if app == nil || !app.cmd_prompt.active do return ""
-    if app.cmd_prompt.kind != .Search do return ""
-    return string(app.cmd_prompt.buffer[:])
+    if app == nil || !app.search_highlight do return ""
+    return app.last_search
 }
 
 // Shared match styling used by every buffer renderer.
@@ -260,6 +258,7 @@ app_search_apply :: proc(
         c.pending_g = false
     }
 
+    app.search_highlight = true
     app_search_commit(app, pattern, direction, wrapped)
     return true
 }
@@ -270,8 +269,7 @@ search_move_editor :: proc(e: ^Editor, offset: int) {
     e.cursor.row = row
     e.cursor.col = editor_clamp_col_to_rune(e, row, offset - line_start)
     e.desired_col = editor_visual_col(e, row, e.cursor.col)
-    e.selection_anchor = e.cursor
-    if e.mode == .Visual do editor_set_mode(e, .Normal, nil)
+    if e.mode != .Visual do e.selection_anchor = e.cursor
     e.pending_cmd = 0
 }
 
