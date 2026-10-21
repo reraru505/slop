@@ -41,7 +41,7 @@ EDITING
 SEARCH
   {search}<pattern> .... search editor, dired, or compilation (Esc restores the cursor)
   {search_next} / {search_prev} / {search_prev_alt} .... next / previous match (wraps around)
-  Matching highlights clear on the next key; :noh clears them immediately
+  Matches highlight while typing; Enter or Esc clears the selection
 
 LSP (when a language server is available)
   {completion_trigger} ... trigger completion
@@ -70,7 +70,6 @@ COMMANDS  (type '{cmd_prompt}' in Normal mode)
   :cnext  :cprev        next / previous compiler error
   :cfirst               jump to the first compiler error
   :replace "text"       replace the Visual selection ("" deletes it)
-  :noh  :nohlsearch     clear search highlighting now
   :theme [name]         cycle themes or set one by name
   :sort [name|size|time|rev]  sort the current dired listing
   :cd <dir>  :pwd       change / show the session working directory

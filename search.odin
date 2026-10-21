@@ -78,25 +78,12 @@ search_find_in_text :: proc(
     return 0, false, false
 }
 
-// The pattern to paint, or "" when highlighting has been cleared.
+// Matches are painted only while the `/` prompt is open. Enter or Esc closes
+// it, which clears the selection and all highlighting immediately.
 app_search_pattern :: proc(app: ^App) -> string {
-    if app == nil || !app.search_highlight do return ""
-    return app.last_search
-}
-
-app_search_key_keeps_highlight :: proc(key: sdl.Keycode) -> bool {
-    return key == KEY_SEARCH ||
-        key == KEY_SEARCH_NEXT ||
-        key == KEY_SEARCH_PREV ||
-        key == KEY_SEARCH_PREV_ALT
-}
-
-// Called for every editor key: any key that is not part of search navigation
-// ends the current search session's highlighting.
-app_search_note_key :: proc(app: ^App, key: sdl.Keycode) {
-    if app == nil || !SEARCH_HIGHLIGHT_AUTO_CLEAR do return
-    if app_search_key_keeps_highlight(key) do return
-    app.search_highlight = false
+    if app == nil || !app.cmd_prompt.active do return ""
+    if app.cmd_prompt.kind != .Search do return ""
+    return string(app.cmd_prompt.buffer[:])
 }
 
 // Shared match styling used by every buffer renderer.
@@ -273,7 +260,6 @@ app_search_apply :: proc(
         c.pending_g = false
     }
 
-    app.search_highlight = true
     app_search_commit(app, pattern, direction, wrapped)
     return true
 }
@@ -284,9 +270,8 @@ search_move_editor :: proc(e: ^Editor, offset: int) {
     e.cursor.row = row
     e.cursor.col = editor_clamp_col_to_rune(e, row, offset - line_start)
     e.desired_col = editor_visual_col(e, row, e.cursor.col)
-    if e.mode != .Visual {
-        e.selection_anchor = e.cursor
-    }
+    e.selection_anchor = e.cursor
+    if e.mode == .Visual do editor_set_mode(e, .Normal, nil)
     e.pending_cmd = 0
 }
 

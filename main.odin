@@ -89,8 +89,6 @@ App :: struct {
     // Last `/` pattern and the direction `n` continues in (+1 / -1).
     last_search      : string,
     search_direction : int,
-    // Whether last_search is currently painted over matches.
-    search_highlight : bool,
     current_theme_id : ThemeId,
     theme            : Theme,
     running          : bool,
@@ -432,7 +430,7 @@ app_command_prompt_tab :: proc(app: ^App, reverse: bool = false) {
         } else {
             // 2. Completing base command
             ALL_COMMANDS := []string{
-                "w", "wa", "wq", "wqa", "q", "qa", "q!", "x", "replace", "noh", "nohlsearch",
+                "w", "wa", "wq", "wqa", "q", "qa", "q!", "x", "replace",
                 "split", "sp", "vsplit", "vs",
                 "dired", "edit", "e",
                 "compile", "recompile", "make",
@@ -839,9 +837,6 @@ app_execute_command :: proc(app: ^App, raw_cmd: string) {
         if app_write_all(app) && !app_has_unsaved_changes(app) {
             app.running = false
         }
-    } else if cmd == "noh" || cmd == "nohlsearch" {
-        app.search_highlight = false
-        app_set_message(app, "Search highlighting cleared")
     } else if cmd == "replace" || strings.has_prefix(cmd, "replace ") {
         arg := strings.trim_space(cmd[len("replace"):])
         app_replace_command(app, arg)
@@ -1292,7 +1287,6 @@ update :: proc(app: ^App) {
 
         #partial switch event.type {
         case .MOUSE_BUTTON_DOWN:
-            if SEARCH_HIGHLIGHT_AUTO_CLEAR do app.search_highlight = false
             if event.button.button == sdl.BUTTON_LEFT {
                 mx := f32(event.button.x)
                 my := f32(event.button.y)
@@ -1316,7 +1310,6 @@ update :: proc(app: ^App) {
                 }
                 continue
             }
-            if SEARCH_HIGHLIGHT_AUTO_CLEAR do app.search_highlight = false
 
         case .KEY_DOWN:
             key := event.key.key
@@ -1366,8 +1359,6 @@ update :: proc(app: ^App) {
                 }
                 continue
             }
-
-            app_search_note_key(app, key)
 
             // Zoom controls
             if is_ctrl && (key == KEY_ZOOM_IN || key == KEY_ZOOM_IN_ALT) {

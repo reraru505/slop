@@ -309,7 +309,7 @@ test_dired_search_cycles_three_matches :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_search_highlight_clearing :: proc(t: ^testing.T) {
+test_search_selection_cleared_on_enter :: proc(t: ^testing.T) {
     path := "/tmp/odin_editor_search_highlight.txt"
     _ = os.remove(path)
     testing.expect(t, os.write_entire_file_from_string(path, "needle one\nneedle two\n") == nil)
@@ -321,37 +321,23 @@ test_search_highlight_clearing :: proc(t: ^testing.T) {
     testing.expect_value(t, app_pane_open_file(&app, pane, path), true)
     e := &pane.editor
 
+    // Searching from Visual mode clears the selection and enters Normal.
+    editor_set_mode(e, .Visual, nil)
+    e.selection_anchor = Cursor{row = 0, col = 0}
     app_open_search_prompt(&app)
     for b in transmute([]u8)string("needle") do append(&app.cmd_prompt.buffer, b)
-    app_submit_prompt(&app)
-    testing.expect_value(t, app.search_highlight, true)
+    // While typing, the prompt's pattern is what gets painted.
     testing.expect_value(t, app_search_pattern(&app), "needle")
-
-    // Search navigation keeps the highlight alive.
-    app_search_note_key(&app, KEY_SEARCH_NEXT)
-    testing.expect_value(t, app.search_highlight, true)
-    app_search_note_key(&app, KEY_SEARCH_PREV_ALT)
-    testing.expect_value(t, app.search_highlight, true)
-
-    // Any other key ends the highlighting session.
-    app_search_note_key(&app, KEY_MOVE_DOWN)
-    testing.expect_value(t, app.search_highlight, false)
+    app_submit_prompt(&app)
+    testing.expect_value(t, e.mode, EditorMode.Normal)
+    testing.expect_value(t, e.selection_anchor, e.cursor)
     testing.expect_value(t, app_search_pattern(&app), "")
-
-    // n brings it back, and :noh clears it without forgetting the pattern.
-    app_search_repeat(&app, false)
-    testing.expect_value(t, app.search_highlight, true)
     testing.expect_value(t, app.last_search, "needle")
-    app_execute_command(&app, "noh")
-    testing.expect_value(t, app.search_highlight, false)
-    testing.expect_value(t, app.last_search, "needle")
-    testing.expect_value(t, app.cmd_prompt.message, "Search highlighting cleared")
+
+    // n continues to navigate but leaves no selection or highlight behind.
     app_search_repeat(&app, false)
-    testing.expect_value(t, app.search_highlight, true)
+    testing.expect_value(t, app_search_pattern(&app), "")
+    testing.expect_value(t, app.last_search, "needle")
 
-    // The long form is accepted too.
-    app_execute_command(&app, "nohlsearch")
-    testing.expect_value(t, app.search_highlight, false)
-
-    fmt.println("  ✓ [Search] highlights clear on next key and via :noh")
+    fmt.println("  ✓ [Search] Enter clears the selection and all highlighting")
 }
