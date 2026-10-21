@@ -97,6 +97,10 @@ Editor :: struct {
     completion         : CompletionState,
     read_only          : bool,
     lsp_doc_open       : bool,
+    // Additional insertion points created by Shift+C over search matches.
+    extra_cursors      : [dynamic]Cursor,
+    // Rectangle (Ctrl+V / Shift+C) selection.
+    block_selection    : bool,
     // Buffer version reflected in this view's cursor.
     seen_version       : u64,
 }
@@ -226,6 +230,8 @@ editor_init_view :: proc(e: ^Editor, font: ^Font) {
     editor_set_status_message(e, "")
     e.read_only = false
     e.lsp_doc_open = false
+    e.extra_cursors = make([dynamic]Cursor, 0, 8)
+    e.block_selection = false
     e.completion.active = false
     e.completion.items = make([dynamic]LspCompletionItem, 0, 32)
     e.completion.all_items = make([dynamic]LspCompletionItem, 0, 64)
@@ -274,6 +280,7 @@ editor_destroy :: proc(e: ^Editor) {
         e.buffer = nil
     }
     delete(e.command_buffer)
+    delete(e.extra_cursors)
     for c in e.completion.items {
         delete(c.label)
         delete(c.detail)
@@ -539,6 +546,14 @@ editor_set_mode :: proc(e: ^Editor, new_mode: EditorMode, window: ^sdl.Window) {
     if e.mode == .Insert && new_mode == .Normal && e.cursor.col > 0 {
         e.cursor.col = editor_prev_rune_start(e, e.cursor.row, e.cursor.col)
         e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
+    }
+
+    // Leaving Insert collapses the extra insertion points, like Helix.
+    if e.mode == .Insert && new_mode == .Normal {
+        clear(&e.extra_cursors)
+    }
+    if new_mode != .Visual {
+        e.block_selection = false
     }
 
     e.mode = new_mode
@@ -950,8 +965,61 @@ editor_selection_offsets :: proc(e: ^Editor) -> (start_off, end_off: int) {
     return
 }
 
+// Row/byte-column bounds of a rectangle selection.
+editor_block_bounds :: proc(e: ^Editor) -> (r0, r1, c0, c1: int) {
+    r0 = min(e.selection_anchor.row, e.cursor.row)
+    r1 = max(e.selection_anchor.row, e.cursor.row)
+    c0 = min(e.selection_anchor.col, e.cursor.col)
+    c1 = max(e.selection_anchor.col, e.cursor.col)
+    return
+}
+
+// Text of the rectangle selection, one line per row, clamped to each line and
+// inclusive of the rune under the end column.
+editor_block_text :: proc(e: ^Editor, allocator := context.temp_allocator) -> string {
+    r0, r1, c0, c1 := editor_block_bounds(e)
+    b: strings.Builder
+    strings.builder_init(&b, 0, max(32, (r1 - r0 + 1) * (c1 - c0 + 2)), allocator)
+    for row := r0; row <= r1; row += 1 {
+        line_len := editor_get_line_len(e, row)
+        start := clamp(c0, 0, line_len)
+        end := clamp(c1, 0, line_len)
+        if end < line_len do end = editor_next_rune_end(e, row, end)
+        if end > start {
+            offset := pt_line_to_offset(&e.buffer.table, row) + start
+            if text, ok := pt_text(&e.buffer.table, offset, end - start, context.temp_allocator); ok {
+                strings.write_string(&b, text)
+            }
+        }
+        strings.write_byte(&b, '\n')
+    }
+    return strings.to_string(b)
+}
+
 editor_delete_selection :: proc(e: ^Editor) {
     break_undo_group(&e.buffer.table)
+
+    if e.mode == .Visual && e.block_selection {
+        r0, r1, c0, c1 := editor_block_bounds(e)
+        editor_begin_undo_transaction(e)
+        for row := r1; row >= r0; row -= 1 {
+            line_len := editor_get_line_len(e, row)
+            start := clamp(c0, 0, line_len)
+            end := clamp(c1, 0, line_len)
+            if end < line_len do end = editor_next_rune_end(e, row, end)
+            if end > start {
+                offset := pt_line_to_offset(&e.buffer.table, row) + start
+                pt_delete_range(&e.buffer.table, offset, end - start)
+            }
+        }
+        editor_end_undo_transaction(e)
+        editor_mark_dirty(e, r0)
+        e.cursor = Cursor{row = r0, col = c0, shape = .Block, color = e.cursor.color}
+        editor_snap_cursor(e)
+        editor_set_mode(e, .Normal, nil)
+        return
+    }
+
     start_sel, _ := editor_get_selection_range(e)
     start_off, end_off := editor_selection_offsets(e)
 
@@ -988,6 +1056,20 @@ editor_replace_selection :: proc(e: ^Editor, text: string) -> bool {
 }
 
 editor_yank_selection :: proc(e: ^Editor) {
+    if e.mode == .Visual && e.block_selection {
+        text := editor_block_text(e)
+        if len(text) > 0 {
+            c_text := strings.clone_to_cstring(text, context.temp_allocator)
+            _ = sdl.SetClipboardText(c_text)
+            e.status_message = "Yanked block selection."
+        }
+        r0, _, c0, _ := editor_block_bounds(e)
+        e.cursor = Cursor{row = r0, col = c0, shape = .Block, color = e.cursor.color}
+        editor_snap_cursor(e)
+        editor_set_mode(e, .Normal, nil)
+        return
+    }
+
     start_sel, _ := editor_get_selection_range(e)
     start_off, end_off := editor_selection_offsets(e)
 
@@ -1544,6 +1626,10 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return false
 
     case sdl.K_BACKSPACE:
+        if len(e.extra_cursors) > 0 {
+            editor_delete_multi(e, true)
+            return true
+        }
         line_len := editor_get_line_len(e, e.cursor.row)
         if e.cursor.col > line_len {
             e.cursor.col -= 1
@@ -1595,6 +1681,10 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
 
     case sdl.K_DELETE:
+        if len(e.extra_cursors) > 0 {
+            editor_delete_multi(e, false)
+            return true
+        }
         offset := editor_get_cursor_offset(e)
         if offset < pt_get_length(&e.buffer.table) {
             del_len := 1
@@ -1713,6 +1803,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     line_len := editor_get_line_len(e, e.cursor.row)
     is_shift := (mod & sdl.KMOD_SHIFT) != {}
     is_ctrl  := (mod & sdl.KMOD_CTRL) != {}
+    is_alt   := (mod & sdl.KMOD_ALT) != {}
 
     // Multi-key commands
     if e.pending_cmd == 'g' {
@@ -1780,9 +1871,34 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         if e.mode == .Visual {
             editor_set_mode(e, .Normal, window)
         } else {
-            e.mode = .Visual
+            editor_set_mode(e, .Visual, window)
+            e.block_selection = false
             e.selection_anchor = e.cursor
-            e.cursor.shape = .Block
+        }
+        return true
+    }
+
+    // Ctrl+V / Shift+C without an active search: rectangle selection.
+    if is_ctrl && key == KEY_BLOCK_VISUAL {
+        if e.mode == .Visual && e.block_selection {
+            editor_set_mode(e, .Normal, window)
+        } else {
+            editor_set_mode(e, .Visual, window)
+            e.block_selection = true
+            e.selection_anchor = e.cursor
+        }
+        return true
+    }
+
+    // Shift+C: cursors at every highlighted search match. With no highlighted
+    // search it starts a rectangle selection instead.
+    if e.mode != .Visual && is_shift && key == KEY_MULTI_CURSOR {
+        if app != nil && app.search_highlight && app.last_search != "" {
+            editor_place_multi_cursors(e, app)
+        } else {
+            editor_set_mode(e, .Visual, window)
+            e.block_selection = true
+            e.selection_anchor = e.cursor
         }
         return true
     }
@@ -1811,10 +1927,17 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
 
-    // ESC = Insert / Normal toggle
+    // Basic motions move every extra cursor together.
+    if !is_ctrl && !is_alt && !is_shift && editor_move_all_cursors(e, key) {
+        return true
+    }
+
+    // ESC = Insert / Normal toggle; with extra cursors it collapses them.
     if key == sdl.K_ESCAPE {
         if e.mode == .Visual {
             editor_set_mode(e, .Normal, window)
+        } else if len(e.extra_cursors) > 0 {
+            editor_clear_extra_cursors(e)
         } else {
             editor_set_mode(e, .Insert, window)
         }
@@ -2073,6 +2196,7 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
     // Undo / Redo
     if key == KEY_UNDO {
         if pt_undo(&e.buffer.table) {
+            editor_clear_extra_cursors(e)
             editor_invalidate_syntax(e, 0)
             editor_mark_dirty(e)
             editor_snap_cursor(e)
@@ -2092,6 +2216,10 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
         }
         if e.mode == .Insert {
             text_str := string(event.text.text)
+            if len(e.extra_cursors) > 0 {
+                editor_insert_text_multi(e, text_str)
+                return true
+            }
             if len(text_str) == 1 {
                 ch := text_str[0]
                 offset := editor_get_cursor_offset(e)
@@ -2261,6 +2389,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
                 key == KEY_SEARCH || key == KEY_SEARCH_NEXT || key == KEY_SEARCH_PREV ||
                 key == KEY_SEARCH_PREV_ALT ||
                 key == KEY_VISUAL_TOGGLE || key == KEY_SELECT_LINE ||
+                key == KEY_BLOCK_VISUAL || key == KEY_MULTI_CURSOR ||
                 key == KEY_YANK_SELECTION || key == KEY_YANK_ALT ||
                 key == KEY_CMD_PROMPT || key == KEY_CMD_PROMPT_ALT
             if !allowed {
@@ -2303,6 +2432,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
 
         if is_ctrl && key == KEY_UNDO_ALT {
             if pt_undo(&e.buffer.table) {
+                editor_clear_extra_cursors(e)
                 editor_invalidate_syntax(e, 0)
                 editor_mark_dirty(e)
                 editor_snap_cursor(e)
@@ -2312,6 +2442,7 @@ editor_handle_event :: proc(e: ^Editor, event: ^sdl.Event, window: ^sdl.Window, 
 
         if is_ctrl && key == KEY_REDO {
             if pt_redo(&e.buffer.table) {
+                editor_clear_extra_cursors(e)
                 editor_invalidate_syntax(e, 0)
                 editor_mark_dirty(e)
                 editor_snap_cursor(e)
@@ -2349,6 +2480,8 @@ editor_render :: proc(
     theme: ^Theme,
     lsp: ^LspClient = nil,
     search_pattern := "",
+    search_scope_start := 0,
+    search_scope_end := -1,
 ) {
     if rect.w < 50 || rect.h < 50 do return
 
@@ -2422,7 +2555,28 @@ editor_render :: proc(
     }
 
     // 5. Visual Mode selection highlight rectangles
-    if e.mode == .Visual {
+    if e.mode == .Visual && e.block_selection {
+        r0, r1, c0, c1 := editor_block_bounds(e)
+        for i in 0 ..< visible_lines {
+            line_idx := e.scroll_row + i
+            if line_idx >= total_lines do break
+            if line_idx < r0 || line_idx > r1 do continue
+
+            line_len := editor_get_line_len(e, line_idx)
+            start := clamp(c0, 0, line_len)
+            end := clamp(c1, 0, line_len)
+            if end < line_len do end = editor_next_rune_end(e, line_idx, end)
+            v0 := editor_visual_col(e, line_idx, start)
+            v1 := editor_visual_col(e, line_idx, end)
+            if v1 <= v0 do v1 = v0 + 1
+
+            sel_x := rect.x + gutter_w + 4.0 + f32(v0 - e.scroll_col) * char_w
+            sel_w := f32(v1 - v0) * char_w
+            sel_rect := sdl.FRect{sel_x, rect.y + f32(i) * line_h, sel_w, line_h}
+            sdl.SetRenderDrawColorFloat(renderer, theme.selection_bg.r, theme.selection_bg.g, theme.selection_bg.b, theme.selection_bg.a)
+            sdl.RenderFillRect(renderer, &sel_rect)
+        }
+    } else if e.mode == .Visual {
         start_sel, end_sel := editor_get_selection_range(e)
         for i in 0 ..< visible_lines {
             line_idx := e.scroll_row + i
@@ -2483,12 +2637,18 @@ editor_render :: proc(
             line_str, ok := pt_line_text(&e.buffer.table, line_idx, context.temp_allocator)
             if !ok do continue
 
+            line_base := pt_line_to_offset(&e.buffer.table, line_idx)
             from := 0
             for from < len(line_str) {
                 idx := strings.index(line_str[from:], search_pattern)
                 if idx < 0 do break
                 abs := from + idx
                 from = abs + 1
+
+                if search_scope_end >= 0 {
+                    global := line_base + abs
+                    if global < search_scope_start || global + len(search_pattern) > search_scope_end do continue
+                }
 
                 vis_st := editor_visual_col(e, line_idx, abs)
                 vis_en := editor_visual_col(e, line_idx, min(len(line_str), abs + len(search_pattern)))
@@ -2551,6 +2711,16 @@ editor_render :: proc(
 
     if is_focused && e.cursor.shape == .Block {
         render_cursor(&e.cursor, renderer, cx, cy, char_w, line_h, e.last_action)
+        for c in e.extra_cursors {
+            if c.row < e.scroll_row || c.row >= e.scroll_row + visible_lines do continue
+            vis := editor_visual_col(e, c.row, c.col)
+            ex := rect.x + gutter_w + 4.0 + f32(vis - scroll_vis) * char_w
+            ey := rect.y + f32(c.row - e.scroll_row) * line_h
+            extra := c
+            extra.shape = .Block
+            extra.color = theme.cursor
+            render_cursor(&extra, renderer, ex, ey, char_w, line_h, e.last_action)
+        }
     }
 
     // 7. Push visible lines into font batcher
@@ -2638,7 +2808,7 @@ editor_render :: proc(
         mode_text = "-- INSERT --"
         status_color = theme.string_lit
     case .Visual:
-        mode_text = "-- VISUAL --"
+        mode_text = "-- VISUAL BLOCK --" if e.block_selection else "-- VISUAL --"
         status_color = theme.fn_name
     case .Command:
         mode_text = "-- COMMAND --"
@@ -2683,6 +2853,16 @@ editor_render :: proc(
     // 9. Bar Cursor (in Insert Mode)
     if is_focused && e.cursor.shape == .Bar {
         render_cursor(&e.cursor, renderer, cx, cy, char_w, line_h, e.last_action)
+        for c in e.extra_cursors {
+            if c.row < e.scroll_row || c.row >= e.scroll_row + visible_lines do continue
+            vis := editor_visual_col(e, c.row, c.col)
+            ex := rect.x + gutter_w + 4.0 + f32(vis - scroll_vis) * char_w
+            ey := rect.y + f32(c.row - e.scroll_row) * line_h
+            extra := c
+            extra.shape = .Bar
+            extra.color = theme.cursor
+            render_cursor(&extra, renderer, ex, ey, char_w, line_h, e.last_action)
+        }
     }
 
     // 10. Autocomplete Popup

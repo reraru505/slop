@@ -70,6 +70,9 @@ DEFAULT_ROOT_DIRECTORY :: ""
 // listing was truncated.
 FILE_PICKER_MAX_ITEMS :: 20_000
 
+// Maximum additional cursors created by Shift+C over search matches.
+MULTI_CURSOR_LIMIT :: 256
+
 // ============================================================================
 // Language servers
 // ============================================================================
@@ -162,6 +165,8 @@ KEY_VISUAL_TOGGLE      :: sdl.K_X        // Ctrl+X
 KEY_FORMAT_LINE        :: sdl.K_EQUALS   // ==
 KEY_FORMAT_SELECTION   :: sdl.K_EQUALS   // = in Visual mode
 KEY_HOVER              :: sdl.K_K        // Shift+K
+KEY_MULTI_CURSOR       :: sdl.K_C        // Shift+C: cursors at search matches / block select
+KEY_BLOCK_VISUAL       :: sdl.K_V        // Ctrl+V: rectangle selection
 KEY_SEARCH             :: sdl.K_SLASH    // / (search forward)
 KEY_SEARCH_NEXT        :: sdl.K_N        // n
 KEY_SEARCH_PREV        :: sdl.K_N        // Shift+N

@@ -33,6 +33,10 @@ CommandPrompt :: struct {
     origin_offset    : int,
     origin_scroll_row: int,
     origin_scroll_col: int,
+    // Search restricted to the Visual selection the prompt was opened from.
+    scope_start      : int,
+    scope_end        : int,
+    scoped           : bool,
 }
 
 app_reset_command_completion :: proc(prompt: ^CommandPrompt) {
@@ -91,6 +95,11 @@ App :: struct {
     search_direction : int,
     // Whether the last search's matches are painted. Opening `/` clears it.
     search_highlight : bool,
+    // Active search scope (a Visual selection) for n / N / p and painting.
+    search_scoped      : bool,
+    search_scope_start : int,
+    search_scope_end   : int,
+    search_scope_pane  : ^Pane,
     current_theme_id : ThemeId,
     theme            : Theme,
     running          : bool,
@@ -209,6 +218,17 @@ app_open_search_prompt :: proc(app: ^App) {
         cp.origin_scroll_col = 0
     }
     cp.origin_offset = app_search_cursor_offset(p)
+    cp.scoped = false
+    cp.scope_start = 0
+    cp.scope_end = -1
+    if p.kind == .Editor && p.editor.mode == .Visual && !p.editor.block_selection {
+        start, end := editor_selection_offsets(&p.editor)
+        if end > start {
+            cp.scoped = true
+            cp.scope_start = start
+            cp.scope_end = end
+        }
+    }
     clear(&cp.buffer)
     app_reset_command_completion(cp)
     cp.message = ""
@@ -710,6 +730,10 @@ app_replace_command :: proc(app: ^App, arg: string) {
     }
     if e.mode != .Visual {
         app_set_message(app, "E: Select text before :replace")
+        return
+    }
+    if e.block_selection {
+        app_set_message(app, "E: :replace needs a character selection, not a block")
         return
     }
     if arg == "" {
@@ -1590,11 +1614,11 @@ draw :: proc(app: ^App) {
         switch p.kind {
         case .Editor:
             editor_sync_view(&p.editor)
-            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app_search_pattern(app))
+            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app_search_pattern(app), app.search_scope_start if (app.search_scoped && app.search_scope_pane == p) else 0, app.search_scope_end if (app.search_scoped && app.search_scope_pane == p) else -1)
         case .Dired:
             if p.dired.is_editing {
                 editor_sync_view(&p.editor)
-                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app_search_pattern(app))
+                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app_search_pattern(app), app.search_scope_start if (app.search_scoped && app.search_scope_pane == p) else 0, app.search_scope_end if (app.search_scoped && app.search_scope_pane == p) else -1)
             } else {
                 dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_search_pattern(app))
             }

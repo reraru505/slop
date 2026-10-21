@@ -27,35 +27,40 @@ search_find_in_text :: proc(
     text, pattern: string,
     start_offset, direction: int,
     inclusive: bool,
+    range_start := 0,
+    range_end := -1,
 ) -> (offset: int, wrapped: bool, found: bool) {
     if pattern == "" || len(text) == 0 do return 0, false, false
 
     n := len(text)
-    start := clamp(start_offset, 0, n)
+    lo := clamp(range_start, 0, n)
+    hi := n if range_end < 0 else clamp(range_end, lo, n)
+    if hi <= lo do return 0, false, false
+    start := clamp(start_offset, lo, hi)
 
     if direction >= 0 {
         from := start
         if !inclusive {
-            from = min(n, start + 1)
+            from = min(hi, start + 1)
         }
-        if from < n {
-            if idx := strings.index(text[from:], pattern); idx >= 0 {
+        if from < hi {
+            if idx := strings.index(text[from:hi], pattern); idx >= 0 {
                 return from + idx, false, true
             }
         }
-        if idx := strings.index(text, pattern); idx >= 0 {
-            return idx, true, true
+        if idx := strings.index(text[lo:hi], pattern); idx >= 0 {
+            return lo + idx, true, true
         }
         return 0, false, false
     }
 
     // Backward: remember the last match at or before the limit, scanning from
-    // the start so overlapping occurrences are all considered.
+    // the range start so overlapping occurrences are all considered.
     limit := start if inclusive else start - 1
     last := -1
-    i := 0
-    for i < n {
-        idx := strings.index(text[i:], pattern)
+    i := lo
+    for i < hi {
+        idx := strings.index(text[i:hi], pattern)
         if idx < 0 do break
         abs := i + idx
         if abs > limit do break
@@ -64,11 +69,11 @@ search_find_in_text :: proc(
     }
     if last >= 0 do return last, false, true
 
-    // Nothing before the cursor: wrap to the last occurrence in the document.
+    // Nothing before the cursor: wrap to the last occurrence in the range.
     last = -1
-    i = 0
-    for i < n {
-        idx := strings.index(text[i:], pattern)
+    i = lo
+    for i < hi {
+        idx := strings.index(text[i:hi], pattern)
         if idx < 0 do break
         abs := i + idx
         last = abs
@@ -229,7 +234,16 @@ app_search_apply :: proc(
     if p == nil || pattern == "" do return false
 
     text := app_search_text(p, context.temp_allocator)
-    offset, wrapped, found := search_find_in_text(text, pattern, start_offset, direction, inclusive)
+    scoped := app.search_scoped && app.search_scope_pane == p
+    offset, wrapped, found := search_find_in_text(
+        text,
+        pattern,
+        start_offset,
+        direction,
+        inclusive,
+        app.search_scope_start if scoped else 0,
+        app.search_scope_end if scoped else -1,
+    )
     if !found {
         app_set_message(app, fmt.tprintf("E486: Pattern not found: %s", pattern))
         return false
@@ -279,8 +293,15 @@ app_submit_search :: proc(app: ^App) {
     pattern := strings.clone(string(cp.buffer[:]), context.temp_allocator)
     source := cp.source_pane
     start := cp.origin_offset
+    scoped := cp.scoped
+    scope_start := cp.scope_start
+    scope_end := cp.scope_end
 
     app_close_command_prompt(app)
+    app.search_scoped = scoped
+    app.search_scope_start = scope_start
+    app.search_scope_end = scope_end
+    app.search_scope_pane = source if scoped else nil
 
     // Search belongs to the pane the prompt was opened from, even if a mouse
     // click moved focus while the prompt was active.

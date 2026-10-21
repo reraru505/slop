@@ -42,6 +42,10 @@ SEARCH
   {search}<pattern> .... search editor, dired, or compilation (Esc restores the cursor)
   {search_next} / {search_prev} / {search_prev_alt} .... next / previous match (wraps around)
   Enter highlights matches; typing {search} again clears them
+  {multi_cursor} over highlighted matches ... cursor at every occurrence
+  {block_visual} or {multi_cursor} (no search) ... rectangle selection; j/k extend
+  Motions move every cursor; typing/Backspace edits every cursor; Esc collapses
+  With a character selection, {search} searches only inside it
 
 LSP (when a language server is available)
   {completion_trigger} ... trigger completion
