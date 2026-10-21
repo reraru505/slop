@@ -2454,7 +2454,13 @@ editor_render :: proc(
     // Search matches: a translucent band behind every visible occurrence.
     // Text is batched and flushed after this, so these land behind the glyphs.
     if search_pattern != "" {
-        sdl.SetRenderDrawColorFloat(renderer, 0.95, 0.78, 0.25, 0.35)
+        sdl.SetRenderDrawColorFloat(
+            renderer,
+            SEARCH_HIGHLIGHT.r,
+            SEARCH_HIGHLIGHT.g,
+            SEARCH_HIGHLIGHT.b,
+            SEARCH_HIGHLIGHT.a,
+        )
         for i in 0 ..< visible_lines {
             line_idx := e.scroll_row + i
             if line_idx >= total_lines do break

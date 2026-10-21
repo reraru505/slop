@@ -168,3 +168,84 @@ test_search_missing_pattern_and_history :: proc(t: ^testing.T) {
 
     fmt.println("  ✓ [Search] E35/E486 paths leave the cursor unchanged")
 }
+
+@(test)
+test_search_in_dired_buffer :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/search_dired"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/alpha.txt", dir), "a") == nil)
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/beta.txt", dir), "b") == nil)
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/gamma.log", dir), "g") == nil)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+    app_pane_open_dired(&app, pane, dir)
+    dired_wait_load(&pane.dired)
+    testing.expect_value(t, pane.kind, PaneKind.Dired)
+    testing.expect_value(t, app.active_pane, pane)
+
+    gamma_idx := -1
+    for entry, i in pane.dired.entries {
+        if entry.name == "gamma.log" do gamma_idx = i
+    }
+    testing.expect(t, gamma_idx >= 0)
+
+    app_open_search_prompt(&app)
+    for b in transmute([]u8)string("gamma") do append(&app.cmd_prompt.buffer, b)
+    app_submit_prompt(&app)
+    testing.expect_value(t, pane.dired.cursor, gamma_idx)
+    testing.expect_value(t, app.last_search, "gamma")
+
+    // n wraps around when the only match is the current one.
+    app_search_repeat(&app, false)
+    testing.expect_value(t, pane.dired.cursor, gamma_idx)
+    testing.expect(t, strings.contains(app.cmd_prompt.message, "wrapped to top"))
+
+    fmt.println("  ✓ [Search] dired listing search moves the entry cursor")
+}
+
+@(test)
+test_search_in_compilation_buffer :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    pane := app.active_pane
+    pane.kind = .Compilation
+    c := &pane.compilation
+    append(&c.lines, CompilationLine{text = strings.clone("first line")})
+    append(&c.lines, CompilationLine{text = strings.clone("an error here")})
+    append(&c.lines, CompilationLine{text = strings.clone("another error")})
+    c.cursor = 0
+    c.cursor_col = 0
+    app.active_pane = pane
+
+    app_open_search_prompt(&app)
+    testing.expect_value(t, app.cmd_prompt.source_pane, pane)
+    for b in transmute([]u8)string("error") do append(&app.cmd_prompt.buffer, b)
+    app_submit_prompt(&app)
+    testing.expect_value(t, c.cursor, 1)
+    testing.expect_value(t, c.cursor_col, 3)
+    testing.expect_value(t, app.last_search, "error")
+
+    // An empty `/<Enter>` repeats the search from the current match.
+    app_open_search_prompt(&app)
+    app_submit_prompt(&app)
+    testing.expect_value(t, c.cursor, 2)
+    testing.expect_value(t, c.cursor_col, 8)
+
+    // Esc restores the compilation cursor and scroll position.
+    c.cursor = 0
+    c.cursor_col = 2
+    c.scroll = 1
+    app_open_search_prompt(&app)
+    for b in transmute([]u8)string("error") do append(&app.cmd_prompt.buffer, b)
+    app_cancel_search_prompt(&app)
+    testing.expect_value(t, c.cursor, 0)
+    testing.expect_value(t, c.cursor_col, 2)
+    testing.expect_value(t, c.scroll, 1)
+
+    fmt.println("  ✓ [Search] compilation output search and restore verified")
+}

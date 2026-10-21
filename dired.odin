@@ -606,6 +606,19 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
             return true
         }
 
+        if key == KEY_SEARCH {
+            app_open_search_prompt(app)
+            return true
+        }
+        if key == KEY_SEARCH_NEXT || key == KEY_SEARCH_PREV {
+            reverse := is_shift
+            if KEY_SEARCH_NEXT != KEY_SEARCH_PREV {
+                reverse = key == KEY_SEARCH_PREV
+            }
+            app_search_repeat(app, reverse)
+            return true
+        }
+
         // Toggle edit mode via 'i' or 'Esc'
         if key == KEY_DIRED_EDIT || key == sdl.K_ESCAPE {
             dired_enter_edit_mode(d, &pane.editor, &app.font, app.window)
@@ -708,10 +721,19 @@ dired_handle_event :: proc(d: ^Dired, event: ^sdl.Event, app: ^App, pane: ^Pane)
     return false
 }
 
-dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme) {
+dired_render :: proc(
+    d: ^Dired,
+    renderer: ^sdl.Renderer,
+    font: ^Font,
+    rect: sdl.FRect,
+    is_focused: bool,
+    theme: ^Theme,
+    search_pattern := "",
+) {
     if rect.w < 50 || rect.h < 50 do return
 
     line_h := get_line_height(.HALF)
+    cell_w := g_font_metrics.cell_width * get_font_scale_multiplier(.HALF)
 
     header_h := line_h * 2.0
     status_bar_h := line_h + 8.0
@@ -777,6 +799,36 @@ dired_render :: proc(d: ^Dired, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.
 
         entry := d.entries[idx]
         y_pos := rect.y + header_h + f32(i) * line_h
+
+        if search_pattern != "" {
+            display := entry.name
+            if entry.is_dir do display = fmt.tprintf("%s/", entry.name)
+            from := 0
+            for from < len(display) {
+                hit := strings.index(display[from:], search_pattern)
+                if hit < 0 do break
+                abs := from + hit
+                from = abs + 1
+
+                v0 := text_visual_col(display, abs)
+                v1 := text_visual_col(display, min(len(display), abs + len(search_pattern)))
+                if v1 <= v0 do v1 = v0 + 1
+                match_rect := sdl.FRect{
+                    x = rect.x + 24.0 + f32(v0) * cell_w,
+                    y = y_pos,
+                    w = f32(v1 - v0) * cell_w,
+                    h = line_h,
+                }
+                sdl.SetRenderDrawColorFloat(
+                    renderer,
+                    SEARCH_HIGHLIGHT.r,
+                    SEARCH_HIGHLIGHT.g,
+                    SEARCH_HIGHLIGHT.b,
+                    SEARCH_HIGHLIGHT.a,
+                )
+                sdl.RenderFillRect(renderer, &match_rect)
+            }
+        }
 
         if idx == d.cursor && is_focused {
             sel_rect := sdl.FRect{

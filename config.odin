@@ -50,6 +50,10 @@ DEFAULT_THEME :: ThemeId.GruberDarker
 DEFAULT_LINE_SPACING :: 1.0
 DEFAULT_UI_SCALE     :: 1.0
 
+// Background band behind `/` matches. Kept translucent so syntax colors stay
+// readable underneath.
+SEARCH_HIGHLIGHT :: sdl.FColor{0.90, 0.75, 0.30, 0.16}
+
 WINDOW_TITLE  :: EDITOR_NAME
 WINDOW_WIDTH  :: 1024
 WINDOW_HEIGHT :: 768

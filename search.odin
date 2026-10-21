@@ -2,12 +2,14 @@ package main
 
 import "core:fmt"
 import "core:strings"
+import "core:time"
 
-// Plain-text search. Patterns are literal (no regex), matching Vim's `/`
-// navigation without pulling a regex engine into every keystroke.
+// Plain-text search across editor, dired, and compilation buffers. Patterns
+// are literal (no regex) and case-sensitive.
 //
-// The search works on the full document text and maps the match offset back to
-// a line and byte column. Matching is case-sensitive.
+// Matches are found on a buffer's full text and mapped back to that buffer's
+// cursor representation: (row, byte column) for editors and compilation
+// output, and an entry index for dired listings.
 
 Search_Match :: struct {
     offset  : int,
@@ -75,46 +77,94 @@ search_find_in_text :: proc(
     return 0, false, false
 }
 
+search_row_and_start :: proc(text: string, offset: int) -> (row, line_start: int) {
+    row = 0
+    line_start = 0
+    for i in 0 ..< clamp(offset, 0, len(text)) {
+        if text[i] == '\n' {
+            row += 1
+            line_start = i + 1
+        }
+    }
+    return
+}
+
+// Every pane kind can be searched. Dired and compilation buffers use their own
+// line lists, so their search text is rebuilt on demand.
 app_search_pane :: proc(app: ^App) -> ^Pane {
     if app == nil || app.active_pane == nil do return nil
     p := app.active_pane
-    if p.kind == .Editor do return p
-    if p.kind == .Dired && p.dired.is_editing do return p
+    #partial switch p.kind {
+    case .Editor, .Dired, .Compilation:
+        return p
+    }
     return nil
 }
 
-// Moves the active editor view to the next match. Returns false when the
-// pattern is not found (the cursor is left where it was).
-app_search_apply :: proc(
-    app: ^App,
-    pattern: string,
-    direction: int,
-    start_offset: int,
-    inclusive: bool,
-) -> bool {
-    p := app_search_pane(app)
-    if p == nil || pattern == "" do return false
-    e := &p.editor
-
-    text := pt_full_text(&e.buffer.table)
-    defer delete(text)
-
-    offset, wrapped, found := search_find_in_text(text, pattern, start_offset, direction, inclusive)
-    if !found {
-        app_set_message(app, fmt.tprintf("E486: Pattern not found: %s", pattern))
-        return false
+// Joined search text for a pane. Editors use the piece table directly; dired
+// listings use the displayed names (directories with a trailing slash), and
+// compilation output uses its lines with newlines between them. Cursor offsets
+// are computed against the same representation.
+app_search_text :: proc(p: ^Pane, allocator := context.temp_allocator) -> string {
+    if p == nil do return ""
+    switch p.kind {
+    case .Editor:
+        return pt_full_text(&p.editor.buffer.table, allocator)
+    case .Dired:
+        if p.dired.is_editing {
+            return pt_full_text(&p.editor.buffer.table, allocator)
+        }
+        b: strings.Builder
+        strings.builder_init(&b, 0, max(64, len(p.dired.entries) * 16), allocator)
+        for entry in p.dired.entries {
+            strings.write_string(&b, entry.name)
+            if entry.is_dir do strings.write_byte(&b, '/')
+            strings.write_byte(&b, '\n')
+        }
+        return strings.to_string(b)
+    case .Compilation:
+        b: strings.Builder
+        strings.builder_init(&b, 0, max(64, len(p.compilation.lines) * 32), allocator)
+        for line in p.compilation.lines {
+            strings.write_string(&b, line.text)
+            strings.write_byte(&b, '\n')
+        }
+        return strings.to_string(b)
     }
+    return ""
+}
 
-    row := pt_offset_to_line(&e.buffer.table, offset)
-    line_start := pt_line_to_offset(&e.buffer.table, row)
-    e.cursor.row = row
-    e.cursor.col = editor_clamp_col_to_rune(e, row, offset - line_start)
-    e.desired_col = editor_visual_col(e, row, e.cursor.col)
-    if e.mode != .Visual {
-        e.selection_anchor = e.cursor
+// Offset of the pane's current cursor in the text returned by app_search_text.
+app_search_cursor_offset :: proc(p: ^Pane) -> int {
+    if p == nil do return 0
+    switch p.kind {
+    case .Editor:
+        return editor_get_cursor_offset(&p.editor)
+    case .Dired:
+        if p.dired.is_editing {
+            return editor_get_cursor_offset(&p.editor)
+        }
+        offset := 0
+        n := clamp(p.dired.cursor, 0, len(p.dired.entries))
+        for i in 0 ..< n {
+            entry := p.dired.entries[i]
+            offset += len(entry.name) + 1
+            if entry.is_dir do offset += 1
+        }
+        return offset
+    case .Compilation:
+        offset := 0
+        n := clamp(p.compilation.cursor, 0, len(p.compilation.lines))
+        for i in 0 ..< n {
+            offset += len(p.compilation.lines[i].text) + 1
+        }
+        offset += clamp(p.compilation.cursor_col, 0, compilation_line_len(&p.compilation, n))
+        return offset
     }
-    e.pending_cmd = 0
+    return 0
+}
 
+app_search_commit :: proc(app: ^App, pattern: string, direction: int, wrapped: bool) {
     if app.last_search != pattern {
         new_search := strings.clone(pattern)
         if app.last_search != "" do delete(app.last_search)
@@ -131,7 +181,64 @@ app_search_apply :: proc(
     } else {
         app_set_message(app, fmt.tprintf("/%s", pattern))
     }
+}
+
+// Moves the active buffer's cursor to the next match. Returns false when the
+// pattern is not found (the cursor is left where it was).
+app_search_apply :: proc(
+    app: ^App,
+    pattern: string,
+    direction: int,
+    start_offset: int,
+    inclusive: bool,
+) -> bool {
+    p := app_search_pane(app)
+    if p == nil || pattern == "" do return false
+
+    text := app_search_text(p, context.temp_allocator)
+    offset, wrapped, found := search_find_in_text(text, pattern, start_offset, direction, inclusive)
+    if !found {
+        app_set_message(app, fmt.tprintf("E486: Pattern not found: %s", pattern))
+        return false
+    }
+
+    switch p.kind {
+    case .Editor:
+        search_move_editor(&p.editor, offset)
+    case .Dired:
+        if p.dired.is_editing {
+            search_move_editor(&p.editor, offset)
+        } else {
+            row, _ := search_row_and_start(text, offset)
+            p.dired.cursor = clamp(row, 0, max(0, len(p.dired.entries) - 1))
+            p.dired.last_action = time.now()
+        }
+    case .Compilation:
+        row, line_start := search_row_and_start(text, offset)
+        c := &p.compilation
+        c.cursor = clamp(row, 0, max(0, len(c.lines) - 1))
+        c.cursor_col = clamp(offset - line_start, 0, compilation_line_len(c, c.cursor))
+        c.desired_col = compilation_visual_col(c, c.cursor, c.cursor_col)
+        c.selecting = false
+        c.linewise = false
+        c.dragging = false
+        c.pending_g = false
+    }
+
+    app_search_commit(app, pattern, direction, wrapped)
     return true
+}
+
+search_move_editor :: proc(e: ^Editor, offset: int) {
+    row := pt_offset_to_line(&e.buffer.table, offset)
+    line_start := pt_line_to_offset(&e.buffer.table, row)
+    e.cursor.row = row
+    e.cursor.col = editor_clamp_col_to_rune(e, row, offset - line_start)
+    e.desired_col = editor_visual_col(e, row, e.cursor.col)
+    if e.mode != .Visual {
+        e.selection_anchor = e.cursor
+    }
+    e.pending_cmd = 0
 }
 
 // Submits the `/` prompt. An empty pattern repeats the previous search.
@@ -139,8 +246,7 @@ app_submit_search :: proc(app: ^App) {
     cp := &app.cmd_prompt
     pattern := strings.clone(string(cp.buffer[:]), context.temp_allocator)
     source := cp.source_pane
-    origin_row := cp.origin_row
-    origin_col := cp.origin_col
+    start := cp.origin_offset
 
     app_close_command_prompt(app)
 
@@ -151,7 +257,10 @@ app_submit_search :: proc(app: ^App) {
     }
     if app.active_pane == nil do return
 
-    if pattern == "" {
+    // An empty prompt repeats the last pattern from after the cursor, like
+    // `n`; a freshly typed pattern may match the character under the cursor.
+    repeating := pattern == ""
+    if repeating {
         if app.last_search == "" {
             app_set_message(app, "E35: No previous search pattern")
             return
@@ -159,13 +268,7 @@ app_submit_search :: proc(app: ^App) {
         pattern = app.last_search
     }
 
-    p := app_search_pane(app)
-    if p == nil do return
-    e := &p.editor
-    row := clamp(origin_row, 0, pt_get_line_count(&e.buffer.table))
-    col := clamp(origin_col, 0, editor_get_line_len(e, row))
-    start := pt_line_to_offset(&e.buffer.table, row) + col
-    _ = app_search_apply(app, pattern, 1, start, true)
+    _ = app_search_apply(app, pattern, 1, start, !repeating)
 }
 
 // `n` and `N`: repeat the last search in the current or opposite direction.
@@ -182,7 +285,7 @@ app_search_repeat :: proc(app: ^App, reverse: bool) {
     if direction == 0 do direction = 1
     if reverse do direction = -direction
 
-    start := editor_get_cursor_offset(&p.editor)
+    start := app_search_cursor_offset(p)
     _ = app_search_apply(app, app.last_search, direction, start, false)
 }
 
@@ -190,13 +293,33 @@ app_search_repeat :: proc(app: ^App, reverse: bool) {
 app_cancel_search_prompt :: proc(app: ^App) {
     cp := &app.cmd_prompt
     if cp.source_pane != nil {
-        e := &cp.source_pane.editor
-        e.cursor.row = cp.origin_row
-        e.cursor.col = cp.origin_col
-        e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
-        e.selection_anchor = e.cursor
-        e.scroll_row = cp.origin_scroll_row
-        e.scroll_col = cp.origin_scroll_col
+        p := cp.source_pane
+        switch p.kind {
+        case .Editor:
+            search_restore_editor(&p.editor, cp.origin_row, cp.origin_col, cp.origin_scroll_row, cp.origin_scroll_col)
+        case .Dired:
+            if p.dired.is_editing {
+                search_restore_editor(&p.editor, cp.origin_row, cp.origin_col, cp.origin_scroll_row, cp.origin_scroll_col)
+            } else {
+                p.dired.cursor = cp.origin_row
+                p.dired.scroll = cp.origin_scroll_row
+            }
+        case .Compilation:
+            c := &p.compilation
+            c.cursor = cp.origin_row
+            c.cursor_col = cp.origin_col
+            c.desired_col = compilation_visual_col(c, c.cursor, c.cursor_col)
+            c.scroll = cp.origin_scroll_row
+        }
     }
     app_close_command_prompt(app)
+}
+
+search_restore_editor :: proc(e: ^Editor, row, col, scroll_row, scroll_col: int) {
+    e.cursor.row = row
+    e.cursor.col = col
+    e.desired_col = editor_visual_col(e, e.cursor.row, e.cursor.col)
+    e.selection_anchor = e.cursor
+    e.scroll_row = scroll_row
+    e.scroll_col = scroll_col
 }

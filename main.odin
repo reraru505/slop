@@ -30,6 +30,7 @@ CommandPrompt :: struct {
     source_pane      : ^Pane,
     origin_row       : int,
     origin_col       : int,
+    origin_offset    : int,
     origin_scroll_row: int,
     origin_scroll_col: int,
 }
@@ -179,10 +180,31 @@ app_open_search_prompt :: proc(app: ^App) {
     cp.active = true
     cp.kind = .Search
     cp.source_pane = p
-    cp.origin_row = p.editor.cursor.row
-    cp.origin_col = p.editor.cursor.col
-    cp.origin_scroll_row = p.editor.scroll_row
-    cp.origin_scroll_col = p.editor.scroll_col
+    switch p.kind {
+    case .Editor:
+        cp.origin_row = p.editor.cursor.row
+        cp.origin_col = p.editor.cursor.col
+        cp.origin_scroll_row = p.editor.scroll_row
+        cp.origin_scroll_col = p.editor.scroll_col
+    case .Dired:
+        if p.dired.is_editing {
+            cp.origin_row = p.editor.cursor.row
+            cp.origin_col = p.editor.cursor.col
+            cp.origin_scroll_row = p.editor.scroll_row
+            cp.origin_scroll_col = p.editor.scroll_col
+        } else {
+            cp.origin_row = p.dired.cursor
+            cp.origin_col = 0
+            cp.origin_scroll_row = p.dired.scroll
+            cp.origin_scroll_col = 0
+        }
+    case .Compilation:
+        cp.origin_row = p.compilation.cursor
+        cp.origin_col = p.compilation.cursor_col
+        cp.origin_scroll_row = p.compilation.scroll
+        cp.origin_scroll_col = 0
+    }
+    cp.origin_offset = app_search_cursor_offset(p)
     clear(&cp.buffer)
     app_reset_command_completion(cp)
     cp.message = ""
@@ -1494,10 +1516,10 @@ draw :: proc(app: ^App) {
                 editor_sync_view(&p.editor)
                 editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app.last_search)
             } else {
-                dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused, &app.theme)
+                dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused, &app.theme, app.last_search)
             }
         case .Compilation:
-            compilation_render(&p.compilation, app.renderer, &app.font, p.rect, is_focused, &app.theme)
+            compilation_render(&p.compilation, app.renderer, &app.font, p.rect, is_focused, &app.theme, app.last_search)
         }
     }
 

@@ -45,6 +45,24 @@ rune_display_width :: proc(r: rune) -> int {
     return 2 if width == 2 else 1
 }
 
+// Terminal cell column of a byte offset in ordinary text (not tied to an
+// editor line). Tabs use the editor's tab width.
+text_visual_col :: proc(text: string, byte_col: int) -> int {
+    n := clamp(byte_col, 0, len(text))
+    col := 0
+    i := 0
+    for i < n {
+        r, size := utf8.decode_rune_in_string(text[i:])
+        if size <= 0 {
+            size = 1
+            r = utf8.RUNE_ERROR
+        }
+        col += TAB_WIDTH if r == '\t' else rune_display_width(r)
+        i += size
+    }
+    return col
+}
+
 is_word_rune :: proc(r: rune) -> bool {
     return r == '_' || unicode.is_letter(r) || unicode.is_digit(r)
 }

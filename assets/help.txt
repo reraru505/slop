@@ -40,7 +40,7 @@ EDITING
   Backspace .... removes an empty pair; at column 0 it joins with above
 
 SEARCH
-  {search}<pattern> .... search forward (Enter runs it, Esc restores the cursor)
+  {search}<pattern> .... search editor, dired, or compilation (Esc restores the cursor)
   {search_next} / {search_prev} ......... next / previous match (wraps around)
 
 LSP (when a language server is available)

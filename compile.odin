@@ -1002,6 +1002,13 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
             return true
         }
 
+        // Search the output. An empty `/<Enter>` repeat advances to the next
+        // match; n/N stay bound to compiler error navigation.
+        if key == KEY_SEARCH {
+            app_open_search_prompt(app)
+            return true
+        }
+
         // M-w (Alt+W) is the copy binding shared with editor Visual mode.
         if is_alt && key == KEY_COMPILE_YANK_ALT {
             compilation_copy(c, app, false)
@@ -1135,7 +1142,15 @@ compilation_handle_event :: proc(c: ^Compilation, event: ^sdl.Event, app: ^App, 
     return false
 }
 
-compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font, rect: sdl.FRect, is_focused: bool, theme: ^Theme) {
+compilation_render :: proc(
+    c: ^Compilation,
+    renderer: ^sdl.Renderer,
+    font: ^Font,
+    rect: sdl.FRect,
+    is_focused: bool,
+    theme: ^Theme,
+    search_pattern := "",
+) {
     if rect.w < 50 || rect.h < 50 do return
 
     line_h := get_line_height(.HALF)
@@ -1219,6 +1234,34 @@ compilation_render :: proc(c: ^Compilation, renderer: ^sdl.Renderer, font: ^Font
                     sdl.SetRenderDrawColorFloat(renderer, theme.selection_bg.r, theme.selection_bg.g, theme.selection_bg.b, 0.9)
                     sdl.RenderFillRect(renderer, &sel_rect)
                 }
+            }
+        }
+
+        if search_pattern != "" {
+            from := 0
+            for from < len(line.text) {
+                hit := strings.index(line.text[from:], search_pattern)
+                if hit < 0 do break
+                abs := from + hit
+                from = abs + 1
+
+                v0 := compilation_visual_col(c, idx, abs)
+                v1 := compilation_visual_col(c, idx, min(len(line.text), abs + len(search_pattern)))
+                if v1 <= v0 do v1 = v0 + 1
+                match_rect := sdl.FRect{
+                    x = text_x + f32(v0) * cell_w,
+                    y = y_pos,
+                    w = f32(v1 - v0) * cell_w,
+                    h = line_h,
+                }
+                sdl.SetRenderDrawColorFloat(
+                    renderer,
+                    SEARCH_HIGHLIGHT.r,
+                    SEARCH_HIGHLIGHT.g,
+                    SEARCH_HIGHLIGHT.b,
+                    SEARCH_HIGHLIGHT.a,
+                )
+                sdl.RenderFillRect(renderer, &match_rect)
             }
         }
 
