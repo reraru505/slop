@@ -78,6 +78,27 @@ search_find_in_text :: proc(
     return 0, false, false
 }
 
+// The pattern to paint, or "" when highlighting has been cleared.
+app_search_pattern :: proc(app: ^App) -> string {
+    if app == nil || !app.search_highlight do return ""
+    return app.last_search
+}
+
+app_search_key_keeps_highlight :: proc(key: sdl.Keycode) -> bool {
+    return key == KEY_SEARCH ||
+        key == KEY_SEARCH_NEXT ||
+        key == KEY_SEARCH_PREV ||
+        key == KEY_SEARCH_PREV_ALT
+}
+
+// Called for every editor key: any key that is not part of search navigation
+// ends the current search session's highlighting.
+app_search_note_key :: proc(app: ^App, key: sdl.Keycode) {
+    if app == nil || !SEARCH_HIGHLIGHT_AUTO_CLEAR do return
+    if app_search_key_keeps_highlight(key) do return
+    app.search_highlight = false
+}
+
 // Shared match styling used by every buffer renderer.
 draw_search_match :: proc(renderer: ^sdl.Renderer, x, y, w, h: f32) {
     band := sdl.FRect{x, y, w, h}
@@ -252,6 +273,7 @@ app_search_apply :: proc(
         c.pending_g = false
     }
 
+    app.search_highlight = true
     app_search_commit(app, pattern, direction, wrapped)
     return true
 }

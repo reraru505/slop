@@ -55,6 +55,11 @@ DEFAULT_UI_SCALE     :: 1.0
 SEARCH_HIGHLIGHT      :: sdl.FColor{0.90, 0.75, 0.30, 0.10}
 SEARCH_HIGHLIGHT_EDGE :: sdl.FColor{0.95, 0.78, 0.30, 0.55}
 
+// When true, `/` match highlighting disappears on the next key, mouse click,
+// or text edit, so it marks where you searched but does not linger. n / N / p
+// and another `/` keep it visible. `:noh` clears it immediately either way.
+SEARCH_HIGHLIGHT_AUTO_CLEAR :: true
+
 WINDOW_TITLE  :: EDITOR_NAME
 WINDOW_WIDTH  :: 1024
 WINDOW_HEIGHT :: 768

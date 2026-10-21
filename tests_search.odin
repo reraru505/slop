@@ -307,3 +307,51 @@ test_dired_search_cycles_three_matches :: proc(t: ^testing.T) {
 
     fmt.println("  ✓ [Search] dired cycles through all three matches")
 }
+
+@(test)
+test_search_highlight_clearing :: proc(t: ^testing.T) {
+    path := "/tmp/odin_editor_search_highlight.txt"
+    _ = os.remove(path)
+    testing.expect(t, os.write_entire_file_from_string(path, "needle one\nneedle two\n") == nil)
+    defer os.remove(path)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    pane := app.active_pane
+    testing.expect_value(t, app_pane_open_file(&app, pane, path), true)
+    e := &pane.editor
+
+    app_open_search_prompt(&app)
+    for b in transmute([]u8)string("needle") do append(&app.cmd_prompt.buffer, b)
+    app_submit_prompt(&app)
+    testing.expect_value(t, app.search_highlight, true)
+    testing.expect_value(t, app_search_pattern(&app), "needle")
+
+    // Search navigation keeps the highlight alive.
+    app_search_note_key(&app, KEY_SEARCH_NEXT)
+    testing.expect_value(t, app.search_highlight, true)
+    app_search_note_key(&app, KEY_SEARCH_PREV_ALT)
+    testing.expect_value(t, app.search_highlight, true)
+
+    // Any other key ends the highlighting session.
+    app_search_note_key(&app, KEY_MOVE_DOWN)
+    testing.expect_value(t, app.search_highlight, false)
+    testing.expect_value(t, app_search_pattern(&app), "")
+
+    // n brings it back, and :noh clears it without forgetting the pattern.
+    app_search_repeat(&app, false)
+    testing.expect_value(t, app.search_highlight, true)
+    testing.expect_value(t, app.last_search, "needle")
+    app_execute_command(&app, "noh")
+    testing.expect_value(t, app.search_highlight, false)
+    testing.expect_value(t, app.last_search, "needle")
+    testing.expect_value(t, app.cmd_prompt.message, "Search highlighting cleared")
+    app_search_repeat(&app, false)
+    testing.expect_value(t, app.search_highlight, true)
+
+    // The long form is accepted too.
+    app_execute_command(&app, "nohlsearch")
+    testing.expect_value(t, app.search_highlight, false)
+
+    fmt.println("  ✓ [Search] highlights clear on next key and via :noh")
+}
