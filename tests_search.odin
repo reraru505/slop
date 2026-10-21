@@ -102,18 +102,22 @@ test_search_prompt_navigation :: proc(t: ^testing.T) {
     testing.expect_value(t, e.cursor.col, 4)
     testing.expect(t, strings.contains(app.cmd_prompt.message, "wrapped to top"))
 
-    // N reverses direction; from the first match it wraps to the last.
+    // N searches opposite to the `/` direction; from the first match it wraps.
     app_search_repeat(&app, true)
     testing.expect_value(t, e.cursor.row, 3)
     testing.expect_value(t, e.cursor.col, 0)
-    testing.expect_value(t, app.search_direction, -1)
+    testing.expect_value(t, app.search_direction, 1)
     testing.expect(t, strings.contains(app.cmd_prompt.message, "wrapped to bottom"))
 
-    // p is the alternate backwards binding (Ctrl+Y remains paste).
+    // p is the alternate backwards binding (Ctrl+Y remains paste). Repeated p
+    // keeps walking backwards instead of toggling between two matches.
+    editor_handle_normal_key(e, KEY_SEARCH_PREV_ALT, {}, nil, &app)
+    testing.expect_value(t, e.cursor.row, 1)
+    testing.expect_value(t, e.cursor.col, 4)
+    testing.expect_value(t, app.search_direction, 1)
     editor_handle_normal_key(e, KEY_SEARCH_PREV_ALT, {}, nil, &app)
     testing.expect_value(t, e.cursor.row, 0)
     testing.expect_value(t, e.cursor.col, 4)
-    testing.expect(t, strings.contains(app.cmd_prompt.message, "wrapped to top"))
 
     // An empty prompt repeats the previous pattern from the current cursor.
     e.cursor.row = 2
@@ -292,12 +296,14 @@ test_dired_search_cycles_three_matches :: proc(t: ^testing.T) {
     testing.expect_value(t, pane.dired.cursor, hit_rows[0])
     testing.expect(t, strings.contains(app.cmd_prompt.message, "wrapped to top"))
 
-    // p cycles backwards through dired matches.
+    // p cycles backwards through dired matches and keeps going.
     key_event: sdl.Event
     key_event.type = .KEY_DOWN
     key_event.key.key = KEY_SEARCH_PREV_ALT
     dired_handle_event(&pane.dired, &key_event, &app, pane)
     testing.expect_value(t, pane.dired.cursor, hit_rows[2])
+    dired_handle_event(&pane.dired, &key_event, &app, pane)
+    testing.expect_value(t, pane.dired.cursor, hit_rows[1])
 
     fmt.println("  ✓ [Search] dired cycles through all three matches")
 }

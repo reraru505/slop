@@ -188,13 +188,16 @@ app_search_cursor_offset :: proc(p: ^Pane) -> int {
     return 0
 }
 
+// Record the pattern and report where the match landed. `search_direction`
+// is deliberately not touched here: it is the direction of the last search
+// command (`/`), so repeated n/N/p keep moving the same way instead of
+// reversing on every keystroke.
 app_search_commit :: proc(app: ^App, pattern: string, direction: int, wrapped: bool) {
     if app.last_search != pattern {
         new_search := strings.clone(pattern)
         if app.last_search != "" do delete(app.last_search)
         app.last_search = new_search
     }
-    app.search_direction = direction
 
     if wrapped {
         if direction >= 0 {
@@ -292,7 +295,10 @@ app_submit_search :: proc(app: ^App) {
         pattern = app.last_search
     }
 
-    _ = app_search_apply(app, pattern, 1, start, !repeating)
+    if app_search_apply(app, pattern, 1, start, !repeating) {
+        // Every `/` command searches forward, including an empty repeat.
+        app.search_direction = 1
+    }
 }
 
 // `n` and `N`: repeat the last search in the current or opposite direction.
