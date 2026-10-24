@@ -296,3 +296,111 @@ test_split_same_file_shares_buffer :: proc(t: ^testing.T) {
     testing.expect_value(t, orig.editor.cursor.col, 1)
     fmt.println("  ✓ [Split] same-file views share content, undo, dirty, and reload state")
 }
+
+@(test)
+test_dired_split_opens_shared_buffer :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/dired_split_shared"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+    path := fmt.tprintf("%s/shared.txt", dir)
+    testing.expect(t, os.write_entire_file_from_string(path, "shared") == nil)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    first := app.active_pane
+    app_pane_open_dired(&app, first, dir)
+    dired_wait_load(&first.dired)
+    app_split_pane(&app, first, .Vertical)
+    second := app.active_pane
+    testing.expect(t, second != first)
+    testing.expect_value(t, second.kind, PaneKind.Dired)
+
+    testing.expect_value(t, app_pane_open_file(&app, first, path), true)
+    testing.expect_value(t, app_pane_open_file(&app, second, path), true)
+    testing.expect(t, first.editor.buffer == second.editor.buffer)
+
+    pt_insert(&second.editor.buffer.table, pt_get_length(&second.editor.buffer.table), "!")
+    shared := pt_full_text(&first.editor.buffer.table)
+    defer delete(shared)
+    testing.expect_value(t, shared, "shared!")
+
+    fmt.println("  ✓ [Split] files opened from split dired panes share one buffer")
+}
+
+@(test)
+test_dired_split_open_via_enter_shares_buffer :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/dired_split_enter"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+    testing.expect(t, os.write_entire_file_from_string(fmt.tprintf("%s/target.txt", dir), "base") == nil)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+
+    first := app.active_pane
+    app_pane_open_dired(&app, first, dir)
+    dired_wait_load(&first.dired)
+    app_split_pane(&app, first, .Vertical)
+    second := app.active_pane
+    dired_wait_load(&second.dired)
+
+    ev: sdl.Event
+    ev.type = .KEY_DOWN
+    ev.key.key = sdl.K_RETURN
+    for pane in ([]^Pane{first, second}) {
+        target_idx := -1
+        for entry, i in pane.dired.entries {
+            if entry.name == "target.txt" do target_idx = i
+        }
+        testing.expect(t, target_idx >= 0)
+        pane.dired.cursor = target_idx
+        dired_handle_event(&pane.dired, &ev, &app, pane)
+    }
+
+    testing.expect_value(t, first.kind, PaneKind.Editor)
+    testing.expect_value(t, second.kind, PaneKind.Editor)
+    testing.expect(t, first.editor.buffer == second.editor.buffer)
+
+    pt_insert(&first.editor.buffer.table, pt_get_length(&first.editor.buffer.table), "!")
+    text := pt_full_text(&second.editor.buffer.table)
+    defer delete(text)
+    testing.expect_value(t, text, "base!")
+
+    fmt.println("  ✓ [Split] dired Enter opens the same buffer on both sides")
+}
+
+@(test)
+test_dired_split_after_hidden_editor_buffer :: proc(t: ^testing.T) {
+    dir := "/tmp/odin_editor_tests/dired_split_hidden"
+    _ = os.remove_all(dir)
+    testing.expect(t, os.make_directory_all(dir) == nil)
+    defer os.remove_all(dir)
+    path := fmt.tprintf("%s/file.txt", dir)
+    testing.expect(t, os.write_entire_file_from_string(path, "hidden") == nil)
+
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    first := app.active_pane
+    testing.expect_value(t, app_pane_open_file(&app, first, path), true)
+
+    // Convert the pane to dired; its hidden editor still owns the buffer.
+    app_pane_open_dired(&app, first, dir)
+    dired_wait_load(&first.dired)
+    app_split_pane(&app, first, .Vertical)
+    second := app.active_pane
+    dired_wait_load(&second.dired)
+
+    testing.expect_value(t, app_pane_open_file(&app, first, path), true)
+    testing.expect_value(t, app_pane_open_file(&app, second, path), true)
+    testing.expect(t, first.editor.buffer == second.editor.buffer)
+
+    pt_insert(&second.editor.buffer.table, pt_get_length(&second.editor.buffer.table), "!")
+    text := pt_full_text(&first.editor.buffer.table)
+    defer delete(text)
+    testing.expect_value(t, text, "hidden!")
+
+    fmt.println("  ✓ [Split] dired split reuses the hidden editor's buffer")
+}

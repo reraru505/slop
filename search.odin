@@ -89,6 +89,65 @@ app_search_pattern :: proc(app: ^App) -> string {
     return app.last_search
 }
 
+// All matches whose start lies inside a rectangle selection.
+search_block_matches :: proc(
+    e: ^Editor,
+    text, pattern: string,
+    r0, r1, c0, c1: int,
+    allocator := context.temp_allocator,
+) -> [dynamic]int {
+    offsets := make([dynamic]int, 0, 16, allocator)
+    if e == nil || pattern == "" do return offsets
+    total_lines := pt_get_line_count(&e.buffer.table) + 1
+    row_start := max(0, r0)
+    row_end := min(r1, total_lines - 1)
+    for row := row_start; row <= row_end; row += 1 {
+        line_len := editor_get_line_len(e, row)
+        start_col := clamp(c0, 0, line_len)
+        end_col := clamp(c1, 0, line_len)
+        if end_col < line_len do end_col = editor_next_rune_end(e, row, end_col)
+        if start_col >= end_col do continue
+
+        line_start := pt_line_to_offset(&e.buffer.table, row)
+        lo := line_start + start_col
+        hi := min(len(text), line_start + end_col)
+        i := lo
+        for i < hi {
+            idx := strings.index(text[i:hi], pattern)
+            if idx < 0 do break
+            append(&offsets, i + idx)
+            i = i + idx + 1
+        }
+    }
+    return offsets
+}
+
+search_pick_offset :: proc(
+    offsets: []int,
+    start_offset, direction: int,
+    inclusive: bool,
+) -> (offset: int, wrapped: bool, found: bool) {
+    if len(offsets) == 0 do return 0, false, false
+
+    if direction >= 0 {
+        for candidate in offsets {
+            if candidate > start_offset || (inclusive && candidate == start_offset) {
+                return candidate, false, true
+            }
+        }
+        return offsets[0], true, true
+    }
+
+    last := -1
+    for candidate in offsets {
+        if candidate < start_offset || (inclusive && candidate == start_offset) {
+            last = candidate
+        }
+    }
+    if last >= 0 do return last, false, true
+    return offsets[len(offsets) - 1], true, true
+}
+
 // Shared match styling used by every buffer renderer.
 draw_search_match :: proc(renderer: ^sdl.Renderer, x, y, w, h: f32) {
     band := sdl.FRect{x, y, w, h}
@@ -235,15 +294,32 @@ app_search_apply :: proc(
 
     text := app_search_text(p, context.temp_allocator)
     scoped := app.search_scoped && app.search_scope_pane == p
-    offset, wrapped, found := search_find_in_text(
-        text,
-        pattern,
-        start_offset,
-        direction,
-        inclusive,
-        app.search_scope_start if scoped else 0,
-        app.search_scope_end if scoped else -1,
-    )
+    offset := 0
+    wrapped := false
+    found := false
+    if scoped && app.search_scope_block && p.kind == .Editor {
+        block_offsets := search_block_matches(
+            &p.editor,
+            text,
+            pattern,
+            app.search_scope_r0,
+            app.search_scope_r1,
+            app.search_scope_c0,
+            app.search_scope_c1,
+        )
+        defer delete(block_offsets)
+        offset, wrapped, found = search_pick_offset(block_offsets[:], start_offset, direction, inclusive)
+    } else {
+        offset, wrapped, found = search_find_in_text(
+            text,
+            pattern,
+            start_offset,
+            direction,
+            inclusive,
+            app.search_scope_start if scoped else 0,
+            app.search_scope_end if scoped else -1,
+        )
+    }
     if !found {
         app_set_message(app, fmt.tprintf("E486: Pattern not found: %s", pattern))
         return false
@@ -296,12 +372,22 @@ app_submit_search :: proc(app: ^App) {
     scoped := cp.scoped
     scope_start := cp.scope_start
     scope_end := cp.scope_end
+    scope_block := cp.scope_block
+    scope_r0 := cp.scope_r0
+    scope_r1 := cp.scope_r1
+    scope_c0 := cp.scope_c0
+    scope_c1 := cp.scope_c1
 
     app_close_command_prompt(app)
     app.search_scoped = scoped
     app.search_scope_start = scope_start
     app.search_scope_end = scope_end
     app.search_scope_pane = source if scoped else nil
+    app.search_scope_block = scope_block
+    app.search_scope_r0 = scope_r0
+    app.search_scope_r1 = scope_r1
+    app.search_scope_c0 = scope_c0
+    app.search_scope_c1 = scope_c1
 
     // Search belongs to the pane the prompt was opened from, even if a mouse
     // click moved focus while the prompt was active.

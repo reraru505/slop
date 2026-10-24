@@ -97,21 +97,40 @@ editor_place_multi_cursors :: proc(e: ^Editor, app: ^App) -> bool {
     }
 
     text := pt_full_text(&e.buffer.table, context.temp_allocator)
-    lo := 0
-    hi := len(text)
-    if app.search_scoped && app.search_scope_pane == app.active_pane {
-        lo = clamp(app.search_scope_start, 0, len(text))
-        hi = clamp(app.search_scope_end, lo, len(text))
+    scoped := app.search_scoped && app.search_scope_pane == app.active_pane
+
+    offsets: [dynamic]int
+    if scoped && app.search_scope_block {
+        offsets = search_block_matches(
+            e,
+            text,
+            app.last_search,
+            app.search_scope_r0,
+            app.search_scope_r1,
+            app.search_scope_c0,
+            app.search_scope_c1,
+        )
+    } else {
+        offsets = make([dynamic]int, 0, 16, context.temp_allocator)
+        lo := 0
+        hi := len(text)
+        if scoped {
+            lo = clamp(app.search_scope_start, 0, len(text))
+            hi = clamp(app.search_scope_end, lo, len(text))
+        }
+        i := lo
+        for i < hi {
+            idx := strings.index(text[i:hi], app.last_search)
+            if idx < 0 do break
+            offset := i + idx
+            append(&offsets, offset)
+            i = offset + 1
+        }
     }
+    defer delete(offsets)
 
     count := 0
-    i := lo
-    for i < hi {
-        idx := strings.index(text[i:hi], app.last_search)
-        if idx < 0 do break
-        offset := i + idx
-        i = offset + 1
-
+    for offset in offsets {
         row := pt_offset_to_line(&e.buffer.table, offset)
         line_start := pt_line_to_offset(&e.buffer.table, row)
         col := editor_clamp_col_to_rune(e, row, offset - line_start)

@@ -12,7 +12,7 @@ MODES
 
 MOVEMENT
   {left} {down} {up} {right} ...... left / down / up / right (arrow keys work too)
-  {line_start} ...... start of line
+  {line_start} ...... first non-blank character
   {line_end} ...... end of line
   {zero}, {dollar} ......... start / end of line
   {gg}, {G} ........ top / bottom of file
@@ -20,7 +20,7 @@ MOVEMENT
   {word_backward} ....... previous word
   {scope_down} ....... next scope / paragraph
   {scope_up} ....... previous scope / paragraph
-  Mouse wheel .. scroll the active pane
+  Mouse wheel .. scroll the pane under the pointer
 
 EDITING
   {delete_char} ............ delete character; at end of line, join the next line
@@ -45,14 +45,14 @@ SEARCH
   {multi_cursor} over highlighted matches ... cursor at every occurrence
   {block_visual} or {multi_cursor} (no search) ... rectangle selection; j/k extend
   Motions move every cursor; typing/Backspace edits every cursor; Esc collapses
-  With a character selection, {search} searches only inside it
+  With a visual or block selection, {search} searches only inside it
 
 LSP (when a language server is available)
   {completion_trigger} ... trigger completion
   Tab/Shift+Tab  cycle completion items
   Enter ........ accept completion
   Shift+Enter .. open documentation in a split
-  Esc .......... dismiss completion
+  Esc .......... leave Insert and dismiss completion
   {gd} ........... go to definition
   {hover} ............ hover documentation
   {format_line} ........... format the current line
@@ -73,7 +73,7 @@ COMMANDS  (type '{cmd_prompt}' in Normal mode)
   :recompile            repeat the last build
   :cnext  :cprev        next / previous compiler error
   :cfirst               jump to the first compiler error
-  :replace "text"       replace the Visual selection ("" deletes it)
+  :replace "text"       replace highlighted matches or the selection ("" deletes)
   :theme [name]         cycle themes or set one by name
   :sort [name|size|time|rev]  sort the current dired listing
   :cd <dir>  :pwd       change / show the session working directory

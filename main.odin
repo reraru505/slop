@@ -37,6 +37,11 @@ CommandPrompt :: struct {
     scope_start      : int,
     scope_end        : int,
     scoped           : bool,
+    scope_block      : bool,
+    scope_r0         : int,
+    scope_r1         : int,
+    scope_c0         : int,
+    scope_c1         : int,
 }
 
 app_reset_command_completion :: proc(prompt: ^CommandPrompt) {
@@ -100,6 +105,11 @@ App :: struct {
     search_scope_start : int,
     search_scope_end   : int,
     search_scope_pane  : ^Pane,
+    search_scope_block : bool,
+    search_scope_r0    : int,
+    search_scope_r1    : int,
+    search_scope_c0    : int,
+    search_scope_c1    : int,
     current_theme_id : ThemeId,
     theme            : Theme,
     running          : bool,
@@ -125,6 +135,18 @@ app_set_project_root :: proc(app: ^App, dir: string) {
 
 // Resolve a user-supplied path against the project root. Absolute paths are
 // returned unchanged; every other path is rooted at the project directory.
+// Pane containing a window-space point, or nil.
+app_pane_at :: proc(app: ^App, x, y: f32) -> ^Pane {
+    if app == nil do return nil
+    for p in app.panes {
+        if x >= p.rect.x && x < p.rect.x + p.rect.w &&
+           y >= p.rect.y && y < p.rect.y + p.rect.h {
+            return p
+        }
+    }
+    return nil
+}
+
 app_resolve_path :: proc(app: ^App, path: string) -> string {
     p := expand_home_path(path)
     if p == "" || filepath.is_abs(p) do return p
@@ -221,12 +243,19 @@ app_open_search_prompt :: proc(app: ^App) {
     cp.scoped = false
     cp.scope_start = 0
     cp.scope_end = -1
-    if p.kind == .Editor && p.editor.mode == .Visual && !p.editor.block_selection {
-        start, end := editor_selection_offsets(&p.editor)
-        if end > start {
+    cp.scope_block = false
+    if p.kind == .Editor && p.editor.mode == .Visual {
+        if p.editor.block_selection {
             cp.scoped = true
-            cp.scope_start = start
-            cp.scope_end = end
+            cp.scope_block = true
+            cp.scope_r0, cp.scope_r1, cp.scope_c0, cp.scope_c1 = editor_block_bounds(&p.editor)
+        } else {
+            start, end := editor_selection_offsets(&p.editor)
+            if end > start {
+                cp.scoped = true
+                cp.scope_start = start
+                cp.scope_end = end
+            }
         }
     }
     clear(&cp.buffer)
@@ -728,14 +757,6 @@ app_replace_command :: proc(app: ^App, arg: string) {
         app_set_message(app, "Buffer is read-only")
         return
     }
-    if e.mode != .Visual {
-        app_set_message(app, "E: Select text before :replace")
-        return
-    }
-    if e.block_selection {
-        app_set_message(app, "E: :replace needs a character selection, not a block")
-        return
-    }
     if arg == "" {
         app_set_message(app, "E: :replace needs text (\"\" deletes the selection)")
         return
@@ -744,6 +765,75 @@ app_replace_command :: proc(app: ^App, arg: string) {
     replacement, ok := command_parse_replacement(arg)
     if !ok {
         app_set_message(app, "E: Unterminated string in :replace")
+        return
+    }
+
+    // With an active search highlight, replace each highlighted occurrence
+    // rather than the whole selection. A character selection limits the
+    // replacements; otherwise a scoped search or the whole buffer is used.
+    has_search := app.search_highlight && app.last_search != ""
+    if has_search {
+        count := 0
+        scoped_here := app.search_scoped && app.search_scope_pane == p
+        if scoped_here && app.search_scope_block {
+            // The scope captured when `/` was submitted is the region the
+            // user searched; navigation may have moved the live selection.
+            full := pt_full_text(&e.buffer.table, context.temp_allocator)
+            offsets := search_block_matches(
+                e,
+                full,
+                app.last_search,
+                app.search_scope_r0,
+                app.search_scope_r1,
+                app.search_scope_c0,
+                app.search_scope_c1,
+            )
+            defer delete(offsets)
+            count = editor_replace_offsets(e, app.last_search, replacement, offsets[:])
+        } else if scoped_here {
+            count = editor_replace_matches(
+                e,
+                app.last_search,
+                replacement,
+                app.search_scope_start,
+                app.search_scope_end,
+            )
+        } else if e.mode == .Visual && e.block_selection {
+            r0, r1, c0, c1 := editor_block_bounds(e)
+            full := pt_full_text(&e.buffer.table, context.temp_allocator)
+            offsets := search_block_matches(e, full, app.last_search, r0, r1, c0, c1)
+            defer delete(offsets)
+            count = editor_replace_offsets(e, app.last_search, replacement, offsets[:])
+        } else if e.mode == .Visual {
+            start, end := editor_selection_offsets(e)
+            if end > start {
+                count = editor_replace_matches(e, app.last_search, replacement, start, end)
+            }
+        } else {
+            count = editor_replace_matches(
+                e,
+                app.last_search,
+                replacement,
+                0,
+                pt_get_length(&e.buffer.table),
+            )
+        }
+
+        if count == 0 {
+            app_set_message(app, "E: No highlighted matches to replace")
+        } else {
+            app.search_highlight = false
+            app_set_message(app, fmt.tprintf("Replaced %d match(es)", count))
+        }
+        return
+    }
+
+    if e.mode != .Visual {
+        app_set_message(app, "E: Select text or highlight a search before :replace")
+        return
+    }
+    if e.block_selection {
+        app_set_message(app, "E: :replace needs a character selection, not a block")
         return
     }
     if editor_replace_selection(e, replacement) {
@@ -1316,14 +1406,8 @@ update :: proc(app: ^App) {
         #partial switch event.type {
         case .MOUSE_BUTTON_DOWN:
             if event.button.button == sdl.BUTTON_LEFT {
-                mx := f32(event.button.x)
-                my := f32(event.button.y)
-                for p in app.panes {
-                    if mx >= p.rect.x && mx < p.rect.x + p.rect.w &&
-                       my >= p.rect.y && my < p.rect.y + p.rect.h {
-                        app.active_pane = p
-                        break
-                    }
+                if p := app_pane_at(app, f32(event.button.x), f32(event.button.y)); p != nil {
+                    app.active_pane = p
                 }
             }
 
@@ -1462,19 +1546,27 @@ update :: proc(app: ^App) {
             }
         }
 
-        // Dispatch remaining events to active pane
-        if app.active_pane != nil {
-            switch app.active_pane.kind {
+        // Wheel events go to the pane under the pointer; keyboard events and
+        // clicks go to the focused pane.
+        target := app.active_pane
+        if event.type == .MOUSE_WHEEL {
+            if hovered := app_pane_at(app, event.wheel.mouse_x, event.wheel.mouse_y); hovered != nil {
+                target = hovered
+            }
+        }
+
+        if target != nil {
+            switch target.kind {
             case .Editor:
-                editor_handle_event(&app.active_pane.editor, &event, app.window, app)
+                editor_handle_event(&target.editor, &event, app.window, app)
             case .Dired:
-                if app.active_pane.dired.is_editing {
-                    editor_handle_event(&app.active_pane.editor, &event, app.window, app)
+                if target.dired.is_editing {
+                    editor_handle_event(&target.editor, &event, app.window, app)
                 } else {
-                    dired_handle_event(&app.active_pane.dired, &event, app, app.active_pane)
+                    dired_handle_event(&target.dired, &event, app, target)
                 }
             case .Compilation:
-                compilation_handle_event(&app.active_pane.compilation, &event, app, app.active_pane)
+                compilation_handle_event(&target.compilation, &event, app, target)
             }
         }
     }
@@ -1611,14 +1703,22 @@ draw :: proc(app: ^App) {
     // Render all panes
     for p in app.panes {
         is_focused := (p == app.active_pane)
+        scope_active := app.search_scoped && app.search_scope_pane == p
+        scope_start := app.search_scope_start if scope_active else 0
+        scope_end := app.search_scope_end if scope_active else -1
+        scope_block := app.search_scope_block if scope_active else false
+        scope_r0 := app.search_scope_r0 if scope_active else 0
+        scope_r1 := app.search_scope_r1 if scope_active else -1
+        scope_c0 := app.search_scope_c0 if scope_active else 0
+        scope_c1 := app.search_scope_c1 if scope_active else -1
         switch p.kind {
         case .Editor:
             editor_sync_view(&p.editor)
-            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app_search_pattern(app), app.search_scope_start if (app.search_scoped && app.search_scope_pane == p) else 0, app.search_scope_end if (app.search_scoped && app.search_scope_pane == p) else -1)
+            editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app_search_pattern(app), scope_start, scope_end, scope_block, scope_r0, scope_r1, scope_c0, scope_c1)
         case .Dired:
             if p.dired.is_editing {
                 editor_sync_view(&p.editor)
-                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app_search_pattern(app), app.search_scope_start if (app.search_scoped && app.search_scope_pane == p) else 0, app.search_scope_end if (app.search_scoped && app.search_scope_pane == p) else -1)
+                editor_render(&p.editor, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_get_lsp_for_file(app, p.editor.buffer.file_path), app_search_pattern(app), scope_start, scope_end, scope_block, scope_r0, scope_r1, scope_c0, scope_c1)
             } else {
                 dired_render(&p.dired, app.renderer, &app.font, p.rect, is_focused, &app.theme, app_search_pattern(app))
             }

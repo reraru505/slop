@@ -813,3 +813,22 @@ test_app_wqa_blocks_on_unnamed_dirty_buffer :: proc(t: ^testing.T) {
     testing.expect_value(t, app.active_pane.editor.buffer.dirty, true)
     fmt.println("  ✓ [App] :wqa refuses to quit with an unwritable dirty buffer")
 }
+
+@(test)
+test_app_pane_at_uses_hovered_rect :: proc(t: ^testing.T) {
+    a, b: Pane
+    a.rect = sdl.FRect{0, 0, 100, 100}
+    b.rect = sdl.FRect{100, 0, 100, 100}
+
+    app: App
+    app.panes = make([dynamic]^Pane, 0, 2)
+    defer delete(app.panes)
+    append(&app.panes, &a, &b)
+
+    testing.expect_value(t, app_pane_at(&app, 10, 10), &a)
+    testing.expect_value(t, app_pane_at(&app, 150, 50), &b)
+    testing.expect_value(t, app_pane_at(&app, 100, 50), &b)
+    testing.expect_value(t, app_pane_at(&app, 250, 50), nil)
+
+    fmt.println("  ✓ [App] wheel/click hover resolves the pane under the pointer")
+}

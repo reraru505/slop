@@ -1007,7 +1007,7 @@ test_editor_insert_tab_and_enter_indent :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_editor_escape_closes_completion_first :: proc(t: ^testing.T) {
+test_editor_escape_leaves_insert_with_completion :: proc(t: ^testing.T) {
     e: Editor
     editor_init(&e, nil, "abc")
     defer editor_destroy(&e)
@@ -1018,11 +1018,9 @@ test_editor_escape_closes_completion_first :: proc(t: ^testing.T) {
 
     testing.expect_value(t, editor_handle_insert_key(&e, sdl.K_ESCAPE, {}, nil, nil), true)
     testing.expect_value(t, e.completion.active, false)
-    testing.expect_value(t, e.mode, EditorMode.Insert) // first Esc only dismisses the popup
+    testing.expect_value(t, e.mode, EditorMode.Normal) // one Esc leaves Insert
 
-    testing.expect_value(t, editor_handle_insert_key(&e, sdl.K_ESCAPE, {}, nil, nil), true)
-    testing.expect_value(t, e.mode, EditorMode.Normal)
-    fmt.println("  ✓ [Editor] Esc dismisses completion before leaving Insert")
+    fmt.println("  ✓ [Editor] Esc leaves Insert and dismisses completion in one press")
 }
 
 @(test)
@@ -1977,4 +1975,84 @@ test_read_only_editor_allows_selection :: proc(t: ^testing.T) {
     testing.expect_value(t, e.mode, EditorMode.Visual)
 
     fmt.println("  ✓ [Editor] read-only buffers allow Visual selection and movement")
+}
+
+@(test)
+test_shift_h_first_nonblank :: proc(t: ^testing.T) {
+    e: Editor
+    editor_init(&e, nil, "    indented\n   \n")
+    defer editor_destroy(&e)
+
+    editor_set_mode(&e, .Normal, nil)
+    e.cursor.row = 0
+    e.cursor.col = 8
+    editor_handle_normal_key(&e, KEY_LINE_START, sdl.KMOD_SHIFT, nil, nil)
+    testing.expect_value(t, e.cursor.col, 4)
+
+    // `0` still goes to column zero.
+    editor_handle_normal_key(&e, KEY_LINE_START_ZERO, {}, nil, nil)
+    testing.expect_value(t, e.cursor.col, 0)
+
+    // A whitespace-only line has no text start; stay at column zero.
+    e.cursor.row = 1
+    e.cursor.col = 3
+    editor_handle_normal_key(&e, KEY_LINE_START, sdl.KMOD_SHIFT, nil, nil)
+    testing.expect_value(t, e.cursor.col, 0)
+
+    fmt.println("  ✓ [Editor] Shift+H moves to first non-blank; 0 keeps column zero")
+}
+
+@(test)
+test_replace_highlighted_matches :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    e := &app.active_pane.editor
+    set_editor_text(e, "foo bar foo\nfoo baz")
+
+    app.last_search = strings.clone("foo")
+    app.search_highlight = true
+
+    app_execute_command(&app, `replace "X"`)
+    text := pt_full_text(&e.buffer.table)
+    defer delete(text)
+    testing.expect_value(t, text, "X bar X\nX baz")
+    testing.expect_value(t, app.search_highlight, false)
+    testing.expect(t, strings.contains(app.cmd_prompt.message, "3 match"))
+
+    // One undo restores every replaced occurrence.
+    testing.expect_value(t, pt_undo(&e.buffer.table), true)
+    restored := pt_full_text(&e.buffer.table)
+    defer delete(restored)
+    testing.expect_value(t, restored, "foo bar foo\nfoo baz")
+
+    fmt.println("  ✓ [Editor] :replace targets highlighted matches without a selection")
+}
+
+@(test)
+test_replace_only_inside_selection_matches :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    e := &app.active_pane.editor
+    set_editor_text(e, "foo foo foo")
+
+    app.last_search = strings.clone("foo")
+    app.search_highlight = true
+
+    // Select just the first two occurrences ("foo foo").
+    editor_set_mode(e, .Visual, nil)
+    e.selection_anchor = Cursor{row = 0, col = 0}
+    e.cursor = Cursor{row = 0, col = 6}
+
+    app_execute_command(&app, `replace "Z"`)
+    text := pt_full_text(&e.buffer.table)
+    defer delete(text)
+    testing.expect_value(t, text, "Z Z foo")
+    testing.expect_value(t, e.mode, EditorMode.Normal)
+
+    testing.expect_value(t, pt_undo(&e.buffer.table), true)
+    restored := pt_full_text(&e.buffer.table)
+    defer delete(restored)
+    testing.expect_value(t, restored, "foo foo foo")
+
+    fmt.println("  ✓ [Editor] :replace only rewrites highlighted matches inside the selection")
 }

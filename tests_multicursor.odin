@@ -32,7 +32,10 @@ test_multicursor_place_insert_and_undo :: proc(t: ^testing.T) {
     testing.expect_value(t, e.extra_cursors[1].col, 8)
     testing.expect_value(t, app.cmd_prompt.message, "3 cursors")
 
-    editor_set_mode(e, .Insert, nil)
+    // `i` enters Insert without collapsing the extra cursors.
+    editor_handle_normal_key(e, KEY_INSERT_BEFORE, {}, nil, &app)
+    testing.expect_value(t, e.mode, EditorMode.Insert)
+    testing.expect_value(t, len(e.extra_cursors), 2)
     testing.expect_value(t, ml_send_text(e, "X"), true)
     text := pt_full_text(&e.buffer.table)
     defer delete(text)
@@ -158,7 +161,10 @@ test_scoped_search_inside_visual_selection :: proc(t: ^testing.T) {
     e.selection_anchor = Cursor{row = 1, col = 0}
     e.cursor = Cursor{row = 1, col = 6}
 
-    app_open_search_prompt(&app)
+    key_ev: sdl.Event
+    key_ev.type = .KEY_DOWN
+    key_ev.key.key = KEY_SEARCH
+    editor_handle_event(e, &key_ev, app.window, &app)
     testing.expect_value(t, app.cmd_prompt.scoped, true)
     for b in transmute([]u8)string("foo") do append(&app.cmd_prompt.buffer, b)
     app_submit_prompt(&app)
@@ -218,4 +224,93 @@ test_multicursor_moves_together :: proc(t: ^testing.T) {
     testing.expect_value(t, e.extra_cursors[2].row, 3)
 
     fmt.println("  ✓ [MultiCursor] vertical motion moves every cursor")
+}
+
+@(test)
+test_block_scoped_search_and_replace :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    e := &app.active_pane.editor
+    set_editor_text(e, "aa foo zz\naa foo zz\naa foo zz")
+
+    // Rectangle over the first two lines' foo occurrences.
+    editor_set_mode(e, .Visual, nil)
+    e.block_selection = true
+    e.selection_anchor = Cursor{row = 0, col = 3}
+    e.cursor = Cursor{row = 1, col = 5}
+
+    key_ev: sdl.Event
+    key_ev.type = .KEY_DOWN
+    key_ev.key.key = KEY_SEARCH
+    editor_handle_event(e, &key_ev, app.window, &app)
+    testing.expect_value(t, app.cmd_prompt.scoped, true)
+    testing.expect_value(t, app.cmd_prompt.scope_block, true)
+    for b in transmute([]u8)string("foo") do append(&app.cmd_prompt.buffer, b)
+    app_submit_prompt(&app)
+
+    testing.expect_value(t, app.search_scope_block, true)
+    testing.expect_value(t, e.cursor.row, 0)
+    testing.expect_value(t, e.cursor.col, 3)
+    app_search_repeat(&app, false)
+    testing.expect_value(t, e.cursor.row, 1)
+    testing.expect_value(t, e.cursor.col, 3)
+    app_search_repeat(&app, false)
+    testing.expect_value(t, e.cursor.row, 0)
+    testing.expect_value(t, e.cursor.col, 3)
+
+    // Replacing highlighted matches honors the block scope.
+    app_execute_command(&app, `replace "bar"`)
+    text := pt_full_text(&e.buffer.table)
+    defer delete(text)
+    testing.expect_value(t, text, "aa bar zz\naa bar zz\naa foo zz")
+
+    fmt.println("  ✓ [Search] block selection scopes search and replacement")
+}
+
+@(test)
+test_multicursor_escape_route_keeps_cursors_when_entering_insert :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    e := &app.active_pane.editor
+    set_editor_text(e, "foo foo")
+
+    app.last_search = strings.clone("foo")
+    app.search_highlight = true
+    e.cursor.row = 0
+    e.cursor.col = 0
+    testing.expect_value(t, editor_place_multi_cursors(e, &app), true)
+    testing.expect_value(t, len(e.extra_cursors), 1)
+
+    // Normal-mode Esc toggles into Insert in this editor and must keep the
+    // extra cursors so the user can start editing them.
+    send_key_event(e, sdl.K_ESCAPE)
+    testing.expect_value(t, e.mode, EditorMode.Insert)
+    testing.expect_value(t, len(e.extra_cursors), 1)
+
+    // Leaving Insert collapses them.
+    send_key_event(e, sdl.K_ESCAPE)
+    testing.expect_value(t, e.mode, EditorMode.Normal)
+    testing.expect_value(t, len(e.extra_cursors), 0)
+
+    fmt.println("  ✓ [MultiCursor] Esc keeps cursors entering Insert and collapses on exit")
+}
+
+@(test)
+test_multicursor_normal_delete_char :: proc(t: ^testing.T) {
+    app := make_test_app()
+    defer destroy_test_app(&app)
+    e := &app.active_pane.editor
+    set_editor_text(e, "foo foo foo")
+
+    app.last_search = strings.clone("foo")
+    app.search_highlight = true
+    testing.expect_value(t, editor_place_multi_cursors(e, &app), true)
+
+    editor_handle_normal_key(e, KEY_DELETE_CHAR, {}, nil, &app)
+    text := pt_full_text(&e.buffer.table)
+    defer delete(text)
+    testing.expect_value(t, text, "oo oo oo")
+    testing.expect_value(t, len(e.extra_cursors), 2)
+
+    fmt.println("  ✓ [MultiCursor] normal-mode delete applies at every cursor")
 }

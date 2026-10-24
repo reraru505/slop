@@ -16,10 +16,10 @@ slop is an ultimate AI assisted config of neovim, somehow turned into a standalo
 - Auto-pairing for brackets and quotes, smart Enter indentation, four-space Tab.
 - Forward search with `/pattern` in editor, dired, and compilation buffers; `n` / `N` / `p` repeat and wrap.
 - Enter highlights all matches; opening `/` again clears them.
-- A character-wise Visual selection scopes search to that region.
-- Manual multi-cursor: `Shift+C` over highlighted matches puts a cursor at every occurrence; typing and Backspace/Delete apply to all.
+- A Visual or block selection scopes search to that region.
+- Manual multi-cursor: `Shift+C` over highlighted matches puts a cursor at every occurrence; motions, typing, and Backspace/Delete apply to all.
 - Rectangle selection with `Ctrl+V` (or `Shift+C` when no search is highlighted); `j` / `k` extend it vertically.
-- `:replace "text"` replaces the Visual selection as one undoable edit (`""` deletes it).
+- `:replace "text"` replaces highlighted matches inside the active selection, or every highlighted match when nothing is selected; `""` deletes them.
 - Undo/redo with typing coalescing and explicit transactions, so compound edits undo as one step.
 - Rune-aware cursor movement and selection: wide characters, combining marks, and emoji do not split.
 - CRLF files stay CRLF on every edit path.

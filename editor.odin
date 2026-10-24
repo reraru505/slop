@@ -149,7 +149,9 @@ buffer_acquire :: proc(initial_text, file_path: string) -> ^Buffer {
     sync.lock(&buffer_registry_mutex)
     defer sync.unlock(&buffer_registry_mutex)
     for b in buffer_registry {
-        if b != nil && b.file_path == file_path {
+        // Different spellings of the same absolute path (./, .., duplicate
+        // separators) must still attach to one document.
+        if b != nil && paths_match(b.file_path, file_path) {
             b.refs += 1
             return b
         }
@@ -1055,6 +1057,63 @@ editor_replace_selection :: proc(e: ^Editor, text: string) -> bool {
     return true
 }
 
+// Replaces every non-overlapping occurrence of `pattern` in [start, end) with
+// `replacement` as one undo step. Returns the replacement count.
+editor_replace_matches :: proc(
+    e: ^Editor,
+    pattern, replacement: string,
+    start, end: int,
+) -> (count: int) {
+    if e == nil || pattern == "" do return 0
+
+    text := pt_full_text(&e.buffer.table, context.temp_allocator)
+    lo := clamp(start, 0, len(text))
+    hi := clamp(end, lo, len(text))
+    if hi <= lo do return 0
+
+    offsets := make([dynamic]int, 0, 16, context.temp_allocator)
+    defer delete(offsets)
+    i := lo
+    for i < hi {
+        idx := strings.index(text[i:hi], pattern)
+        if idx < 0 do break
+        abs := i + idx
+        append(&offsets, abs)
+        i = abs + len(pattern)
+    }
+    if len(offsets) == 0 do return 0
+    return editor_replace_offsets(e, pattern, replacement, offsets[:])
+}
+
+// Replaces an explicit, ascending list of match offsets.
+editor_replace_offsets :: proc(
+    e: ^Editor,
+    pattern, replacement: string,
+    offsets: []int,
+) -> int {
+    if e == nil || len(offsets) == 0 do return 0
+
+    insertion := editor_normalize_newlines(e, replacement, context.temp_allocator)
+    editor_begin_undo_transaction(e)
+    for k := len(offsets) - 1; k >= 0; k -= 1 {
+        pt_replace(&e.buffer.table, offsets[k], len(pattern), insertion)
+    }
+    editor_end_undo_transaction(e)
+
+    first := offsets[0]
+    row := pt_offset_to_line(&e.buffer.table, first)
+    line_start := pt_line_to_offset(&e.buffer.table, row)
+    e.cursor.row = row
+    e.cursor.col = clamp(first - line_start, 0, editor_get_line_len(e, row))
+    e.cursor.col = editor_clamp_col_to_rune(e, row, e.cursor.col)
+    e.selection_anchor = e.cursor
+    e.desired_col = editor_visual_col(e, row, e.cursor.col)
+    editor_mark_dirty(e, row)
+    if e.mode == .Visual do editor_set_mode(e, .Normal, nil)
+
+    return len(offsets)
+}
+
 editor_yank_selection :: proc(e: ^Editor) {
     if e.mode == .Visual && e.block_selection {
         text := editor_block_text(e)
@@ -1529,10 +1588,9 @@ editor_handle_insert_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
 
     switch key {
     case sdl.K_ESCAPE:
-        if e.completion.active {
-            e.completion.active = false
-            return true
-        }
+        // Esc always leaves Insert; closing the completion popup is a side
+        // effect rather than a separate first press.
+        e.completion.active = false
         editor_set_mode(e, .Normal, window)
         return true
 
@@ -1932,22 +1990,29 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
 
-    // ESC = Insert / Normal toggle; with extra cursors it collapses them.
+    // ESC = Insert / Normal toggle. Extra cursors survive entering Insert and
+    // collapse when Insert is left.
     if key == sdl.K_ESCAPE {
         if e.mode == .Visual {
             editor_set_mode(e, .Normal, window)
-        } else if len(e.extra_cursors) > 0 {
-            editor_clear_extra_cursors(e)
         } else {
             editor_set_mode(e, .Insert, window)
         }
         return true
     }
 
-    // Shift+H: start of line; h: left
+    // Shift+H: first non-blank character (start of the line's text); h: left.
     if is_shift && key == KEY_LINE_START {
-        e.cursor.col = 0
-        e.desired_col = 0
+        start := pt_line_to_offset(&e.buffer.table, e.cursor.row)
+        col := 0
+        for col < line_len {
+            ch := pt_byte_at(&e.buffer.table, start + col)
+            if ch != ' ' && ch != '\t' do break
+            col += 1
+        }
+        if col >= line_len do col = 0
+        e.cursor.col = col
+        e.desired_col = editor_visual_col(e, e.cursor.row, col)
         return true
     }
     if key == KEY_MOVE_LEFT {
@@ -2161,6 +2226,10 @@ editor_handle_normal_key :: proc(e: ^Editor, key: sdl.Keycode, mod: sdl.Keymod, 
         return true
     }
     if e.mode != .Visual && key == KEY_DELETE_CHAR {
+        if len(e.extra_cursors) > 0 {
+            editor_delete_multi(e, false)
+            return true
+        }
         if line_len > 0 && e.cursor.col < line_len {
             offset := pt_line_to_offset(&e.buffer.table, e.cursor.row) + e.cursor.col
             _, size := editor_rune_at(e, e.cursor.row, e.cursor.col)
@@ -2482,6 +2551,11 @@ editor_render :: proc(
     search_pattern := "",
     search_scope_start := 0,
     search_scope_end := -1,
+    search_scope_block := false,
+    search_block_r0 := 0,
+    search_block_r1 := -1,
+    search_block_c0 := 0,
+    search_block_c1 := -1,
 ) {
     if rect.w < 50 || rect.h < 50 do return
 
@@ -2645,7 +2719,10 @@ editor_render :: proc(
                 abs := from + idx
                 from = abs + 1
 
-                if search_scope_end >= 0 {
+                if search_scope_block {
+                    if line_idx < search_block_r0 || line_idx > search_block_r1 do continue
+                    if abs < search_block_c0 || abs > search_block_c1 do continue
+                } else if search_scope_end >= 0 {
                     global := line_base + abs
                     if global < search_scope_start || global + len(search_pattern) > search_scope_end do continue
                 }
